@@ -44,3 +44,5 @@ aes-gcm = "0.10"
 lightning-invoice = { version = "0.32", features = ["std"] }
 bech32 = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
+zeroize = "1.8"
+

@@ -155,6 +155,8 @@ impl ProfileResolver for Bip353Resolver {
             hybrid_pubkey: None,
             pqc_required: false,
             revoked: false,
+            recovery_policy: None,
+            recovery: None,
         };
 
         let signed = crate::crypto::sign_profile(profile, &kp.secret_key()).map_err(|e| {

@@ -12,8 +12,8 @@ use crate::handlers::{
         mark_notification_read_handler,
     },
     profile::{
-        create_challenge, profile_response, rotate_profile_key, update_profile,
-        update_profile_methods, verify_challenge,
+        create_challenge, profile_response, recover_profile_key, rotate_profile_key,
+        update_profile, update_profile_methods, verify_challenge,
     },
     quote::{pay_response, quote_response},
     resolve::{dns_resolve_response, resolve_profile, resolve_v2_envelope},
@@ -30,8 +30,8 @@ use crate::http::{
 use crate::rate_limit;
 use crate::types::{
     safety_warnings, AliasRequest, ClaimRequest, ConsistencyVerifyRequest, DnsResolveRequest,
-    InclusionVerifyRequest, PayRequest, PreviewResponse, ProfileUpdateRequest, QuoteRequest,
-    ReceiveRequest, SendRequest, VerifyRequest,
+    InclusionVerifyRequest, PayRequest, PreviewResponse, ProfileRecoverRequest,
+    ProfileUpdateRequest, QuoteRequest, ReceiveRequest, SendRequest, VerifyRequest,
 };
 use crate::ui::{html_response, INDEX_HTML};
 use crate::v2_api;
@@ -88,6 +88,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         || path == "/v1/claim"
         || path == "/v1/dns/resolve"
         || path == "/v1/transparency/verify/inclusion"
+        || path == "/v1/profile/recover"
         || path == "/v2/resolve";
 
     if is_mutation && !is_public_mutation {
@@ -348,6 +349,39 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             let _guard = state.mutation_lock.lock().await;
             match rotate_profile_key(state) {
                 Ok(response) => json_response(StatusCode(200), &response),
+                Err(error) => json_error(StatusCode(400), error),
+            }
+        }
+        (Method::Post, "/v1/profile/recover") => {
+            match read_json::<ProfileRecoverRequest>(&mut request) {
+                Ok(body) => {
+                    let precheck = || -> Result<()> {
+                        crate::handlers::profile::validate_recovery_request_shape(&body)?;
+                        let alias = satspath_core::privacy::canonical_identifier(&body.alias);
+                        let store = satspath_core::TransactionalTransparencyStore::open_read_only(
+                            &state.home,
+                        )?;
+                        let existing = store
+                            .profile(&alias)?
+                            .ok_or(satspath_core::SatsPathError::AliasNotFound(alias))?;
+                        if !satspath_core::recovery::verify_key_recovery(
+                            &existing,
+                            &body.signed_profile,
+                        )? {
+                            anyhow::bail!("recovery proof failed verification against existing profile/policy");
+                        }
+                        Ok(())
+                    };
+                    if let Err(error) = precheck() {
+                        json_error(StatusCode(400), error)
+                    } else {
+                        let _guard = state.mutation_lock.lock().await;
+                        match recover_profile_key(state, body) {
+                            Ok(response) => json_response(StatusCode(200), &response),
+                            Err(error) => json_error(StatusCode(400), error),
+                        }
+                    }
+                }
                 Err(error) => json_error(StatusCode(400), error),
             }
         }

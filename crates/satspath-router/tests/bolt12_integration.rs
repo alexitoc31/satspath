@@ -33,6 +33,8 @@ fn dummy_signed_profile(alias: &str, method: PaymentMethod) -> SignedPaymentProf
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: None,
+        recovery: None,
     };
     satspath_core::crypto::sign_profile(profile, &key.secret_key).unwrap()
 }

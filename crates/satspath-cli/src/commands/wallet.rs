@@ -20,7 +20,9 @@ use satspath_core::crypto::{
     fingerprint_pubkey, generate_identity_keypair, generate_nonce, sign_profile,
     verify_signed_profile,
 };
-use satspath_core::privacy::{mask_address, mask_identifier, mask_pubkey};
+use satspath_core::privacy::{
+    canonical_identifier, mask_address, mask_identifier, mask_pubkey, validate_ascii_identifier,
+};
 use satspath_core::registry::Registry;
 use satspath_core::validation::{
     assert_no_private_material, validate_bitcoin_address, validate_compressed_pubkey,
@@ -258,10 +260,14 @@ fn sign_and_store(state: &WalletState) -> Result<String> {
     }
 
     let mut registry = open_registry()?;
-    let current_sequence = registry
-        .resolve_alias(alias)
+    let existing_profile = registry.resolve_alias(alias);
+    let current_sequence = existing_profile
+        .as_ref()
         .map(|signed| signed.profile.sequence.unwrap_or(0))
         .unwrap_or(0);
+    let existing_policy = existing_profile
+        .ok()
+        .and_then(|signed| signed.profile.recovery_policy.clone());
 
     let secret = keystore::load_identity_key(&satspath_dir(), pubkey)?;
     let t = now();
@@ -279,6 +285,8 @@ fn sign_and_store(state: &WalletState) -> Result<String> {
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: existing_policy,
+        recovery: None,
     };
     let signed = sign_profile(profile, &secret)?;
     let fp = fingerprint_pubkey(pubkey)?;
@@ -353,10 +361,14 @@ pub fn cmd_wallet_rotate() -> Result<()> {
     }
 
     let mut registry = open_registry()?;
-    let current_sequence = registry
-        .resolve_alias(alias)
+    let existing_profile = registry.resolve_alias(alias);
+    let current_sequence = existing_profile
+        .as_ref()
         .map(|signed| signed.profile.sequence.unwrap_or(0))
         .unwrap_or(0);
+    let existing_policy = existing_profile
+        .ok()
+        .and_then(|signed| signed.profile.recovery_policy.clone());
 
     let t = now();
     let rotation = satspath_core::rotation::KeyRotation::create(
@@ -383,6 +395,8 @@ pub fn cmd_wallet_rotate() -> Result<()> {
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: existing_policy,
+        recovery: None,
     };
 
     let signed = sign_profile(profile, &new_kp.secret_key)?;
@@ -395,6 +409,100 @@ pub fn cmd_wallet_rotate() -> Result<()> {
         fingerprint_pubkey(&new_pubkey_hex)?
     );
 
+    Ok(())
+}
+
+/// `satspath alias recover` — recover control of an alias identity key using a pre-committed guardian threshold proof.
+pub fn cmd_alias_recover(alias: Option<&str>, proof_file: &str) -> Result<()> {
+    let data = std::fs::read_to_string(proof_file)
+        .map_err(|e| anyhow::anyhow!("failed to read proof file {}: {e}", proof_file))?;
+    let proof: satspath_core::recovery::KeyRecoveryProof = serde_json::from_str(&data)
+        .map_err(|e| anyhow::anyhow!("invalid KeyRecoveryProof JSON: {e}"))?;
+
+    let mut registry = open_registry()?;
+    let target_alias = if let Some(a) = alias {
+        validate_ascii_identifier(a)?;
+        canonical_identifier(a)
+    } else {
+        load_wallet()
+            .ok()
+            .and_then(|w| w.alias)
+            .ok_or_else(|| anyhow::anyhow!("alias must be specified with --alias"))?
+    };
+
+    let existing = registry.resolve_alias(&target_alias).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to resolve alias '{}': {e}",
+            mask_identifier(&target_alias)
+        )
+    })?;
+
+    let policy = existing.profile.recovery_policy.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no RecoveryPolicy was pre-committed for '{}'. Recovery is disabled (fail-closed).",
+            mask_identifier(&target_alias)
+        )
+    })?;
+
+    if !proof.verify(policy)? {
+        anyhow::bail!("recovery proof failed cryptographic verification against committed policy");
+    }
+
+    let expected_seq = existing.profile.sequence.unwrap_or(0).saturating_add(1);
+    if proof.previous_pubkey != existing.profile.identity_pubkey
+        || proof.identifier_hash != satspath_core::privacy::identifier_hash(&target_alias)
+        || proof.sequence != expected_seq
+    {
+        anyhow::bail!("recovery proof is not bound to this identifier, key, or sequence");
+    }
+
+    let new_pubkey = proof.new_pubkey.clone();
+    let fp = fingerprint_pubkey(&new_pubkey)?;
+
+    let mut new_profile = existing.profile.clone();
+    new_profile.identity_pubkey = new_pubkey.clone();
+    new_profile.sequence = Some(proof.sequence);
+    new_profile.recovery = Some(proof.clone());
+    let t = now();
+    new_profile.updated_at = t;
+    new_profile.expires_at = Some(t + 30 * 24 * 3600);
+    new_profile.nonce = Some(generate_nonce());
+    new_profile.rotation = None;
+    new_profile.method_verifications = Vec::new();
+    new_profile.hybrid_pubkey = None;
+    new_profile.pqc_required = false;
+
+    // If the new identity key is present in local keystore, sign the profile.
+    if let Ok(new_secret) = keystore::load_identity_key(&satspath_dir(), &new_pubkey) {
+        let mut state = load_wallet()?;
+        if let Some(existing_alias) = state.alias.as_deref() {
+            if canonical_identifier(existing_alias) != target_alias {
+                anyhow::bail!(
+                    "wallet is bound to a different alias; refusing to rebind it during recovery; nothing was changed"
+                );
+            }
+        }
+        let signed = sign_profile(new_profile, &new_secret)?;
+        if !satspath_core::recovery::verify_key_recovery(existing, &signed)? {
+            anyhow::bail!("recovery proof is not bound to this identifier, key, or sequence");
+        }
+        registry.update_profile(signed)?;
+        state.identity_pubkey = Some(new_pubkey.clone());
+        state.alias = Some(target_alias.clone());
+        state.updated_at = Some(now());
+        save_wallet(&state).map_err(|e| {
+            anyhow::anyhow!("recovery committed to registry but wallet update failed: {e}")
+        })?;
+        println!("Identity key recovered and signed successfully using guardian threshold proof.");
+    } else {
+        anyhow::bail!(
+            "proof is valid for identity {}, but its private key is not in the local keystore; nothing was changed",
+            mask_pubkey(&new_pubkey)
+        );
+    }
+
+    println!("Recovered identity fingerprint: {}", fp);
+    print_receiver_warning();
     Ok(())
 }
 
@@ -760,5 +868,21 @@ mod tests {
         assert!(!build_methods(&state)
             .iter()
             .any(|m| matches!(m, PaymentMethod::Ark { .. })));
+    }
+
+    #[test]
+    fn alias_recover_rejects_nonexistent_proof_file() {
+        let err =
+            cmd_alias_recover(Some("alice@example.com"), "nonexistent_proof.json").unwrap_err();
+        assert!(err.to_string().contains("failed to read proof file"));
+    }
+
+    #[test]
+    fn alias_recover_rejects_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_proof.json");
+        std::fs::write(&path, "not json").unwrap();
+        let err = cmd_alias_recover(Some("alice@example.com"), path.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("invalid KeyRecoveryProof JSON"));
     }
 }

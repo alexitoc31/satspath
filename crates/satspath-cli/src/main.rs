@@ -197,6 +197,12 @@ enum Command {
         command: ServerCommand,
     },
 
+    /// Alias management and sovereign key recovery commands
+    Alias {
+        #[command(subcommand)]
+        command: AliasCommand,
+    },
+
     /// Safe receiver-profile wallet: manage public receive methods, sign a
     /// profile, preview. Never moves funds or stores spending keys.
     Wallet {
@@ -235,6 +241,8 @@ enum WalletCommand {
     Init,
     /// Rotate the identity key and issue a KeyRotation proof
     Rotate,
+    /// Recover lost identity key using a pre-committed guardian threshold proof (KeyRecoveryProof)
+    Recover(WalletRecoverArgs),
     /// Set the alias + public receive methods, then sign and save the profile
     AddMethods(WalletAddMethodsArgs),
     /// Add/replace the Lightning Address (re-signs the profile)
@@ -278,6 +286,32 @@ struct WalletAddMethodsArgs {
     ark_server: Option<String>,
     #[arg(long)]
     ark_pubkey: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum AliasCommand {
+    /// Recover an alias identity key using a pre-committed guardian threshold proof (KeyRecoveryProof)
+    Recover(AliasRecoverArgs),
+}
+
+#[derive(Args)]
+struct AliasRecoverArgs {
+    /// Alias to recover (e.g. alice@example.com)
+    #[arg(long)]
+    alias: Option<String>,
+    /// Path to JSON file containing KeyRecoveryProof
+    #[arg(long = "proof-file", required = true)]
+    proof_file: String,
+}
+
+#[derive(Args)]
+struct WalletRecoverArgs {
+    /// Alias to recover (e.g. alice@example.com)
+    #[arg(long)]
+    alias: Option<String>,
+    /// Path to JSON file containing KeyRecoveryProof
+    #[arg(long = "proof-file", required = true)]
+    proof_file: String,
 }
 
 #[derive(Subcommand)]
@@ -589,6 +623,11 @@ async fn main() -> Result<()> {
             ServerCommand::Init { domain } => commands::cmd_server_init(&domain)?,
             ServerCommand::Check { domain } => commands::cmd_server_check(&domain).await?,
         },
+        Command::Alias { command } => match command {
+            AliasCommand::Recover(args) => {
+                commands::cmd_alias_recover(args.alias.as_deref(), &args.proof_file)?
+            }
+        },
         Command::Wallet { command } => match command {
             WalletCommand::Init => commands::cmd_wallet_init()?,
             WalletCommand::Rotate => commands::cmd_wallet_rotate()?,
@@ -611,6 +650,9 @@ async fn main() -> Result<()> {
             }
             WalletCommand::Show { debug } => commands::cmd_wallet_show(debug)?,
             WalletCommand::Publish { alias } => commands::cmd_wallet_publish(alias.as_deref())?,
+            WalletCommand::Recover(args) => {
+                commands::cmd_alias_recover(args.alias.as_deref(), &args.proof_file)?
+            }
             WalletCommand::Receive {
                 alias,
                 amount_sats,

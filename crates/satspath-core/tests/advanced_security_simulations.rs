@@ -24,6 +24,8 @@ fn create_test_profile(expires_at: Option<i64>) -> PaymentProfile {
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: None,
+        recovery: None,
     }
 }
 

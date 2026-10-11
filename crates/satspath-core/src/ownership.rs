@@ -1895,6 +1895,8 @@ mod tests {
             hybrid_pubkey: None,
             pqc_required: false,
             revoked: false,
+            recovery_policy: None,
+            recovery: None,
         };
         let mut signed = sign_profile(profile, &identity.secret).unwrap();
         assert!(verify_signed_profile(&signed).unwrap());
@@ -1987,6 +1989,8 @@ mod tests {
             hybrid_pubkey: None,
             pqc_required: false,
             revoked: false,
+            recovery_policy: None,
+            recovery: None,
         }
     }
 

@@ -198,6 +198,7 @@ pub fn verify_identifier_history(events: &[NameEvent]) -> Result<()> {
     }
     let identifier = &events[0].identifier_hash;
     let mut authorized_key = events[0].identity_pubkey.clone();
+    let mut active_recovery_policy: Option<crate::recovery::RecoveryPolicy> = None;
     let mut previous_hash: Option<String> = None;
     let mut revoked = false;
     for (index, event) in events.iter().enumerate() {
@@ -216,10 +217,46 @@ pub fn verify_identifier_history(events: &[NameEvent]) -> Result<()> {
         if revoked {
             return Err(TransparencyError::IdentifierRevoked.into());
         }
-        if event.action == NameAction::RecoverKey {
-            return Err(TransparencyError::RecoveryDisabled.into());
+        if event.action == NameAction::RecoverKey && event.rotation.is_some() {
+            return Err(TransparencyError::InvalidRecovery(
+                "recovery event must not contain a key rotation".into(),
+            )
+            .into());
         }
-        let signing_key = if event.action == NameAction::RotateKey {
+        if event.action != NameAction::RecoverKey && event.recovery.is_some() {
+            return Err(TransparencyError::InvalidRecovery(
+                "recovery proof is only permitted on RecoverKey events".into(),
+            )
+            .into());
+        }
+        if event.action != NameAction::RotateKey && event.rotation.is_some() {
+            return Err(TransparencyError::InvalidRotation(
+                "rotation proof is only permitted on RotateKey events".into(),
+            )
+            .into());
+        }
+        let signing_key = if event.action == NameAction::RecoverKey {
+            let policy = active_recovery_policy
+                .as_ref()
+                .ok_or(TransparencyError::RecoveryDisabled)?;
+            let recovery = event.recovery.as_ref().ok_or_else(|| {
+                TransparencyError::InvalidRecovery("missing recovery proof".into())
+            })?;
+            if recovery.previous_pubkey != authorized_key
+                || recovery.new_pubkey != event.identity_pubkey
+                || recovery.identifier_hash != event.identifier_hash
+                || recovery.previous_event_hash
+                    != event.previous_event_hash.clone().unwrap_or_default()
+                || recovery.sequence != event.sequence
+                || !recovery.verify(policy)?
+            {
+                return Err(TransparencyError::InvalidRecovery(
+                    "guardian authorization or new acceptance failed".into(),
+                )
+                .into());
+            }
+            event.identity_pubkey.clone()
+        } else if event.action == NameAction::RotateKey {
             let rotation = event
                 .rotation
                 .as_ref()
@@ -251,7 +288,11 @@ pub fn verify_identifier_history(events: &[NameEvent]) -> Result<()> {
         )? {
             return Err(TransparencyError::InvalidEventSignature.into());
         }
-        if event.action == NameAction::RotateKey {
+        if let Some(policy) = &event.recovery_policy {
+            policy.validate()?;
+            active_recovery_policy = Some(policy.clone());
+        }
+        if event.action == NameAction::RotateKey || event.action == NameAction::RecoverKey {
             authorized_key = event.identity_pubkey.clone();
         }
         revoked = event.action == NameAction::Revoke;
@@ -265,7 +306,36 @@ pub fn verify_key_continuity(events: &[NameEvent]) -> Result<bool> {
     Ok(true)
 }
 
-pub fn verify_event_transition(head: Option<&NameEvent>, proposed: &NameEvent) -> Result<()> {
+/// Validate an incremental transition between two adjacent events for an identifier,
+/// with an explicit active recovery policy.
+///
+/// NOTE: Full historical validation including recovery policy retention across
+/// updates that set `recovery_policy: None` must use `verify_identifier_history`
+/// (or `TransparencyLog::prepare_append`).
+pub fn verify_event_transition_with_policy(
+    head: Option<&NameEvent>,
+    proposed: &NameEvent,
+    active_recovery_policy: Option<&crate::recovery::RecoveryPolicy>,
+) -> Result<()> {
+    if proposed.action == NameAction::RecoverKey && proposed.rotation.is_some() {
+        return Err(TransparencyError::InvalidRecovery(
+            "recovery event must not contain a key rotation".into(),
+        )
+        .into());
+    }
+    if proposed.action != NameAction::RecoverKey && proposed.recovery.is_some() {
+        return Err(TransparencyError::InvalidRecovery(
+            "recovery proof is only permitted on RecoverKey events".into(),
+        )
+        .into());
+    }
+    if proposed.action != NameAction::RotateKey && proposed.rotation.is_some() {
+        return Err(TransparencyError::InvalidRotation(
+            "rotation proof is only permitted on RotateKey events".into(),
+        )
+        .into());
+    }
+
     match head {
         None => {
             if proposed.action != NameAction::Register || proposed.sequence != 0 {
@@ -304,7 +374,27 @@ pub fn verify_event_transition(head: Option<&NameEvent>, proposed: &NameEvent) -
                 return Err(TransparencyError::IdentifierRevoked.into());
             }
 
-            let signing_key = if proposed.action == NameAction::RotateKey {
+            let signing_key = if proposed.action == NameAction::RecoverKey {
+                let policy = active_recovery_policy.ok_or(TransparencyError::RecoveryDisabled)?;
+                let recovery = proposed.recovery.as_ref().ok_or_else(|| {
+                    TransparencyError::InvalidRecovery("missing recovery proof".into())
+                })?;
+
+                if recovery.previous_pubkey != head_event.identity_pubkey
+                    || recovery.new_pubkey != proposed.identity_pubkey
+                    || recovery.identifier_hash != proposed.identifier_hash
+                    || recovery.previous_event_hash
+                        != proposed.previous_event_hash.clone().unwrap_or_default()
+                    || recovery.sequence != proposed.sequence
+                    || !recovery.verify(policy)?
+                {
+                    return Err(TransparencyError::InvalidRecovery(
+                        "guardian authorization or new acceptance failed".into(),
+                    )
+                    .into());
+                }
+                proposed.identity_pubkey.clone()
+            } else if proposed.action == NameAction::RotateKey {
                 let rotation = proposed.rotation.as_ref().ok_or_else(|| {
                     TransparencyError::InvalidRotation("missing dual proof".into())
                 })?;
@@ -337,24 +427,41 @@ pub fn verify_event_transition(head: Option<&NameEvent>, proposed: &NameEvent) -
             )? {
                 return Err(TransparencyError::InvalidEventSignature.into());
             }
+
+            if let Some(policy) = &proposed.recovery_policy {
+                policy.validate()?;
+            }
         }
     }
 
-    if proposed.action == NameAction::RecoverKey {
-        return Err(TransparencyError::RecoveryDisabled.into());
-    }
-
-    if head.is_none()
-        && !verify_message_signature(
+    if head.is_none() {
+        if proposed.action == NameAction::RecoverKey {
+            return Err(TransparencyError::RecoveryDisabled.into());
+        }
+        if let Some(policy) = &proposed.recovery_policy {
+            policy.validate()?;
+        }
+        if !verify_message_signature(
             &proposed.signing_message()?,
             &proposed.owner_signature,
             &proposed.identity_pubkey,
-        )?
-    {
-        return Err(TransparencyError::InvalidEventSignature.into());
+        )? {
+            return Err(TransparencyError::InvalidEventSignature.into());
+        }
     }
 
     Ok(())
+}
+
+/// Validate an incremental transition between two adjacent events for an identifier.
+///
+/// NOTE: Full historical validation including recovery policy retention across
+/// updates that set `recovery_policy: None` must use `verify_identifier_history`
+/// (or `TransparencyLog::prepare_append`). When checking an isolated single-step
+/// transition, `head.recovery_policy` is evaluated as the active policy.
+pub fn verify_event_transition(head: Option<&NameEvent>, proposed: &NameEvent) -> Result<()> {
+    let active_policy = head.and_then(|h| h.recovery_policy.as_ref());
+    verify_event_transition_with_policy(head, proposed, active_policy)
 }
 
 pub fn next_identifier_sequence(

@@ -25,6 +25,8 @@ fn create_test_profile(alias: &str, pubkey_hex: &str, ln_address: &str) -> Payme
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: None,
+        recovery: None,
     }
 }
 

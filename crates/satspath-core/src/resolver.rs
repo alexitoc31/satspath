@@ -226,6 +226,8 @@ mod tests {
                     hybrid_pubkey: None,
                     pqc_required: false,
                     revoked: false,
+                    recovery_policy: None,
+                    recovery: None,
                 };
                 Ok(sign_profile(profile, &kp.secret_key).unwrap())
             } else {

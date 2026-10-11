@@ -203,11 +203,11 @@ mod tests {
 
     use crate::config::AppState;
     use crate::handlers::{
-        profile::{rotate_profile_key, sign_and_store},
+        profile::{recover_profile_key, rotate_profile_key, sign_and_store},
         quote::{pay_response, quote_response},
         resolve::resolve_v2_envelope,
         send::send_response,
-        wallet::{load_or_create_identity, save_wallet},
+        wallet::{load_or_create_identity, save_identity_key, save_wallet},
     };
     use crate::rate_limit;
     use crate::server::{audit_binding_security, serve_server};
@@ -483,6 +483,8 @@ mod tests {
             hybrid_pubkey: None,
             pqc_required: false,
             revoked: false,
+            recovery_policy: None,
+            recovery: None,
         };
         Registry::open(dir.path())
             .unwrap()
@@ -557,6 +559,370 @@ mod tests {
         assert_eq!(response.sequence, 1);
         assert_eq!(profile.profile.sequence, Some(latest.sequence));
         assert_eq!(latest.rotation.as_ref().unwrap().sequence, latest.sequence);
+    }
+
+    #[test]
+    fn update_profile_configures_and_commits_recovery_policy() {
+        use satspath_core::recovery::RecoveryPolicy;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = load_or_create_identity(dir.path()).unwrap();
+        wallet.alias = Some("alice@example.com".into());
+        wallet.lightning_address = Some("alice@example.com".into());
+        sign_and_store(dir.path(), &mut wallet, "devnet").unwrap();
+        save_wallet(dir.path(), &wallet).unwrap();
+
+        let g1 = generate_identity_keypair();
+        let g2 = generate_identity_keypair();
+        let policy = RecoveryPolicy::new(
+            2,
+            vec![
+                hex::encode(g1.public_key.serialize()),
+                hex::encode(g2.public_key.serialize()),
+            ],
+        )
+        .unwrap();
+
+        let state = test_state(dir.path());
+        let update_req = crate::types::ProfileUpdateRequest {
+            alias: Some("alice@example.com".into()),
+            lightning_address: None,
+            onchain_address: None,
+            onchain_pubkey: None,
+            ark_server: None,
+            ark_pubkey: None,
+            remove_methods: vec![],
+            recovery_policy: Some(policy.clone()),
+        };
+
+        let response = crate::handlers::profile::update_profile(&state, update_req).unwrap();
+        assert_eq!(
+            response.wallet.recovery_policy.as_ref().unwrap().threshold,
+            2
+        );
+
+        let store = TransactionalTransparencyStore::open(dir.path()).unwrap();
+        let profile = store.profile("alice@example.com").unwrap().unwrap();
+        assert_eq!(profile.profile.recovery_policy, Some(policy.clone()));
+
+        let log = store.load_log().unwrap();
+        let latest = log.events().last().unwrap();
+        assert_eq!(latest.action, satspath_core::NameAction::UpdateProfile);
+        assert_eq!(latest.recovery_policy, Some(policy));
+    }
+
+    #[test]
+    fn key_recovery_with_guardian_threshold_succeeds_and_updates_transparency_log() {
+        use satspath_core::recovery::{
+            sign_guardian_authorization, KeyRecoveryProof, RecoveryPolicy,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = generate_identity_keypair();
+        let pubkey_hex = hex::encode(key.public_key.serialize());
+
+        let g1 = generate_identity_keypair();
+        let g2 = generate_identity_keypair();
+        let g3 = generate_identity_keypair();
+        let g1_pk = hex::encode(g1.public_key.serialize());
+        let g2_pk = hex::encode(g2.public_key.serialize());
+        let g3_pk = hex::encode(g3.public_key.serialize());
+
+        let policy = RecoveryPolicy::new(2, vec![g1_pk.clone(), g2_pk.clone(), g3_pk]).unwrap();
+
+        let initial_profile = PaymentProfile {
+            alias: "alice@example.com".into(),
+            identity_pubkey: pubkey_hex.clone(),
+            methods: vec![PaymentMethod::Lightning {
+                label: "LN".into(),
+                lightning_address: Some("alice@example.com".into()),
+                lnurl: None,
+                bolt12: None,
+                receiver_pubkey: None,
+            }],
+            updated_at: 1_700_000_000,
+            expires_at: None,
+            sequence: Some(0),
+            preferences: vec![],
+            nonce: None,
+            rotation: None,
+            method_verifications: vec![],
+            hybrid_pubkey: None,
+            pqc_required: false,
+            revoked: false,
+            recovery_policy: Some(policy.clone()),
+            recovery: None,
+        };
+        let signed_initial = sign_profile(initial_profile, &key.secret_key).unwrap();
+
+        let store = TransactionalTransparencyStore::open(dir.path()).unwrap();
+        let log = store.load_log().unwrap();
+        let id_hash = satspath_core::privacy::identifier_hash("alice@example.com");
+        let mut initial_event = satspath_core::NameEvent {
+            version: 1,
+            identifier_hash: id_hash.clone(),
+            action: satspath_core::NameAction::Register,
+            identity_pubkey: pubkey_hex.clone(),
+            profile_hash: satspath_core::transparency::profile_hash(&signed_initial).unwrap(),
+            sequence: 0,
+            previous_event_hash: None,
+            created_at: 1_700_000_000,
+            identifier_attestation_hash: None,
+            removed_method_hashes: vec![],
+            rotation: None,
+            recovery_policy: Some(policy),
+            recovery: None,
+            owner_signature: String::new(),
+        };
+        initial_event.sign(&key.secret_key).unwrap();
+        let candidate = log
+            .prepare_append(initial_event.clone(), &signed_initial)
+            .unwrap();
+        let operator =
+            crate::handlers::transparency::load_or_create_transparency_operator(dir.path())
+                .unwrap();
+        let checkpoint = candidate.prepare_checkpoint(&operator).unwrap();
+        store
+            .commit_profile_event_checkpoint(
+                "alice@example.com",
+                &signed_initial,
+                &initial_event,
+                &checkpoint,
+            )
+            .unwrap();
+
+        // Simulate recovery
+        let new_key = generate_identity_keypair();
+        let new_pk_hex = hex::encode(new_key.public_key.serialize());
+        let prev_hash = initial_event.signed_event_hash().unwrap();
+        let now_ts = chrono::Utc::now().timestamp();
+
+        let sig1 = sign_guardian_authorization(
+            &id_hash,
+            &pubkey_hex,
+            &new_pk_hex,
+            &prev_hash,
+            1,
+            now_ts,
+            &g1.secret_key,
+        );
+        let sig2 = sign_guardian_authorization(
+            &id_hash,
+            &pubkey_hex,
+            &new_pk_hex,
+            &prev_hash,
+            1,
+            now_ts,
+            &g2.secret_key,
+        );
+
+        let proof = KeyRecoveryProof::create(
+            id_hash,
+            pubkey_hex,
+            new_pk_hex.clone(),
+            &new_key.secret_key,
+            prev_hash,
+            1,
+            now_ts,
+            vec![sig1, sig2],
+        )
+        .unwrap();
+
+        let mut recovered_profile = signed_initial.profile.clone();
+        recovered_profile.identity_pubkey = new_pk_hex.clone();
+        recovered_profile.sequence = Some(1);
+        recovered_profile.recovery = Some(proof.clone());
+        let signed_recovered = sign_profile(recovered_profile, &new_key.secret_key).unwrap();
+
+        save_identity_key(dir.path(), &new_key.secret_key).unwrap();
+
+        let state = test_state(dir.path());
+        let request = crate::types::ProfileRecoverRequest {
+            alias: "alice@example.com".into(),
+            proof,
+            signed_profile: signed_recovered,
+            event_created_at: None,
+            event_signature: None,
+        };
+        let response = recover_profile_key(&state, request).unwrap();
+        assert_eq!(response.alias, "alice@example.com");
+        assert_eq!(response.sequence, 1);
+
+        let updated_store = TransactionalTransparencyStore::open(dir.path()).unwrap();
+        let current_profile = updated_store.profile("alice@example.com").unwrap().unwrap();
+        assert_eq!(current_profile.profile.identity_pubkey, new_pk_hex);
+        assert_eq!(current_profile.profile.sequence, Some(1));
+    }
+
+    #[test]
+    fn key_recovery_remote_event_signature_with_mismatched_timestamp_is_rejected() {
+        use satspath_core::recovery::{
+            sign_guardian_authorization, KeyRecoveryProof, RecoveryPolicy,
+        };
+        use satspath_core::transparency::{NameAction, NameEvent, TransparencyError};
+        use satspath_core::SatsPathError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = generate_identity_keypair();
+        let pubkey_hex = hex::encode(key.public_key.serialize());
+
+        let g1 = generate_identity_keypair();
+        let g2 = generate_identity_keypair();
+        let g1_pk = hex::encode(g1.public_key.serialize());
+        let g2_pk = hex::encode(g2.public_key.serialize());
+
+        let policy = RecoveryPolicy::new(1, vec![g1_pk.clone(), g2_pk.clone()]).unwrap();
+        let initial_profile = PaymentProfile {
+            sequence: Some(0),
+            alias: "bob@example.com".into(),
+            identity_pubkey: pubkey_hex.clone(),
+            methods: vec![],
+            updated_at: 1_700_000_000,
+            expires_at: None,
+            preferences: vec![],
+            nonce: None,
+            rotation: None,
+            method_verifications: vec![],
+            hybrid_pubkey: None,
+            pqc_required: false,
+            revoked: false,
+            recovery_policy: Some(policy.clone()),
+            recovery: None,
+        };
+        let signed_initial = sign_profile(initial_profile, &key.secret_key).unwrap();
+
+        let store = TransactionalTransparencyStore::open(dir.path()).unwrap();
+        let log = store.load_log().unwrap();
+        let genesis_event = NameEvent {
+            version: 1,
+            identifier_hash: satspath_core::privacy::identifier_hash("bob@example.com"),
+            action: NameAction::Register,
+            identity_pubkey: pubkey_hex.clone(),
+            profile_hash: satspath_core::transparency::profile_hash(&signed_initial).unwrap(),
+            sequence: 0,
+            previous_event_hash: None,
+            created_at: 1_700_000_000,
+            identifier_attestation_hash: None,
+            removed_method_hashes: Vec::new(),
+            rotation: None,
+            recovery_policy: Some(policy),
+            recovery: None,
+            owner_signature: String::new(),
+        };
+        let mut signed_genesis = genesis_event;
+        signed_genesis.sign(&key.secret_key).unwrap();
+
+        let candidate = log
+            .prepare_append(signed_genesis.clone(), &signed_initial)
+            .unwrap();
+        let operator =
+            crate::handlers::transparency::load_or_create_transparency_operator(dir.path())
+                .unwrap();
+        let cp = candidate.prepare_checkpoint(&operator).unwrap();
+        store
+            .commit_profile_event_checkpoint(
+                "bob@example.com",
+                &signed_initial,
+                &signed_genesis,
+                &cp,
+            )
+            .unwrap();
+
+        let new_key = generate_identity_keypair();
+        let new_pk_hex = hex::encode(new_key.public_key.serialize());
+        let sig1 = sign_guardian_authorization(
+            &satspath_core::privacy::identifier_hash("bob@example.com"),
+            &pubkey_hex,
+            &new_pk_hex,
+            &signed_genesis.event_hash().unwrap(),
+            1,
+            1_700_000_100,
+            &g1.secret_key,
+        );
+
+        let proof = KeyRecoveryProof::create(
+            satspath_core::privacy::identifier_hash("bob@example.com"),
+            pubkey_hex,
+            new_pk_hex.clone(),
+            &new_key.secret_key,
+            signed_genesis.event_hash().unwrap(),
+            1,
+            1_700_000_100,
+            vec![sig1],
+        )
+        .unwrap();
+
+        let mut recovered_profile = signed_initial.profile.clone();
+        recovered_profile.identity_pubkey = new_pk_hex.clone();
+        recovered_profile.sequence = Some(1);
+        recovered_profile.recovery = Some(proof.clone());
+        let signed_recovered = sign_profile(recovered_profile, &new_key.secret_key).unwrap();
+
+        // Sign the event remotely with signed_time
+        let signed_time = chrono::Utc::now().timestamp();
+        let mut remote_event = NameEvent {
+            version: 1,
+            identifier_hash: satspath_core::privacy::identifier_hash("bob@example.com"),
+            action: NameAction::RecoverKey,
+            identity_pubkey: new_pk_hex.clone(),
+            profile_hash: satspath_core::transparency::profile_hash(&signed_recovered).unwrap(),
+            sequence: 1,
+            previous_event_hash: Some(signed_genesis.event_hash().unwrap()),
+            created_at: signed_time,
+            identifier_attestation_hash: None,
+            removed_method_hashes: Vec::new(),
+            rotation: None,
+            recovery_policy: signed_recovered.profile.recovery_policy.clone(),
+            recovery: Some(proof.clone()),
+            owner_signature: String::new(),
+        };
+        remote_event.sign(&new_key.secret_key).unwrap();
+        let valid_remote_sig = remote_event.owner_signature.clone();
+
+        let state = test_state(dir.path());
+
+        // 1. Submit with mismatched created_at timestamp -> must fail with InvalidEventSignature
+        let bad_request = crate::types::ProfileRecoverRequest {
+            alias: "bob@example.com".into(),
+            proof: proof.clone(),
+            signed_profile: signed_recovered.clone(),
+            event_created_at: Some(signed_time + 10),
+            event_signature: Some(valid_remote_sig.clone()),
+        };
+        let err = recover_profile_key(&state, bad_request).unwrap_err();
+        let is_invalid_sig = err.downcast_ref::<SatsPathError>().is_some_and(|e| {
+            matches!(
+                e,
+                SatsPathError::Transparency(TransparencyError::InvalidEventSignature)
+            )
+        });
+        assert!(
+            is_invalid_sig,
+            "expected InvalidEventSignature, got: {err:?}"
+        );
+
+        // 2. Submit with event_signature but missing event_created_at -> must fail immediately
+        let missing_time_request = crate::types::ProfileRecoverRequest {
+            alias: "bob@example.com".into(),
+            proof: proof.clone(),
+            signed_profile: signed_recovered.clone(),
+            event_created_at: None,
+            event_signature: Some(valid_remote_sig.clone()),
+        };
+        let err = recover_profile_key(&state, missing_time_request).unwrap_err();
+        assert!(err.to_string().contains("event_created_at is required"));
+
+        // 3. Submit with matching created_at timestamp -> must succeed
+        let good_request = crate::types::ProfileRecoverRequest {
+            alias: "bob@example.com".into(),
+            proof,
+            signed_profile: signed_recovered,
+            event_created_at: Some(signed_time),
+            event_signature: Some(valid_remote_sig),
+        };
+        let response = recover_profile_key(&state, good_request).unwrap();
+        assert_eq!(response.alias, "bob@example.com");
+        assert_eq!(response.sequence, 1);
     }
 
     #[test]

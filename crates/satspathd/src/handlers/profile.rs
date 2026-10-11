@@ -12,8 +12,8 @@ use crate::handlers::wallet::{
     load_identity_key, load_or_create_identity, load_wallet, save_identity_key, save_wallet,
 };
 use crate::types::{
-    build_methods, now, AliasRequest, KeyRotationResponse, ProfileResponse, ProfileUpdateRequest,
-    VerifyRequest,
+    build_methods, now, AliasRequest, KeyRecoveryResponse, KeyRotationResponse,
+    ProfileRecoverRequest, ProfileResponse, ProfileUpdateRequest, VerifyRequest,
 };
 
 pub(crate) fn profile_response(state: &AppState) -> Result<ProfileResponse> {
@@ -121,9 +121,15 @@ pub(crate) fn apply_method_updates(
         || body.onchain_pubkey.is_some()
         || body.ark_server.is_some()
         || body.ark_pubkey.is_some()
-        || !body.remove_methods.is_empty();
+        || !body.remove_methods.is_empty()
+        || body.recovery_policy.is_some();
     if !allow_empty && !has_method {
         anyhow::bail!("provide at least one receive method");
+    }
+
+    if let Some(policy) = body.recovery_policy {
+        policy.validate()?;
+        wallet.recovery_policy = Some(policy);
     }
 
     for method in &body.remove_methods {
@@ -214,6 +220,12 @@ pub(crate) fn sign_and_store(
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: wallet.recovery_policy.clone().or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|old| old.profile.recovery_policy.clone())
+        }),
+        recovery: None,
     };
     let signed = sign_profile(profile, &secret)?;
     let new_descriptors: std::collections::HashSet<_> = signed
@@ -251,6 +263,8 @@ pub(crate) fn sign_and_store(
         identifier_attestation_hash: None,
         removed_method_hashes,
         rotation: signed.profile.rotation.clone(),
+        recovery_policy: signed.profile.recovery_policy.clone(),
+        recovery: signed.profile.recovery.clone(),
         owner_signature: String::new(),
     };
     event.sign(&secret)?;
@@ -309,6 +323,8 @@ pub(crate) fn rotate_profile_key(state: &AppState) -> Result<KeyRotationResponse
         identifier_attestation_hash: None,
         removed_method_hashes: Vec::new(),
         rotation: signed.profile.rotation.clone(),
+        recovery_policy: signed.profile.recovery_policy.clone(),
+        recovery: signed.profile.recovery.clone(),
         owner_signature: String::new(),
     };
     event.sign(&old_secret)?;
@@ -325,6 +341,137 @@ pub(crate) fn rotate_profile_key(state: &AppState) -> Result<KeyRotationResponse
         alias,
         sequence,
         previous_fingerprint: fingerprint_pubkey(&old_pubkey)?,
+        new_fingerprint: fingerprint_pubkey(&signed.profile.identity_pubkey)?,
+        event_hash: event.signed_event_hash()?,
+        checkpoint_hash: checkpoint.checkpoint_hash()?,
+    })
+}
+
+/// Body-only recovery request checks. These need no store access, so they run before
+/// any O(log size) transparency replay on the unauthenticated recovery route.
+pub(crate) fn validate_recovery_request_shape(body: &ProfileRecoverRequest) -> Result<()> {
+    let signed = &body.signed_profile;
+    if signed.profile.alias != body.alias {
+        anyhow::bail!("signed profile alias mismatch");
+    }
+    if !verify_signed_profile(signed)? {
+        anyhow::bail!("signed profile signature is invalid");
+    }
+    if signed.profile.recovery.as_ref() != Some(&body.proof) {
+        anyhow::bail!("profile recovery object does not match submitted proof");
+    }
+    if signed.profile.rotation.is_some() {
+        anyhow::bail!("recovery profile must not contain a key rotation");
+    }
+    if signed.profile.recovery_policy.is_none() {
+        anyhow::bail!("recovered profile must carry a recovery_policy; policies cannot be removed");
+    }
+    satspath_core::validation::validate_public_profile(&signed.profile)?;
+    Ok(())
+}
+
+pub(crate) fn recover_profile_key(
+    state: &AppState,
+    body: ProfileRecoverRequest,
+) -> Result<KeyRecoveryResponse> {
+    use satspath_core::crypto::fingerprint_pubkey;
+    use satspath_core::recovery::verify_key_recovery;
+
+    validate_recovery_request_shape(&body)?;
+
+    let alias = body.alias;
+    let proof = body.proof;
+    let signed = body.signed_profile;
+
+    let store = TransactionalTransparencyStore::open(&state.home)?;
+    let existing = store
+        .profile(&alias)?
+        .ok_or_else(|| SatsPathError::AliasNotFound(alias.clone()))?;
+
+    // Cryptographically verify the recovery proof against the identifier's committed policy
+    if !verify_key_recovery(&existing, &signed)? {
+        anyhow::bail!("recovery proof failed verification against existing profile/policy");
+    }
+
+    let log = store.load_log()?;
+    let identifier_hash = satspath_core::privacy::identifier_hash(&alias);
+    let history: Vec<_> = log.history(&identifier_hash).into_iter().cloned().collect();
+    let sequence = satspath_core::next_identifier_sequence(Some(&existing), &history)?;
+
+    if signed.profile.sequence != Some(sequence) || proof.sequence != sequence {
+        anyhow::bail!("recovery sequence mismatch: expected {sequence}");
+    }
+
+    let previous_event = history
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("recovery requires existing history"))?;
+    let previous_event_hash = previous_event.signed_event_hash()?;
+
+    if proof.previous_event_hash != previous_event_hash {
+        anyhow::bail!("proof previous_event_hash mismatch");
+    }
+
+    let current_time = now();
+    let created_at = if let Some(client_time) = body.event_created_at {
+        if client_time.abs_diff(current_time) > 300 {
+            anyhow::bail!("client event timestamp out of allowable window (+/- 300s)");
+        }
+        client_time
+    } else {
+        if body.event_signature.is_some() {
+            anyhow::bail!("event_created_at is required when providing a remote event_signature");
+        }
+        current_time
+    };
+
+    let mut event = NameEvent {
+        version: 1,
+        identifier_hash,
+        action: NameAction::RecoverKey,
+        identity_pubkey: signed.profile.identity_pubkey.clone(),
+        profile_hash: satspath_core::transparency::profile_hash(&signed)?,
+        sequence,
+        previous_event_hash: Some(previous_event_hash),
+        created_at,
+        identifier_attestation_hash: None,
+        removed_method_hashes: Vec::new(),
+        rotation: None,
+        recovery_policy: signed.profile.recovery_policy.clone(),
+        recovery: Some(proof.clone()),
+        owner_signature: String::new(),
+    };
+
+    if let Ok(new_secret) = load_identity_key(&state.home, &signed.profile.identity_pubkey) {
+        event.sign(&new_secret)?;
+    } else if let Some(sig) = body.event_signature {
+        event.owner_signature = sig;
+    } else {
+        anyhow::bail!(
+            "event_signature is required when new identity private key is not present in local keystore"
+        );
+    }
+
+    let candidate = log.prepare_append(event.clone(), &signed)?;
+    let operator = load_or_create_transparency_operator(&state.home)?;
+    let checkpoint = candidate.prepare_checkpoint(&operator)?;
+    store.commit_profile_event_checkpoint(&alias, &signed, &event, &checkpoint)?;
+
+    let mut wallet = load_wallet(&state.home)
+        .map_err(|e| anyhow::anyhow!("recovery committed but wallet could not be loaded: {e}"))?;
+    if wallet.alias.as_deref() == Some(&alias)
+        && load_identity_key(&state.home, &signed.profile.identity_pubkey).is_ok()
+    {
+        wallet.identity_pubkey = Some(signed.profile.identity_pubkey.clone());
+        wallet.recovery_policy = signed.profile.recovery_policy.clone();
+        wallet.updated_at = Some(now());
+        save_wallet(&state.home, &wallet)
+            .map_err(|e| anyhow::anyhow!("recovery committed but wallet update failed: {e}"))?;
+    }
+
+    Ok(KeyRecoveryResponse {
+        alias,
+        sequence,
+        previous_fingerprint: fingerprint_pubkey(&existing.profile.identity_pubkey)?,
         new_fingerprint: fingerprint_pubkey(&signed.profile.identity_pubkey)?,
         event_hash: event.signed_event_hash()?,
         checkpoint_hash: checkpoint.checkpoint_hash()?,

@@ -286,6 +286,8 @@ fn test_bip352_profile_validation_integration() {
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: None,
+        recovery: None,
     };
 
     assert!(validate_public_profile(&valid_profile).is_ok());
@@ -316,6 +318,8 @@ fn test_bip352_profile_validation_integration() {
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: None,
+        recovery: None,
     };
 
     assert!(validate_public_profile(&invalid_profile).is_err());

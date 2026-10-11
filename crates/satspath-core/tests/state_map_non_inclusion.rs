@@ -172,6 +172,8 @@ fn test_checkpoint_map_root_binding_and_backward_compatibility() {
             hybrid_pubkey: None,
             pqc_required: false,
             revoked: false,
+            recovery_policy: None,
+            recovery: None,
         },
         &key.secret_key,
     )
@@ -189,6 +191,8 @@ fn test_checkpoint_map_root_binding_and_backward_compatibility() {
         identifier_attestation_hash: None,
         removed_method_hashes: Vec::new(),
         rotation: None,
+        recovery_policy: None,
+        recovery: None,
         owner_signature: String::new(),
     };
     event.sign(&key.secret_key).expect("sign event");

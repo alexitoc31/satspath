@@ -35,6 +35,10 @@ pub struct NameEvent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_method_hashes: Vec<String>,
     pub rotation: Option<crate::rotation::KeyRotation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_policy: Option<crate::recovery::RecoveryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::recovery::KeyRecoveryProof>,
     pub owner_signature: String,
 }
 
@@ -51,6 +55,10 @@ struct UnsignedEvent<'a> {
     identifier_attestation_hash: &'a Option<String>,
     removed_method_hashes: &'a [String],
     rotation: &'a Option<crate::rotation::KeyRotation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_policy: &'a Option<crate::recovery::RecoveryPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: &'a Option<crate::recovery::KeyRecoveryProof>,
 }
 
 impl NameEvent {
@@ -67,6 +75,8 @@ impl NameEvent {
             identifier_attestation_hash: &self.identifier_attestation_hash,
             removed_method_hashes: &self.removed_method_hashes,
             rotation: &self.rotation,
+            recovery_policy: &self.recovery_policy,
+            recovery: &self.recovery,
         })?;
         Ok(canonical_json::to_string(&value)
             .map_err(|e| crate::SatsPathError::SerializationError(e.to_string()))?

@@ -13,6 +13,7 @@ pub mod platform;
 pub mod pointer;
 pub mod privacy;
 pub mod profile;
+pub mod recovery;
 pub mod registry;
 pub mod rotation;
 pub mod split;
@@ -72,6 +73,10 @@ pub use privacy::{canonical_identifier, identifier_hash, validate_ascii_identifi
 pub use profile::{
     Bolt12Offer, ClaimNotification, ClaimPolicy, Invite, InviteRecord, InviteStatus, PaymentMethod,
     PaymentProfile, PaymentRequest, SignedPaymentProfile,
+};
+pub use recovery::{
+    recover_identity_key, recovery_message, sign_guardian_authorization, verify_key_recovery,
+    GuardianSignature, KeyRecoveryProof, RecoveryPolicy,
 };
 pub use rotation::{
     apply_key_rotation, get_effective_identity_pubkey, is_rotation_valid, rotate_identity_key,

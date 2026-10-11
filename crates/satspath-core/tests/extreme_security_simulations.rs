@@ -26,6 +26,8 @@ fn create_pqc_profile() -> PaymentProfile {
         hybrid_pubkey: None,
         pqc_required: true, // Quantum resistant flag
         revoked: false,
+        recovery_policy: None,
+        recovery: None,
     }
 }
 

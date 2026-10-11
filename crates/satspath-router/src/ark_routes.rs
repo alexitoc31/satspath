@@ -140,6 +140,8 @@ mod tests {
                 hybrid_pubkey: None,
                 pqc_required: false,
                 revoked: false,
+                recovery_policy: None,
+                recovery: None,
             },
             signature: "sig".into(),
             hybrid_signature: None,

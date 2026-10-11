@@ -20,7 +20,7 @@ flowchart LR
   T --> C[Operator-signed checkpoint]
 ```
 
-Startup deterministically replays every history and fails closed on corruption. Checkpoints use atomic rename. Events contain `identifier_hash`, not a plaintext consumer email. Recovery exists in the enum but is disabled.
+Startup deterministically replays every history and fails closed on corruption. Checkpoints use atomic rename. Events contain `identifier_hash`, not a plaintext consumer email. Recovery is supported via pre-committed M-of-N `RecoveryPolicy` (see [key_recovery.md](key_recovery.md)); if no policy was committed, recovery fails closed.
 
 ```text
 signing_payload_hash = SHA256(UTF8("SatsPathNameEventPayloadV1") || canonical_json_utf8(event_without_owner_signature))
@@ -30,7 +30,7 @@ leaf_hash            = SHA256(0x00 || raw_32_byte_signed_event_hash)
 node_hash  = SHA256(0x01 || left_32 || right_32)
 ```
 
-`previous_event_hash` and Merkle leaves use `signed_event_hash`, so the tree commits to the exact owner signature, rotation evidence, attestation hash and method-removal evidence. The exact profile and rotation encodings are in `protocol.md`.
+`previous_event_hash` and Merkle leaves use `signed_event_hash`, so the tree commits to the exact owner signature, rotation evidence, attestation hash, method-removal evidence, and recovery proof. The exact profile and rotation encodings are in `protocol.md`.
 
 ## Resolution and proof verification
 
@@ -52,7 +52,7 @@ Inclusion verification is accepted only when proof root and size equal the exact
 
 The resolver returns separate states for profile signature, identifier attestation, key continuity, inclusion, checkpoint consistency and payment-method ownership. Missing evidence never becomes a vague `verified: true`.
 
-## Key rotation
+## Key rotation and recovery
 
 ```mermaid
 flowchart LR
@@ -64,7 +64,9 @@ flowchart LR
   P --> V
 ```
 
-Both statements bind identifier hash, old/new keys, previous signed-event hash, the exact canonical next sequence and timestamp. Registration is sequence 0 and `profile.sequence == event.sequence == rotation.sequence`. Direct self-signed replacement is rejected. No emergency recovery is invented.
+Both rotation statements bind identifier hash, old/new keys, previous signed-event hash, the exact canonical next sequence and timestamp. Registration is sequence 0 and `profile.sequence == event.sequence == rotation.sequence`. Direct self-signed replacement is rejected.
+
+When an identity key is lost, recovery cannot be claimed arbitrarily or via SMS/email resets. Instead, an identifier may pre-commit an $M$-of-$N$ guardian `RecoveryPolicy`. If no policy was committed, recovery is strictly disabled (fail-closed). When a policy is active, $M$ guardian signatures (`SatsPathKeyRecoveryAuthorizationV1`) and new key acceptance (`SatsPathKeyRecoveryAcceptanceV1`) are validated in a `RecoverKey` event. See [key_recovery.md](key_recovery.md) for full details.
 
 ## Checkpoint consistency and split views
 
@@ -139,7 +141,7 @@ Read APIs cover status, paginated events/checkpoints, identifier/event/checkpoin
 - First contact is TOFU unless the namespace-to-key binding is independently verified out-of-band or confirmed through a trusted identity anchor. Witness quorums improve consistency and split-view detection but do not by themselves authenticate the initial binding.
 - A compromised verifier can attest a false binding.
 - A compromised current key can update, revoke or authorize rotation; transparency makes unauthorized actions publicly detectable and attributable, but cannot undo valid cryptographic signatures.
-- A lost key has no recovery in V1. Email recovery is deliberately avoided because it would reduce security to the email provider.
+- A lost key cannot be recovered via email or SMS (strictly rejected to preserve non-custodial sovereignty). In SatsPath, alias recovery is supported via pre-committed M-of-N cryptographic guardian threshold proofs (subject to guardian collusion limits; guardian recovery fails closed if no policy was pre-committed). See [Key Recovery](key_recovery.md).
 - A malicious operator can attempt split views; client pinning and $K$-of-$N$ witness quorums detect local rollback and equivocation. Optional Nostr checkpoint gossip detects attributable same-size forks once two trusted observers' signed views reach a common monitor. Relay censorship/eclipsing or forks at different sizes remain possible limitations.
 - Bitcoin regtest anchoring provides auditable public evidence; independent OP_RETURNs do not provide Catena's single-history UTXO continuation property.
 - Current-state non-inclusion proofs (`StateMap`) are bound to checkpoints; full audit of sparse Merkle implementation is pending external cryptographic review.

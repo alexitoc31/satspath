@@ -68,8 +68,9 @@ pub use tree::{consistency_proof, leaf_hash, merkle_root, node_hash, verify_cons
 pub use verifier::{
     next_identifier_sequence, verify_checkpoint, verify_checkpoint_inclusion,
     verify_checkpoint_state_binding, verify_checkpoint_transition, verify_consistency_proof,
-    verify_event_profile, verify_event_transition, verify_identifier_history,
-    verify_inclusion_proof, verify_key_continuity, verify_state_map_proof,
+    verify_event_profile, verify_event_transition, verify_event_transition_with_policy,
+    verify_identifier_history, verify_inclusion_proof, verify_key_continuity,
+    verify_state_map_proof,
 };
 
 use thiserror::Error;
@@ -110,6 +111,8 @@ pub enum TransparencyError {
     IdentifierRevoked,
     #[error("recovery is disabled")]
     RecoveryDisabled,
+    #[error("invalid key recovery: {0}")]
+    InvalidRecovery(String),
     #[error("corrupt transparency store: {0}")]
     CorruptStore(String),
     #[error("invalid identifier attestation: {0}")]

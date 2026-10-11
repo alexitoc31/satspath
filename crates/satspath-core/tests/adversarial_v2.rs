@@ -19,6 +19,8 @@ fn test_reject_old_profile_replay() {
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: None,
+        recovery: None,
     };
 
     // Test our local expiration logic

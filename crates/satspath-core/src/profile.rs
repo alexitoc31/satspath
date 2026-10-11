@@ -199,6 +199,12 @@ pub struct PaymentProfile {
     /// Indicates if this profile (and identity key) has been revoked by the owner.
     #[serde(default)]
     pub revoked: bool,
+    /// Optional pre-committed recovery policy (Issue #97).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_policy: Option<crate::recovery::RecoveryPolicy>,
+    /// Optional key recovery proof object (Issue #97).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::recovery::KeyRecoveryProof>,
 }
 
 /// A payment profile together with the owner's signature over its contents.

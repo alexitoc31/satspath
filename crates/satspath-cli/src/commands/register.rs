@@ -90,6 +90,8 @@ pub async fn cmd_register(
         hybrid_pubkey: None,
         pqc_required: false,
         revoked: false,
+        recovery_policy: None,
+        recovery: None,
     };
 
     let signed = sign_profile(profile, &kp.secret_key)?;
@@ -122,7 +124,8 @@ pub async fn cmd_register(
          profile. Back up {} securely.",
         key_path.display()
     );
-    println!("   There is no recovery mechanism in v0.1. A future version may support BIP-39.");
+    println!("   This randomly generated key cannot be re-derived from a seed, and no guardian recovery policy is committed for it.");
+    println!("   The CLI cannot yet commit a guardian RecoveryPolicy; CLI guardian recovery is therefore unavailable for this profile. See docs/key_recovery.md.");
     println!();
     println!(
         "Prove ownership of a method:  satspath prove {} --method-index 0",

@@ -82,6 +82,8 @@ pub(crate) struct WalletState {
     pub(crate) created_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_policy: Option<satspath_core::recovery::RecoveryPolicy>,
 }
 
 #[derive(Clone)]
