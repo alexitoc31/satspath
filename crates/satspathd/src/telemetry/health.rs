@@ -44,15 +44,37 @@ pub fn check_sqlite_health(home: &Path) -> DependencyHealth {
     match TransactionalTransparencyStore::open(home) {
         Ok(store) => {
             let log_id = store.log_id().to_string();
+            // Test actual write capability via an immediate transaction probe that rolls back
+            let write_probe = (|| -> anyhow::Result<()> {
+                let db_path = home.join("transparency.db");
+                let mut conn = rusqlite::Connection::open(&db_path)?;
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _health_check_probe(id INTEGER); INSERT INTO _health_check_probe VALUES (1);")?;
+                tx.rollback()?;
+                Ok(())
+            })();
+
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-            DependencyHealth {
-                status: "healthy".to_string(),
-                latency_ms,
-                error: None,
-                details: serde_json::json!({
-                    "writable": true,
-                    "log_id": log_id,
-                }),
+            match write_probe {
+                Ok(()) => DependencyHealth {
+                    status: "healthy".to_string(),
+                    latency_ms,
+                    error: None,
+                    details: serde_json::json!({
+                        "writable": true,
+                        "log_id": log_id,
+                    }),
+                },
+                Err(e) => DependencyHealth {
+                    status: "unhealthy".to_string(),
+                    latency_ms,
+                    error: Some(format!("database not writable: {e}")),
+                    details: serde_json::json!({
+                        "writable": false,
+                        "log_id": log_id,
+                    }),
+                },
             }
         }
         Err(e) => {
@@ -213,8 +235,21 @@ pub fn check_transparency_health(home: &Path) -> DependencyHealth {
     }
 }
 
+static CACHED_DEEP_HEALTH: std::sync::RwLock<Option<(Instant, DeepHealthResponse)>> =
+    std::sync::RwLock::new(None);
+const DEEP_HEALTH_CACHE_TTL_SECS: u64 = 5;
+
 /// Performs a comprehensive health check across all daemon dependencies.
+/// Caches result for 5 seconds to prevent outbound request amplification and SQLite thrashing.
 pub async fn perform_deep_health_check(home: &Path) -> DeepHealthResponse {
+    if let Ok(guard) = CACHED_DEEP_HEALTH.read() {
+        if let Some((cached_at, ref resp)) = *guard {
+            if cached_at.elapsed().as_secs() < DEEP_HEALTH_CACHE_TTL_SECS {
+                return resp.clone();
+            }
+        }
+    }
+
     let sqlite = check_sqlite_health(home);
     let fee_api = check_fee_api_health().await;
     let transparency_log = check_transparency_health(home);
@@ -232,7 +267,7 @@ pub async fn perform_deep_health_check(home: &Path) -> DeepHealthResponse {
 
     let ok = overall_status == "healthy" || overall_status == "degraded";
 
-    DeepHealthResponse {
+    let resp = DeepHealthResponse {
         ok,
         status: overall_status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -243,7 +278,13 @@ pub async fn perform_deep_health_check(home: &Path) -> DeepHealthResponse {
             fee_api,
             transparency_log,
         },
+    };
+
+    if let Ok(mut guard) = CACHED_DEEP_HEALTH.write() {
+        *guard = Some((Instant::now(), resp.clone()));
     }
+
+    resp
 }
 
 #[cfg(test)]

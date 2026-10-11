@@ -36,12 +36,62 @@ use crate::types::{
 use crate::ui::{html_response, INDEX_HTML};
 use crate::v2_api;
 
+pub(crate) fn route_template(path: &str) -> &'static str {
+    match path {
+        "/" => "/",
+        "/claim" => "/claim",
+        "/metrics" => "/metrics",
+        "/health" => "/health",
+        "/v1/health" => "/v1/health",
+        "/v2/health" => "/v2/health",
+        "/v1/dashboard/auth" => "/v1/dashboard/auth",
+        "/dashboard-auth.mjs" => "/dashboard-auth.mjs",
+        "/v1/diagnostics/rate_limit" => "/v1/diagnostics/rate_limit",
+        "/v1/receive" => "/v1/receive",
+        "/v1/send" => "/v1/send",
+        "/v1/broadcast" => "/v1/broadcast",
+        "/.well-known/satspath-authority" | "/v2/namespace" => "/v2/namespace",
+        "/v2/resolve" => "/v2/resolve",
+        "/v1/node" => "/v1/node",
+        "/v1/control" => "/v1/control",
+        "/v1/p2p/resolve" => "/v1/p2p/resolve",
+        "/v1/status" => "/v1/status",
+        "/v1/profile" => "/v1/profile",
+        "/v1/profile/challenge" => "/v1/profile/challenge",
+        "/v1/profile/verify" => "/v1/profile/verify",
+        "/v1/profile/rotate" => "/v1/profile/rotate",
+        "/v1/profile/recover" => "/v1/profile/recover",
+        "/v1/profile/methods" => "/v1/profile/methods",
+        "/v1/quote" => "/v1/quote",
+        "/v1/pay" => "/v1/pay",
+        "/v1/dns/resolve" => "/v1/dns/resolve",
+        "/v1/claim" => "/v1/claim",
+        "/v1/invites" => "/v1/invites",
+        "/v1/invites/notifications" => "/v1/invites/notifications",
+        "/v1/invites/notifications/read-all" => "/v1/invites/notifications/read-all",
+        "/v1/transparency/status" => "/v1/transparency/status",
+        "/v1/transparency/checkpoints" => "/v1/transparency/checkpoints",
+        "/v1/transparency/events" => "/v1/transparency/events",
+        "/v1/transparency/catena/chain" => "/v1/transparency/catena/chain",
+        "/v1/transparency/catena/anchor" => "/v1/transparency/catena/anchor",
+        "/v1/transparency/verify/inclusion" => "/v1/transparency/verify/inclusion",
+        "/v1/transparency/verify/consistency" => "/v1/transparency/verify/consistency",
+        "/v1/transparency/verify/catena" => "/v1/transparency/verify/catena",
+        p if p.starts_with("/v1/transparency/checkpoints/") => "/v1/transparency/checkpoints/:hash",
+        p if p.starts_with("/v1/transparency/events/") => "/v1/transparency/events/:hash",
+        p if p.starts_with("/v1/invites/notifications/") => "/v1/invites/notifications/:id",
+        p if p.starts_with("/v1/invites/") => "/v1/invites/:id",
+        _ => "other",
+    }
+}
+
 pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Result<()> {
     let req_start = std::time::Instant::now();
     let request_id = crate::telemetry::get_or_generate_request_id(request.headers());
     let method = request.method().clone();
     let raw_url = request.url().to_string();
     let path = raw_url.split('?').next().unwrap_or("/").to_string();
+    let template = route_template(&path);
 
     let request_span = tracing::info_span!(
         "http_request",
@@ -57,7 +107,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         let _ = request.respond(resp);
         crate::telemetry::record_http_request(
             method.as_str(),
-            &path,
+            template,
             400,
             req_start.elapsed().as_secs_f64(),
         );
@@ -84,7 +134,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             let _ = request.respond(resp);
             crate::telemetry::record_http_request(
                 method.as_str(),
-                &path,
+                template,
                 413,
                 req_start.elapsed().as_secs_f64(),
             );
@@ -114,7 +164,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             let _ = request.respond(resp);
             crate::telemetry::record_http_request(
                 method.as_str(),
-                &path,
+                template,
                 429,
                 req_start.elapsed().as_secs_f64(),
             );
@@ -139,7 +189,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             let _ = request.respond(resp);
             crate::telemetry::record_http_request(
                 method.as_str(),
-                &path,
+                template,
                 401,
                 req_start.elapsed().as_secs_f64(),
             );
@@ -176,7 +226,11 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             ),
             Err(e) => json_error(StatusCode(500), e),
         },
-        (Method::Get, "/health") | (Method::Get, "/v1/health") => {
+        (Method::Get, "/health") => json_response(
+            StatusCode(200),
+            &serde_json::json!({ "ok": true, "status": "healthy" }),
+        ),
+        (Method::Get, "/v1/health") => {
             let health = crate::telemetry::perform_deep_health_check(&state.home).await;
             let status = if health.status == "healthy" || health.status == "degraded" {
                 StatusCode(200)
@@ -633,8 +687,9 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     };
     let status_code = response.status_code().0;
     let duration_secs = req_start.elapsed().as_secs_f64();
-    crate::telemetry::record_http_request(method.as_str(), &path, status_code, duration_secs);
+    crate::telemetry::record_http_request(method.as_str(), template, status_code, duration_secs);
     tracing::info!(
+        endpoint = template,
         status = status_code,
         duration_ms = duration_secs * 1000.0,
         "request completed"

@@ -1652,21 +1652,43 @@ mod tests {
         let base_url = format!("http://{}", state.bind);
 
         let srv = server.clone();
-        tokio::spawn(serve_server(Arc::new(state), srv));
+        let handle = tokio::spawn(serve_server(Arc::new(state), srv));
 
         let client = reqwest::Client::new();
 
-        // 1. GET /health deep health check returns 200 with dependency statuses
-        let health_res = client
+        // 1. GET /health fast liveness check returns 200
+        let liveness_res = client
             .get(format!("{base_url}/health"))
             .send()
             .await
             .unwrap();
-        assert_eq!(health_res.status(), reqwest::StatusCode::OK);
-        let req_id_header = health_res.headers().get("X-Request-Id");
+        assert_eq!(liveness_res.status(), reqwest::StatusCode::OK);
+        let req_id_header = liveness_res.headers().get("X-Request-Id");
         assert!(
             req_id_header.is_some(),
             "X-Request-Id header must be present on response"
+        );
+        let liveness_json: serde_json::Value = liveness_res.json().await.unwrap();
+        assert_eq!(liveness_json["status"], "healthy");
+        assert_eq!(liveness_json["ok"], true);
+
+        // 2. GET /v1/health deep readiness check returns 200 with dependency statuses
+        let custom_id = "test-custom-trace-uuid-123456";
+        let health_res = client
+            .get(format!("{base_url}/v1/health"))
+            .header("X-Request-Id", custom_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health_res.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            health_res
+                .headers()
+                .get("X-Request-Id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            custom_id
         );
         let health_json: serde_json::Value = health_res.json().await.unwrap();
         assert!(health_json["status"] == "healthy" || health_json["status"] == "degraded");
@@ -1675,25 +1697,6 @@ mod tests {
         assert_eq!(
             health_json["dependencies"]["transparency_log"]["status"],
             "healthy"
-        );
-
-        // 2. Custom X-Request-Id is reflected in response
-        let custom_id = "test-custom-trace-uuid-123456";
-        let echo_res = client
-            .get(format!("{base_url}/v1/health"))
-            .header("X-Request-Id", custom_id)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(echo_res.status(), reqwest::StatusCode::OK);
-        assert_eq!(
-            echo_res
-                .headers()
-                .get("X-Request-Id")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            custom_id
         );
 
         // 3. GET /metrics returns Prometheus metrics exposition
@@ -1715,5 +1718,6 @@ mod tests {
         assert!(metrics_text.contains("satspathd_http_request_duration_seconds"));
 
         server.unblock();
+        handle.abort();
     }
 }

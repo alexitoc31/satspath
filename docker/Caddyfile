@@ -22,6 +22,12 @@
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
     }
 
+    # Block internal Prometheus metrics from external public ingress
+    @internal_metrics {
+        path /metrics
+    }
+    respond @internal_metrics "Forbidden" 403
+
     reverse_proxy satspathd:9737 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
