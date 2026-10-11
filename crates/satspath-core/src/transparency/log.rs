@@ -11,9 +11,9 @@ use crate::{Result, SignedPaymentProfile};
 
 use super::tree::inclusion_proof;
 use super::{
-    anchor_commitment, leaf_hash, merkle_root, verify_identifier_history, BitcoinAnchor,
-    MerkleConsistencyProof, MerkleInclusionProof, NameAction, NameEvent, TransparencyCheckpoint,
-    TransparencyError,
+    anchor_commitment, catena_commitment, leaf_hash, merkle_root, verify_identifier_history,
+    BitcoinAnchor, MerkleConsistencyProof, MerkleInclusionProof, NameAction, NameEvent,
+    TransparencyCheckpoint, TransparencyError, CATENA_CONTINUATION_VOUT,
 };
 
 const EVENTS_FILE: &str = "transparency-events-v1.jsonl";
@@ -355,20 +355,54 @@ impl TransparencyLog {
         anchor: BitcoinAnchor,
         operator_key: &SecretKey,
     ) -> Result<TransparencyCheckpoint> {
-        let checkpoint = self
+        let last_checkpoint = self
             .checkpoints
-            .last_mut()
+            .last()
             .ok_or_else(|| TransparencyError::CorruptStore("no checkpoint to anchor".into()))?;
+        if let Some(existing) = &last_checkpoint.bitcoin_anchor {
+            if !(existing.txid == anchor.txid
+                && existing.chain_index == anchor.chain_index
+                && existing.prev_txid == anchor.prev_txid
+                && existing.prev_vout == anchor.prev_vout
+                && existing.continuation_vout == anchor.continuation_vout)
+            {
+                return Err(TransparencyError::CorruptCheckpointChain(
+                    "latest checkpoint already carries a different Bitcoin anchor".into(),
+                )
+                .into());
+            }
+        }
+        let expected_commitment = match anchor.chain_index {
+            Some(idx) => catena_commitment(&last_checkpoint.checkpoint_hash()?, idx)
+                .map_err(|e| crate::SatsPathError::SerializationError(e.to_string()))?,
+            None => anchor_commitment(&last_checkpoint.checkpoint_hash()?)
+                .map_err(|e| crate::SatsPathError::SerializationError(e.to_string()))?,
+        };
         if anchor.network != crate::BitcoinNetwork::Regtest
-            || anchor.commitment
-                != anchor_commitment(&checkpoint.checkpoint_hash()?)
-                    .map_err(|e| crate::SatsPathError::SerializationError(e.to_string()))?
+            || anchor.commitment != expected_commitment
         {
             return Err(TransparencyError::CorruptStore(
                 "anchor commitment or network mismatch".into(),
             )
             .into());
         }
+        if anchor.chain_index.is_some() {
+            let last_catena = self
+                .checkpoints
+                .iter()
+                .take(self.checkpoints.len().saturating_sub(1))
+                .rev()
+                .find_map(|c| {
+                    c.bitcoin_anchor
+                        .as_ref()
+                        .filter(|a| a.chain_index.is_some())
+                });
+            validate_catena_successor(last_catena, &anchor)?;
+        }
+        let checkpoint = self
+            .checkpoints
+            .last_mut()
+            .expect("checked non-empty above");
         checkpoint.bitcoin_anchor = Some(anchor);
         checkpoint.sign(operator_key)?;
         let result = checkpoint.clone();
@@ -434,8 +468,15 @@ impl TransparencyLog {
         for history in histories.values() {
             verify_identifier_history(history)?;
         }
+        self.verify_checkpoint_chain_integrity()?;
+        Ok(())
+    }
+
+    pub fn verify_checkpoint_chain_integrity(&self) -> Result<()> {
         let mut previous: Option<&TransparencyCheckpoint> = None;
         let mut seen_sizes: HashMap<u64, String> = HashMap::new();
+        let mut last_catena: Option<&BitcoinAnchor> = None;
+
         for checkpoint in &self.checkpoints {
             if checkpoint.log_id != self.log_id
                 || !super::verify_checkpoint(checkpoint)?
@@ -503,19 +544,45 @@ impl TransparencyLog {
                 _ => {}
             }
             if let Some(anchor) = &checkpoint.bitcoin_anchor {
+                let expected_commitment = match anchor.chain_index {
+                    Some(idx) => catena_commitment(&checkpoint.checkpoint_hash()?, idx)
+                        .map_err(|e| TransparencyError::CorruptCheckpointChain(e.to_string()))?,
+                    None => anchor_commitment(&checkpoint.checkpoint_hash()?)
+                        .map_err(|e| TransparencyError::CorruptCheckpointChain(e.to_string()))?,
+                };
                 if anchor.network != crate::BitcoinNetwork::Regtest
-                    || anchor.commitment
-                        != anchor_commitment(&checkpoint.checkpoint_hash()?)
-                            .map_err(|e| TransparencyError::CorruptCheckpointChain(e.to_string()))?
+                    || anchor.commitment != expected_commitment
                 {
                     return Err(TransparencyError::CorruptCheckpointChain(
                         "invalid anchor commitment or disallowed network".into(),
                     )
                     .into());
                 }
+                if anchor.chain_index.is_some() {
+                    validate_catena_successor(last_catena, anchor)?;
+                    last_catena = Some(anchor);
+                }
             }
             previous = Some(checkpoint);
         }
+        Ok(())
+    }
+
+    pub(crate) fn replace_checkpoint_by_hash_in_memory(
+        &mut self,
+        target_hash: &str,
+        checkpoint: TransparencyCheckpoint,
+    ) -> Result<()> {
+        let index = self
+            .checkpoints
+            .iter()
+            .position(|c| c.checkpoint_hash().ok().as_deref() == Some(target_hash))
+            .ok_or_else(|| {
+                TransparencyError::CorruptCheckpointChain(format!(
+                    "checkpoint with hash {target_hash} not found in memory"
+                ))
+            })?;
+        self.checkpoints[index] = checkpoint;
         Ok(())
     }
 
@@ -526,4 +593,56 @@ impl TransparencyLog {
         std::fs::rename(tmp, path)?;
         Ok(())
     }
+}
+
+pub fn validate_catena_successor(
+    prev: Option<&BitcoinAnchor>,
+    anchor: &BitcoinAnchor,
+) -> Result<()> {
+    let Some(idx) = anchor.chain_index else {
+        return Ok(());
+    };
+    if anchor.continuation_vout != Some(CATENA_CONTINUATION_VOUT) {
+        return Err(TransparencyError::CorruptCheckpointChain(format!(
+            "Catena anchor continuation_vout is {:?}, expected Some({CATENA_CONTINUATION_VOUT})",
+            anchor.continuation_vout
+        ))
+        .into());
+    }
+    match prev {
+        None => {
+            if idx != 0 || anchor.prev_txid.is_some() || anchor.prev_vout.is_some() {
+                return Err(TransparencyError::CorruptCheckpointChain(format!(
+                    "genesis Catena anchor must have chain_index 0 and no predecessor, got index {idx}, prev_txid: {:?}, prev_vout: {:?}",
+                    anchor.prev_txid, anchor.prev_vout
+                ))
+                .into());
+            }
+        }
+        Some(p) => {
+            let expected = p.chain_index.and_then(|i| i.checked_add(1));
+            if Some(idx) != expected {
+                return Err(TransparencyError::CorruptCheckpointChain(format!(
+                    "non-sequential Catena chain_index: got {idx}, expected {:?}",
+                    expected
+                ))
+                .into());
+            }
+            if anchor.prev_txid.as_deref() != Some(p.txid.as_str()) {
+                return Err(TransparencyError::CorruptCheckpointChain(format!(
+                    "Catena prev_txid mismatch: got {:?}, expected {}",
+                    anchor.prev_txid, p.txid
+                ))
+                .into());
+            }
+            if anchor.prev_vout != Some(CATENA_CONTINUATION_VOUT) {
+                return Err(TransparencyError::CorruptCheckpointChain(format!(
+                    "Catena prev_vout mismatch: got {:?}, expected Some({CATENA_CONTINUATION_VOUT})",
+                    anchor.prev_vout
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(())
 }

@@ -92,15 +92,16 @@ Pins are indexed by a stable deployment `log_id`, never by an untrusted newly pr
 sequenceDiagram
   participant Daemon
   participant Core as Bitcoin Core regtest
-  Daemon->>Daemon: SHA256("SatsPathCheckpointAnchorV1" || checkpoint_hash)
-  Daemon->>Core: OP_RETURN transaction
-  Daemon->>Core: fund, wallet-sign, broadcast, mine one block
-  Daemon->>Core: fetch verbose transaction
-  Core-->>Daemon: script + block + confirmations
-  Daemon->>Daemon: verify commitment
+  Daemon->>Daemon: SHA256("SatsPathCatenaAnchorV1" || chain_index_be64 || checkpoint_hash)
+  Daemon->>Core: createrawtransaction: vin[0] spends prev continuation UTXO, vout[0] OP_RETURN commitment, vout[1] 1000-sat continuation UTXO
+  Daemon->>Core: fundrawtransaction (changePosition=2), signrawtransactionwithwallet
+  Daemon->>Core: sendrawtransaction, lockunspent continuation UTXO, generatetoaddress (mine 1 block)
+  Daemon->>Core: getrawtransaction (fetch confirmations & blockhash)
+  Core-->>Daemon: confirmed transaction details
+  Daemon->>Daemon: verify commitment, continuation linkage & store anchor
 ```
 
-Anchoring is never automatic. Authenticated `POST /v1/transparency/anchors` requires `SATSPATH_BITCOIN_NETWORK=regtest` plus `SATSPATH_BITCOIN_RPC_URL`, `SATSPATH_BITCOIN_RPC_USER` and `SATSPATH_BITCOIN_RPC_PASSWORD`. Mainnet is rejected and credentials are never logged. OP_RETURN provides public evidence but unrelated anchors do not fully prevent split views. Future Catena-style chaining would make transaction N spend a continuation output from N-1; it is not implemented.
+Anchoring is never automatic. Authenticated `POST /v1/transparency/anchors` requires `SATSPATH_BITCOIN_NETWORK=regtest` plus `SATSPATH_BITCOIN_RPC_URL`, `SATSPATH_BITCOIN_RPC_USER` and `SATSPATH_BITCOIN_RPC_PASSWORD`. The Bitcoin Core node must have `-txindex=1` enabled and synced to serve confirmed non-mempool transactions via `getrawtransaction`. Mainnet is rejected and credentials are never logged. SatsPath implements Catena-style UTXO chaining (`POST /v1/transparency/anchors`, `GET /v1/transparency/catena/chain`), where anchor transaction $Tx_N$ spends the 1,000-sat continuation UTXO of $Tx_{N-1}$ and emits a domain-separated `OP_RETURN` commitment (`SatsPathCatenaAnchorV1`).
 
 ## Explorer data flow
 
@@ -143,7 +144,7 @@ Read APIs cover status, paginated events/checkpoints, identifier/event/checkpoin
 - A compromised current key can update, revoke or authorize rotation; transparency makes unauthorized actions publicly detectable and attributable, but cannot undo valid cryptographic signatures.
 - A lost key cannot be recovered via email or SMS (strictly rejected to preserve non-custodial sovereignty). In SatsPath, alias recovery is supported via pre-committed M-of-N cryptographic guardian threshold proofs (subject to guardian collusion limits; guardian recovery fails closed if no policy was pre-committed). See [Key Recovery](key_recovery.md).
 - A malicious operator can attempt split views; client pinning and $K$-of-$N$ witness quorums detect local rollback and equivocation. Optional Nostr checkpoint gossip detects attributable same-size forks once two trusted observers' signed views reach a common monitor. Relay censorship/eclipsing or forks at different sizes remain possible limitations.
-- Bitcoin regtest anchoring provides auditable public evidence; independent OP_RETURNs do not provide Catena's single-history UTXO continuation property.
+- Bitcoin anchoring provides auditable, immutable public evidence. SatsPath implements Catena-style UTXO chaining ([`catena.rs`](../crates/satspath-core/src/transparency/catena.rs), Tomescu & Devadas 2017): each anchor transaction $Tx_n$ spends the 1,000-sat continuation output of $Tx_{n-1}$ and commits a domain-separated `OP_RETURN` checkpoint digest. Once confirmed, Bitcoin's double-spend prevention prevents conflicting spends of the same continuation UTXO from appearing in one canonical history; competing unconfirmed spends and reorganizations remain possible limitations. The local log accepts exactly one Catena genesis and rejects any later anchor that does not extend the recorded tip. However, a malicious operator can still broadcast additional genesis transactions outside this log (for example, in a forked view served to other clients), so verifying clients must pin the chosen Catena genesis outpoint (`txid:vout`) out-of-band and supply `(genesis_txid, genesis_vout)` to `verify_catena_chain(latest_txid, genesis_txid, genesis_vout)` or `verify_catena_chain_with_checkpoints(...)`, recomputing each domain-separated commitment against their expected checkpoint (these checks are client responsibilities). Active RPC broadcasting is restricted to regtest (`SATSPATH_BITCOIN_NETWORK=regtest`); Mainnet anchoring is not implemented and is rejected. A proposed (unimplemented) Mainnet policy anchors once per 24h epoch plus immediately on key rotation/recovery (~200 vbytes per anchor).
 - Current-state non-inclusion proofs (`StateMap`) are bound to checkpoints; full audit of sparse Merkle implementation is pending external cryptographic review.
 - This software is experimental and unaudited. It must not be used with real funds.
 

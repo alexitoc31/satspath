@@ -2,7 +2,7 @@ use satspath_core::crypto::{generate_identity_keypair, sign_profile};
 use satspath_core::transparency::{
     profile_hash, verify_checkpoint, verify_checkpoint_transition, verify_consistency_proof,
     verify_event_transition, verify_identifier_history, verify_inclusion_proof, CheckpointStore,
-    NameAction, NameEvent, PinnedCheckpoint, TransparencyError, TransparencyLog,
+    MockAnchorClient, NameAction, NameEvent, PinnedCheckpoint, TransparencyError, TransparencyLog,
 };
 use satspath_core::{KeyRotation, PaymentMethod, PaymentProfile, SatsPathError};
 
@@ -656,5 +656,190 @@ fn non_rotation_event_rejects_rotation_proof() {
     assert!(matches!(
         verify_event_transition(None, &register).unwrap_err(),
         SatsPathError::Transparency(TransparencyError::InvalidRotation(_))
+    ));
+}
+
+#[test]
+fn catena_anchor_sequence_integrity_and_replay_validation() {
+    let key = generate_identity_keypair();
+    let op_key = generate_identity_keypair();
+
+    let signed_reg1 = profile("alice@example.com", &key, 0);
+    let register1 = event(&signed_reg1, NameAction::Register, 0, None, &key.secret_key);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = TransparencyLog::open(dir.path()).unwrap();
+    log.append(register1, &signed_reg1).unwrap();
+
+    // Checkpoint 0
+    let cp0 = log.create_checkpoint(&op_key.secret_key).unwrap();
+    let cp0_hash = cp0.checkpoint_hash().unwrap();
+    let a0 = MockAnchorClient::catena_genesis(&cp0_hash).unwrap();
+    let attached0 = log
+        .attach_latest_anchor(a0.clone(), &op_key.secret_key)
+        .unwrap();
+    assert_eq!(
+        attached0.bitcoin_anchor.as_ref().unwrap().chain_index,
+        Some(0)
+    );
+
+    // Event 2 & Checkpoint 1
+    let key2 = generate_identity_keypair();
+    let signed_reg2 = profile("bob@example.com", &key2, 0);
+    let register2 = event(
+        &signed_reg2,
+        NameAction::Register,
+        0,
+        None,
+        &key2.secret_key,
+    );
+    log.append(register2, &signed_reg2).unwrap();
+
+    let cp1 = log.create_checkpoint(&op_key.secret_key).unwrap();
+    let cp1_hash = cp1.checkpoint_hash().unwrap();
+    let a1 = MockAnchorClient::catena_next(&cp1_hash, &a0).unwrap();
+    let attached1 = log
+        .attach_latest_anchor(a1.clone(), &op_key.secret_key)
+        .unwrap();
+    assert_eq!(
+        attached1.bitcoin_anchor.as_ref().unwrap().chain_index,
+        Some(1)
+    );
+
+    // Verify checkpoint chain integrity
+    assert!(log.verify_checkpoint_chain_integrity().is_ok());
+
+    // Reopen log from disk and verify full replay passes
+    let reopened = TransparencyLog::open(dir.path()).unwrap();
+    assert_eq!(reopened.checkpoints().len(), 2);
+    assert_eq!(
+        reopened.checkpoints()[0]
+            .bitcoin_anchor
+            .as_ref()
+            .unwrap()
+            .chain_index,
+        Some(0)
+    );
+    assert_eq!(
+        reopened.checkpoints()[1]
+            .bitcoin_anchor
+            .as_ref()
+            .unwrap()
+            .chain_index,
+        Some(1)
+    );
+}
+
+#[test]
+fn catena_anchor_rejects_out_of_order_attachments() {
+    let key = generate_identity_keypair();
+    let op_key = generate_identity_keypair();
+
+    let signed_reg = profile("alice@example.com", &key, 0);
+    let register = event(&signed_reg, NameAction::Register, 0, None, &key.secret_key);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = TransparencyLog::open(dir.path()).unwrap();
+    log.append(register, &signed_reg).unwrap();
+
+    let cp0 = log.create_checkpoint(&op_key.secret_key).unwrap();
+    let cp0_hash = cp0.checkpoint_hash().unwrap();
+
+    // 1. First Catena anchor must be genesis (index 0). Try attaching index 1 first.
+    let mut bad_non_genesis = MockAnchorClient::catena_genesis(&cp0_hash).unwrap();
+    bad_non_genesis.chain_index = Some(1);
+    bad_non_genesis.commitment =
+        satspath_core::transparency::catena_commitment(&cp0_hash, 1).unwrap();
+    assert!(matches!(
+        log.attach_latest_anchor(bad_non_genesis, &op_key.secret_key),
+        Err(SatsPathError::Transparency(
+            TransparencyError::CorruptCheckpointChain(_)
+        ))
+    ));
+
+    // 2. Genesis anchor cannot have prev_txid
+    let mut bad_genesis_prev = MockAnchorClient::catena_genesis(&cp0_hash).unwrap();
+    bad_genesis_prev.prev_txid = Some("aa".repeat(32));
+    assert!(matches!(
+        log.attach_latest_anchor(bad_genesis_prev, &op_key.secret_key),
+        Err(SatsPathError::Transparency(
+            TransparencyError::CorruptCheckpointChain(_)
+        ))
+    ));
+
+    // 3. Genesis anchor cannot have non-canonical continuation_vout
+    let mut bad_genesis_vout = MockAnchorClient::catena_genesis(&cp0_hash).unwrap();
+    bad_genesis_vout.continuation_vout = Some(2);
+    assert!(matches!(
+        log.attach_latest_anchor(bad_genesis_vout, &op_key.secret_key),
+        Err(SatsPathError::Transparency(
+            TransparencyError::CorruptCheckpointChain(_)
+        ))
+    ));
+
+    // Attach valid genesis
+    let a0 = MockAnchorClient::catena_genesis(&cp0_hash).unwrap();
+    log.attach_latest_anchor(a0.clone(), &op_key.secret_key)
+        .unwrap();
+
+    // Re-attaching identical anchor to cp0 succeeds idempotently
+    assert!(log
+        .attach_latest_anchor(a0.clone(), &op_key.secret_key)
+        .is_ok());
+
+    // Attempting to overwrite existing anchor with a different one fails closed
+    let mut conflicting_anchor = a0.clone();
+    conflicting_anchor.txid = "ff".repeat(32);
+    assert!(matches!(
+        log.attach_latest_anchor(conflicting_anchor, &op_key.secret_key),
+        Err(SatsPathError::Transparency(
+            TransparencyError::CorruptCheckpointChain(_)
+        ))
+    ));
+
+    // Create Checkpoint 1
+    let key2 = generate_identity_keypair();
+    let signed_reg2 = profile("bob@example.com", &key2, 0);
+    let register2 = event(
+        &signed_reg2,
+        NameAction::Register,
+        0,
+        None,
+        &key2.secret_key,
+    );
+    log.append(register2, &signed_reg2).unwrap();
+    let cp1 = log.create_checkpoint(&op_key.secret_key).unwrap();
+    let cp1_hash = cp1.checkpoint_hash().unwrap();
+
+    // 4. Try attaching index 2 (skipping index 1)
+    let mut bad_skip_index = MockAnchorClient::catena_next(&cp1_hash, &a0).unwrap();
+    bad_skip_index.chain_index = Some(2);
+    bad_skip_index.commitment =
+        satspath_core::transparency::catena_commitment(&cp1_hash, 2).unwrap();
+    assert!(matches!(
+        log.attach_latest_anchor(bad_skip_index, &op_key.secret_key),
+        Err(SatsPathError::Transparency(
+            TransparencyError::CorruptCheckpointChain(_)
+        ))
+    ));
+
+    // 5. Try attaching step 1 with wrong prev_txid
+    let mut bad_prev_txid = MockAnchorClient::catena_next(&cp1_hash, &a0).unwrap();
+    bad_prev_txid.prev_txid = Some("bb".repeat(32));
+    assert!(matches!(
+        log.attach_latest_anchor(bad_prev_txid, &op_key.secret_key),
+        Err(SatsPathError::Transparency(
+            TransparencyError::CorruptCheckpointChain(_)
+        ))
+    ));
+
+    // 6. Try attaching step 1 with non-canonical continuation_vout
+    let mut bad_cont_vout = MockAnchorClient::catena_next(&cp1_hash, &a0).unwrap();
+    bad_cont_vout.continuation_vout = Some(0);
+    assert!(matches!(
+        log.attach_latest_anchor(bad_cont_vout, &op_key.secret_key),
+        Err(SatsPathError::Transparency(
+            TransparencyError::CorruptCheckpointChain(_)
+        ))
     ));
 }

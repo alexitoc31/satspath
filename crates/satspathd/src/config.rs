@@ -96,6 +96,7 @@ pub(crate) struct AppState {
     pub(crate) open_ui: bool,
     pub(crate) auth_token: String,
     pub(crate) mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) anchor_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) rate_limiter: Arc<rate_limit::RateLimiter>,
     pub(crate) is_tls: bool,
 }

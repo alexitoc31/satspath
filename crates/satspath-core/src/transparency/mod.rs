@@ -1,6 +1,7 @@
 mod anchor;
 mod api;
 mod attestation;
+mod catena;
 mod checkpoint;
 #[cfg(feature = "std")]
 mod database;
@@ -21,9 +22,9 @@ mod verifier;
 #[cfg(test)]
 mod consistency_tests;
 
-#[cfg(feature = "std")]
-pub use anchor::RegtestAnchorClient;
 pub use anchor::{anchor_commitment, BitcoinAnchor, MockAnchorClient};
+#[cfg(feature = "std")]
+pub use anchor::{parse_sats, RegtestAnchorClient};
 pub use api::{
     MutationChallengeRequest, MutationChallengeResponse, MutationResponse, MutationStatus,
     MutationSubmitRequest,
@@ -31,6 +32,12 @@ pub use api::{
 pub use attestation::{
     verify_attestation_binding, IdentifierAttestation, IdentifierVerificationMethod,
     TrustedVerifier,
+};
+pub use catena::{
+    catena_commitment, detect_catena_equivocation, verify_catena_commitments,
+    verify_catena_commitments_bounded, verify_catena_links, verify_catena_links_bounded,
+    CatenaChainProof, CatenaEquivocationProof, CatenaGenesis, CATENA_COMMITMENT_DOMAIN,
+    CATENA_CONTINUATION_VOUT, CONTINUATION_BTC, CONTINUATION_SATOSHIS, MAX_CATENA_HOPS,
 };
 pub use checkpoint::{
     CheckpointComparison, OperatorKeyRotation, PinnedCheckpoint, TransparencyCheckpoint,
@@ -43,7 +50,7 @@ pub use gossip::{
     compare_gossip_observations, gossip_topic, GossipComparison, GossipObservation,
     SplitViewEvidence, GOSSIP_FUTURE_SKEW_SECS, GOSSIP_KIND, GOSSIP_MAX_AGE_SECS, MAX_GOSSIP_BYTES,
 };
-pub use log::{ConsistencyStatus, TransparencyLog, TransparencyStatus};
+pub use log::{validate_catena_successor, ConsistencyStatus, TransparencyLog, TransparencyStatus};
 pub use migration::{verify_migration_statement, MigrationExport, MigrationStatement};
 pub use proof::{MerkleConsistencyProof, MerkleInclusionProof};
 pub use protocol::{
@@ -119,4 +126,8 @@ pub enum TransparencyError {
     InvalidAttestation(String),
     #[error("invalid checkpoint gossip observation or evidence")]
     InvalidGossipObservation,
+    #[error("invalid Catena anchor chain: {0}")]
+    InvalidCatenaChain(String),
+    #[error("Catena equivocation detected: {0}")]
+    CatenaEquivocation(String),
 }

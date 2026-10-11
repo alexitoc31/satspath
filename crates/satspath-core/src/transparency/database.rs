@@ -155,9 +155,7 @@ impl TransactionalTransparencyStore {
         ).map_err(db_error)?;
         Ok(())
     }
-
-    pub fn load_log(&self) -> Result<TransparencyLog> {
-        let connection = self.connection()?;
+    fn load_log_from_connection(&self, connection: &Connection) -> Result<TransparencyLog> {
         let mut event_statement = connection
             .prepare("SELECT event_json FROM name_events ORDER BY event_index")
             .map_err(db_error)?;
@@ -209,6 +207,11 @@ impl TransactionalTransparencyStore {
             }
         }
         Ok(log)
+    }
+
+    pub fn load_log(&self) -> Result<TransparencyLog> {
+        let connection = self.connection()?;
+        self.load_log_from_connection(&connection)
     }
 
     /// Atomically commits the complete security state. SQLite's WAL recovers
@@ -338,27 +341,165 @@ impl TransactionalTransparencyStore {
             )
             .into());
         }
-        let new_hash = checkpoint.checkpoint_hash()?;
-        let json = serde_json::to_string(checkpoint)?;
-        transaction.execute("UPDATE checkpoints SET checkpoint_hash=?1,checkpoint_json=?2 WHERE checkpoint_index=?3", params![new_hash, json, index]).map_err(db_error)?;
-        transaction
-            .execute(
-                "INSERT OR REPLACE INTO anchors(txid,anchor_json) VALUES (?1,?2)",
-                params![
-                    checkpoint
-                        .bitcoin_anchor
-                        .as_ref()
-                        .map(|a| a.txid.as_str())
-                        .unwrap_or(""),
-                    checkpoint
-                        .bitcoin_anchor
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()?
-                        .unwrap_or_default()
-                ],
+        let stored_json: String = transaction
+            .query_row(
+                "SELECT checkpoint_json FROM checkpoints WHERE checkpoint_index=?1",
+                params![index],
+                |r| r.get(0),
             )
             .map_err(db_error)?;
+        let stored: TransparencyCheckpoint = serde_json::from_str(&stored_json)?;
+        validate_replacement_anchor(previous_hash, &stored, checkpoint)?;
+
+        // Validate the candidate log to ensure full replay and Catena integrity before committing
+        let mut candidate = self.load_log_from_connection(&transaction)?;
+        candidate.replace_checkpoint_by_hash_in_memory(previous_hash, checkpoint.clone())?;
+        candidate.verify_checkpoint_chain_integrity()?;
+
+        let new_hash = checkpoint.checkpoint_hash()?;
+        if new_hash != previous_hash {
+            return Err(TransparencyError::CorruptCheckpointChain(
+                "replacement may only change the Bitcoin receipt and signature".into(),
+            )
+            .into());
+        }
+        let json = serde_json::to_string(checkpoint)?;
+        transaction.execute("UPDATE checkpoints SET checkpoint_hash=?1,checkpoint_json=?2 WHERE checkpoint_index=?3", params![new_hash, json, index]).map_err(db_error)?;
+        upsert_anchor(&transaction, checkpoint.bitcoin_anchor.as_ref())?;
         transaction.commit().map_err(db_error)
     }
+
+    pub fn replace_checkpoint_by_hash(
+        &self,
+        target_hash: &str,
+        checkpoint: &TransparencyCheckpoint,
+    ) -> Result<()> {
+        if !super::verify_checkpoint(checkpoint)? {
+            return Err(TransparencyError::InvalidCheckpointSignature.into());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let row: Option<i64> = transaction
+            .query_row(
+                "SELECT checkpoint_index FROM checkpoints WHERE checkpoint_hash=?1",
+                params![target_hash],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let index = row.ok_or_else(|| {
+            TransparencyError::CorruptCheckpointChain(format!(
+                "checkpoint with hash {target_hash} not found to replace"
+            ))
+        })?;
+        let new_hash = checkpoint.checkpoint_hash()?;
+        if new_hash != target_hash {
+            return Err(TransparencyError::CorruptCheckpointChain(
+                "replacement may only change the Bitcoin receipt and signature".into(),
+            )
+            .into());
+        }
+        let stored_json: String = transaction
+            .query_row(
+                "SELECT checkpoint_json FROM checkpoints WHERE checkpoint_index=?1",
+                params![index],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
+        let stored: TransparencyCheckpoint = serde_json::from_str(&stored_json)?;
+        validate_replacement_anchor(target_hash, &stored, checkpoint)?;
+
+        // Validate the candidate log to ensure full replay and Catena integrity before committing
+        let mut candidate = self.load_log_from_connection(&transaction)?;
+        candidate.replace_checkpoint_by_hash_in_memory(target_hash, checkpoint.clone())?;
+        candidate.verify_checkpoint_chain_integrity()?;
+
+        let json = serde_json::to_string(checkpoint)?;
+        transaction
+            .execute(
+                "UPDATE checkpoints SET checkpoint_hash=?1,checkpoint_json=?2 WHERE checkpoint_index=?3",
+                params![new_hash, json, index],
+            )
+            .map_err(db_error)?;
+        upsert_anchor(&transaction, checkpoint.bitcoin_anchor.as_ref())?;
+        transaction.commit().map_err(db_error)
+    }
+}
+
+fn validate_replacement_anchor(
+    target_hash: &str,
+    stored: &TransparencyCheckpoint,
+    replacement: &TransparencyCheckpoint,
+) -> Result<()> {
+    match (&stored.bitcoin_anchor, &replacement.bitcoin_anchor) {
+        (Some(_), None) => {
+            return Err(TransparencyError::CorruptCheckpointChain(
+                "replacement may not remove an existing Bitcoin anchor".into(),
+            )
+            .into());
+        }
+        (Some(old), Some(new)) => {
+            if old.txid != new.txid {
+                return Err(TransparencyError::CorruptCheckpointChain(
+                    "checkpoint already carries a different Bitcoin anchor".into(),
+                )
+                .into());
+            }
+            if old.network != new.network
+                || old.commitment != new.commitment
+                || old.chain_index != new.chain_index
+                || old.prev_txid != new.prev_txid
+                || old.prev_vout != new.prev_vout
+                || old.continuation_vout != new.continuation_vout
+            {
+                return Err(TransparencyError::CorruptCheckpointChain(
+                    "replacement anchor may not alter immutable chain metadata".into(),
+                )
+                .into());
+            }
+        }
+        _ => {}
+    }
+    if let Some(anchor) = &replacement.bitcoin_anchor {
+        let expected = match anchor.chain_index {
+            Some(idx) => super::catena_commitment(target_hash, idx),
+            None => super::anchor_commitment(target_hash),
+        }
+        .map_err(|e| TransparencyError::CorruptCheckpointChain(e.to_string()))?;
+        if anchor.network != crate::BitcoinNetwork::Regtest || anchor.commitment != expected {
+            return Err(TransparencyError::CorruptCheckpointChain(
+                "replacement anchor commitment or network mismatch".into(),
+            )
+            .into());
+        }
+        if anchor.chain_index.is_some()
+            && anchor.continuation_vout != Some(super::CATENA_CONTINUATION_VOUT)
+        {
+            return Err(TransparencyError::CorruptCheckpointChain(format!(
+                "replacement Catena anchor continuation_vout is {:?}, expected Some({})",
+                anchor.continuation_vout,
+                super::CATENA_CONTINUATION_VOUT
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn upsert_anchor(
+    transaction: &rusqlite::Transaction,
+    anchor: Option<&super::BitcoinAnchor>,
+) -> Result<()> {
+    let Some(anchor) = anchor else {
+        return Ok(());
+    };
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO anchors(txid,anchor_json) VALUES (?1,?2)",
+            params![anchor.txid.as_str(), serde_json::to_string(anchor)?],
+        )
+        .map_err(db_error)?;
+    Ok(())
 }

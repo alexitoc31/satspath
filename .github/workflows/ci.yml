@@ -109,4 +109,4 @@ jobs:
           SATSPATH_BITCOIN_RPC_URL: http://127.0.0.1:18443/wallet/satspath-anchor
           SATSPATH_BITCOIN_RPC_USER: satspath
           SATSPATH_BITCOIN_RPC_PASSWORD: satspath-regtest-only
-        run: cargo test -p satspath-core --test regtest_anchor --all-features -- --ignored --exact checkpoint_op_return_round_trip_on_bitcoin_core_regtest
+        run: cargo test -p satspath-core --test regtest_anchor --all-features -- --ignored --test-threads=1

@@ -265,6 +265,13 @@ pub(crate) struct ConsistencyVerifyRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct CatenaVerifyRequest {
+    pub(crate) anchors: Vec<satspath_core::TransparencyBitcoinAnchor>,
+    #[serde(default)]
+    pub(crate) checkpoint_hashes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct ReceiveRequest {
     pub(crate) rail: Option<String>,
     pub(crate) amount_sats: Option<u64>,

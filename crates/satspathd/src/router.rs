@@ -20,8 +20,8 @@ use crate::handlers::{
     send::{broadcast, receive_view, send_response},
     status::{node_response, status_response},
     transparency::{
-        anchor_latest_checkpoint, consistency_from_query, namespace_descriptor, paginated,
-        query_str, transparency_log,
+        anchor_latest_checkpoint, catena_chain, consistency_from_query, namespace_descriptor,
+        paginated, query_str, transparency_log,
     },
 };
 use crate::http::{
@@ -29,8 +29,8 @@ use crate::http::{
 };
 use crate::rate_limit;
 use crate::types::{
-    safety_warnings, AliasRequest, ClaimRequest, ConsistencyVerifyRequest, DnsResolveRequest,
-    InclusionVerifyRequest, PayRequest, PreviewResponse, ProfileRecoverRequest,
+    safety_warnings, AliasRequest, CatenaVerifyRequest, ClaimRequest, ConsistencyVerifyRequest,
+    DnsResolveRequest, InclusionVerifyRequest, PayRequest, PreviewResponse, ProfileRecoverRequest,
     ProfileUpdateRequest, QuoteRequest, ReceiveRequest, SendRequest, VerifyRequest,
 };
 use crate::ui::{html_response, INDEX_HTML};
@@ -88,6 +88,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         || path == "/v1/claim"
         || path == "/v1/dns/resolve"
         || path == "/v1/transparency/verify/inclusion"
+        || path == "/v1/transparency/verify/catena"
         || path == "/v1/profile/recover"
         || path == "/v2/resolve";
 
@@ -280,6 +281,28 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
                 }),
             )
         }
+        (Method::Get, "/v1/transparency/anchors") => json_result(
+            StatusCode(200),
+            transparency_log(state).map(|log| {
+                let anchors: Vec<_> = log
+                    .checkpoints()
+                    .iter()
+                    .filter_map(|c| c.bitcoin_anchor.clone())
+                    .collect();
+                paginated(&raw_url, &anchors)
+            }),
+        ),
+        (Method::Get, "/v1/transparency/catena/chain") => json_result(
+            StatusCode(200),
+            catena_chain(state).map(|chain| {
+                serde_json::json!({
+                    "chain_length": chain.len(),
+                    "genesis": chain.first(),
+                    "latest": chain.last(),
+                    "anchors": paginated(&raw_url, &chain),
+                })
+            }),
+        ),
         (Method::Post, "/v1/transparency/anchors") => match anchor_latest_checkpoint(state).await {
             Ok(anchor) => json_response(StatusCode(200), &anchor),
             Err(e) => json_error(StatusCode(400), e),
@@ -307,6 +330,53 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
                     .map_err(Into::into)
             }) {
                 Ok(valid) => json_response(StatusCode(200), &serde_json::json!({"valid": valid})),
+                Err(e) => json_error(StatusCode(400), e),
+            }
+        }
+        // Evaluates purely in-memory structural consistency of the caller-supplied sequence of anchors
+        // (linkage, sequence indices, and optional checkpoint hash commitments).
+        // This endpoint does NOT query a live Bitcoin node; clients must independently verify on-chain confirmations and outpoints.
+        (Method::Post, "/v1/transparency/verify/catena") => {
+            match read_json::<CatenaVerifyRequest>(&mut request).and_then(|body| {
+                if let Some(genesis) = body.anchors.first() {
+                    if genesis.continuation_vout
+                        != Some(satspath_core::transparency::CATENA_CONTINUATION_VOUT)
+                    {
+                        return Err(
+                            satspath_core::transparency::TransparencyError::InvalidCatenaChain(
+                                format!(
+                                    "genesis continuation_vout is {:?}, expected Some({})",
+                                    genesis.continuation_vout,
+                                    satspath_core::transparency::CATENA_CONTINUATION_VOUT
+                                ),
+                            )
+                            .into(),
+                        );
+                    }
+                }
+                let structurally_consistent =
+                    satspath_core::transparency::verify_catena_links(&body.anchors)?;
+                let commitments_valid = match &body.checkpoint_hashes {
+                    Some(hashes) => {
+                        let str_hashes: Vec<&str> = hashes.iter().map(String::as_str).collect();
+                        Some(satspath_core::transparency::verify_catena_commitments(
+                            &body.anchors,
+                            &str_hashes,
+                        )?)
+                    }
+                    None => None,
+                };
+                Ok((structurally_consistent, commitments_valid))
+            }) {
+                Ok((structurally_consistent, commitments_valid)) => {
+                    let mut resp = serde_json::json!({
+                        "structurally_consistent": structurally_consistent
+                    });
+                    if let Some(valid) = commitments_valid {
+                        resp["commitments_valid"] = serde_json::json!(valid);
+                    }
+                    json_response(StatusCode(200), &resp)
+                }
                 Err(e) => json_error(StatusCode(400), e),
             }
         }
