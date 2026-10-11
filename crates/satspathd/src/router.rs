@@ -37,15 +37,30 @@ use crate::ui::{html_response, INDEX_HTML};
 use crate::v2_api;
 
 pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Result<()> {
+    let req_start = std::time::Instant::now();
+    let request_id = crate::telemetry::get_or_generate_request_id(request.headers());
     let method = request.method().clone();
     let raw_url = request.url().to_string();
     let path = raw_url.split('?').next().unwrap_or("/").to_string();
 
+    let request_span = tracing::info_span!(
+        "http_request",
+        request_id = %request_id,
+        method = %method,
+        path = %path
+    );
+    let _span_guard = request_span.enter();
+
     if !crate::host::is_allowed_host(request.headers(), state.bind, &state.allowed_hosts) {
-        request.respond(json_error(
-            StatusCode(400),
-            anyhow::anyhow!("untrusted HTTP Host"),
-        ))?;
+        let resp = json_error(StatusCode(400), anyhow::anyhow!("untrusted HTTP Host"))
+            .with_header(crate::http::request_id_header(&request_id));
+        let _ = request.respond(resp);
+        crate::telemetry::record_http_request(
+            method.as_str(),
+            &path,
+            400,
+            req_start.elapsed().as_secs_f64(),
+        );
         return Ok(());
     }
 
@@ -54,11 +69,25 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     if let Some(body_len) = request.body_length() {
         if body_len > max_body {
             state.rate_limiter.record_payload_too_large();
-            eprintln!(
-                "[rate_limit] payload too large: {} bytes (limit: {}) on {} {}",
-                body_len, max_body, method, path
+            crate::telemetry::metrics::record_rate_limit_dropped("payload_too_large");
+            tracing::warn!(
+                body_len = body_len,
+                max_body = max_body,
+                "payload too large: {} bytes (limit: {}) on {} {}",
+                body_len,
+                max_body,
+                method,
+                path
             );
-            let _ = request.respond(rate_limit::payload_too_large_response(max_body));
+            let resp = rate_limit::payload_too_large_response(max_body)
+                .with_header(crate::http::request_id_header(&request_id));
+            let _ = request.respond(resp);
+            crate::telemetry::record_http_request(
+                method.as_str(),
+                &path,
+                413,
+                req_start.elapsed().as_secs_f64(),
+            );
             return Ok(());
         }
     }
@@ -73,11 +102,22 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     match state.rate_limiter.check(&client_ip) {
         rate_limit::RateLimitResult::Allowed { remaining: _ } => {}
         rate_limit::RateLimitResult::RateLimited { retry_after_secs } => {
-            eprintln!(
-                "[rate_limit] client IP {} exceeded rate limit on {} {}, retry after {}s",
+            crate::telemetry::metrics::record_rate_limit_dropped("rate_limited");
+            tracing::warn!(
+                client_ip = %client_ip,
+                retry_after_secs = retry_after_secs,
+                "client IP {} exceeded rate limit on {} {}, retry after {}s",
                 client_ip, method, path, retry_after_secs
             );
-            let _ = request.respond(rate_limit::rate_limit_response(retry_after_secs));
+            let resp = rate_limit::rate_limit_response(retry_after_secs)
+                .with_header(crate::http::request_id_header(&request_id));
+            let _ = request.respond(resp);
+            crate::telemetry::record_http_request(
+                method.as_str(),
+                &path,
+                429,
+                req_start.elapsed().as_secs_f64(),
+            );
             return Ok(());
         }
     }
@@ -94,7 +134,15 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
 
     if is_mutation && !is_public_mutation {
         if let Err(e) = check_auth(&request, &state.auth_token) {
-            let _ = request.respond(json_error(StatusCode(401), e));
+            let resp = json_error(StatusCode(401), e)
+                .with_header(crate::http::request_id_header(&request_id));
+            let _ = request.respond(resp);
+            crate::telemetry::record_http_request(
+                method.as_str(),
+                &path,
+                401,
+                req_start.elapsed().as_secs_f64(),
+            );
             return Ok(());
         }
     }
@@ -120,8 +168,22 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             Err(e) => handle_read_error(e),
         },
         (Method::Post, "/v1/broadcast") => json_result(StatusCode(200), broadcast(state)),
-        (Method::Get, "/health") => {
-            json_response(StatusCode(200), &serde_json::json!({"ok": true}))
+        (Method::Get, "/metrics") => match crate::telemetry::gather_metrics() {
+            Ok(metrics_text) => crate::http::text_response(
+                StatusCode(200),
+                metrics_text,
+                "text/plain; version=0.04; charset=utf-8",
+            ),
+            Err(e) => json_error(StatusCode(500), e),
+        },
+        (Method::Get, "/health") | (Method::Get, "/v1/health") => {
+            let health = crate::telemetry::perform_deep_health_check(&state.home).await;
+            let status = if health.status == "healthy" || health.status == "degraded" {
+                StatusCode(200)
+            } else {
+                StatusCode(503)
+            };
+            json_response(status, &health)
         }
         (Method::Get, v2_api::routes::HEALTH) => {
             let (checkpoint_age, log_ok) = match transparency_log(state) {
@@ -156,9 +218,22 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
                     ))?)
                 }
             };
+            let res_start = std::time::Instant::now();
             match resolve_v2_envelope(state, &identifier) {
-                Ok(envelope) => json_response(StatusCode(200), &envelope),
+                Ok(envelope) => {
+                    crate::telemetry::record_profile_resolution(
+                        "success",
+                        false,
+                        res_start.elapsed().as_secs_f64(),
+                    );
+                    json_response(StatusCode(200), &envelope)
+                }
                 Err(e) => {
+                    crate::telemetry::record_profile_resolution(
+                        "error",
+                        false,
+                        res_start.elapsed().as_secs_f64(),
+                    );
                     let status = if e.to_string().contains("not found") {
                         StatusCode(404)
                     } else {
@@ -170,17 +245,32 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         }
         (Method::Post, v2_api::routes::RESOLVE) => {
             match read_json::<satspath_core::transparency::ResolutionRequest>(&mut request) {
-                Ok(body) => match resolve_v2_envelope(state, &body.identifier) {
-                    Ok(envelope) => json_response(StatusCode(200), &envelope),
-                    Err(e) => {
-                        let status = if e.to_string().contains("not found") {
-                            StatusCode(404)
-                        } else {
-                            StatusCode(400)
-                        };
-                        json_error(status, e)
+                Ok(body) => {
+                    let res_start = std::time::Instant::now();
+                    match resolve_v2_envelope(state, &body.identifier) {
+                        Ok(envelope) => {
+                            crate::telemetry::record_profile_resolution(
+                                "success",
+                                false,
+                                res_start.elapsed().as_secs_f64(),
+                            );
+                            json_response(StatusCode(200), &envelope)
+                        }
+                        Err(e) => {
+                            crate::telemetry::record_profile_resolution(
+                                "error",
+                                false,
+                                res_start.elapsed().as_secs_f64(),
+                            );
+                            let status = if e.to_string().contains("not found") {
+                                StatusCode(404)
+                            } else {
+                                StatusCode(400)
+                            };
+                            json_error(status, e)
+                        }
                     }
-                },
+                }
                 Err(e) => handle_read_error(e),
             }
         }
@@ -541,6 +631,15 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         }
         _ => json_error(StatusCode(404), anyhow::anyhow!("endpoint not found")),
     };
+    let status_code = response.status_code().0;
+    let duration_secs = req_start.elapsed().as_secs_f64();
+    crate::telemetry::record_http_request(method.as_str(), &path, status_code, duration_secs);
+    tracing::info!(
+        status = status_code,
+        duration_ms = duration_secs * 1000.0,
+        "request completed"
+    );
+    let response = response.with_header(crate::http::request_id_header(&request_id));
     request.respond(response)?;
     Ok(())
 }

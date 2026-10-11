@@ -13,6 +13,7 @@ mod p2p;
 mod rate_limit;
 mod router;
 mod server;
+pub mod telemetry;
 mod types;
 mod ui;
 mod v2_api;
@@ -41,6 +42,7 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    telemetry::init_telemetry(cli.log_format.as_deref())?;
     let bind = cli
         .bind
         .or_else(|| std::env::var("SATSPATHD_BIND").ok())
@@ -1636,6 +1638,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad_res.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        server.unblock();
+    }
+
+    #[tokio::test]
+    async fn test_observability_metrics_health_and_request_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path());
+        load_or_create_identity(&state.home).unwrap();
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        state.bind = server.server_addr().to_ip().unwrap();
+        let base_url = format!("http://{}", state.bind);
+
+        let srv = server.clone();
+        tokio::spawn(serve_server(Arc::new(state), srv));
+
+        let client = reqwest::Client::new();
+
+        // 1. GET /health deep health check returns 200 with dependency statuses
+        let health_res = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health_res.status(), reqwest::StatusCode::OK);
+        let req_id_header = health_res.headers().get("X-Request-Id");
+        assert!(
+            req_id_header.is_some(),
+            "X-Request-Id header must be present on response"
+        );
+        let health_json: serde_json::Value = health_res.json().await.unwrap();
+        assert!(health_json["status"] == "healthy" || health_json["status"] == "degraded");
+        assert_eq!(health_json["dependencies"]["sqlite"]["status"], "healthy");
+        assert_eq!(health_json["dependencies"]["sqlite"]["writable"], true);
+        assert_eq!(
+            health_json["dependencies"]["transparency_log"]["status"],
+            "healthy"
+        );
+
+        // 2. Custom X-Request-Id is reflected in response
+        let custom_id = "test-custom-trace-uuid-123456";
+        let echo_res = client
+            .get(format!("{base_url}/v1/health"))
+            .header("X-Request-Id", custom_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(echo_res.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            echo_res
+                .headers()
+                .get("X-Request-Id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            custom_id
+        );
+
+        // 3. GET /metrics returns Prometheus metrics exposition
+        let metrics_res = client
+            .get(format!("{base_url}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(metrics_res.status(), reqwest::StatusCode::OK);
+        let ct = metrics_res
+            .headers()
+            .get("Content-Type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.contains("text/plain"));
+        let metrics_text = metrics_res.text().await.unwrap();
+        assert!(metrics_text.contains("satspathd_http_requests_total"));
+        assert!(metrics_text.contains("satspathd_http_request_duration_seconds"));
 
         server.unblock();
     }

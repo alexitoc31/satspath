@@ -29,6 +29,7 @@ use satspath_core::{
 use crate::fees::FeeEstimate;
 use crate::lightning::{fetch_invoice, fetch_lnurl_metadata};
 use crate::router::{select_route, select_route_with_fees, RouteRequest};
+use tracing::Instrument;
 
 /// Public, frontend-facing description of the recipient.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,7 +238,12 @@ where
     R: ProfileResolver + Sync + ?Sized,
 {
     // 1. Resolve. Anything unresolvable becomes an invite — never a hard error.
-    let signed = match resolver.resolve_alias(recipient).await {
+    let resolve_span = tracing::info_span!("satspath.resolve", recipient = %recipient);
+    let signed = match resolver
+        .resolve_alias(recipient)
+        .instrument(resolve_span)
+        .await
+    {
         Ok(signed) => signed,
         Err(_) => {
             return QuoteResponse::NotRegistered {
@@ -249,7 +255,11 @@ where
     };
 
     // 2. Verify signature.
-    let verified = verify_signed_profile(&signed).unwrap_or(false);
+    let verify_span = tracing::info_span!("satspath.verify", recipient = %recipient);
+    let verified = {
+        let _guard = verify_span.enter();
+        verify_signed_profile(&signed).unwrap_or(false)
+    };
     let recipient_info = recipient_of(&signed.profile, verified);
     if !verified {
         return QuoteResponse::InvalidSignature {
@@ -277,6 +287,11 @@ async fn route_verified_signed(
     }
 
     // 4. Route.
+    let route_span = tracing::info_span!(
+        "satspath.route",
+        recipient = %recipient,
+        amount_sats = %amount_sats
+    );
     let req = RouteRequest {
         alias: recipient.to_string(),
         amount_sats,
@@ -286,8 +301,11 @@ async fn route_verified_signed(
         max_fee_percent: None,
     };
     let route = match fees {
-        Some(fee_est) => select_route_with_fees(&req, &fee_est),
-        None => select_route(&req).await,
+        Some(fee_est) => {
+            let _guard = route_span.enter();
+            select_route_with_fees(&req, &fee_est)
+        }
+        None => select_route(&req).instrument(route_span).await,
     };
     let route = match route {
         Ok(route) => route,
