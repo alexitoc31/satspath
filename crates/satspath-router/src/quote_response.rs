@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use satspath_core::{
     create_invite,
     crypto::{check_profile_expiry, fingerprint_pubkey, verify_signed_profile},
+    identifier_hash,
     profile::PaymentProfile,
     registry::Registry,
     resolver::{ChainResolver, ProfileResolver},
@@ -153,7 +154,8 @@ pub async fn quote_verified_profile(
                 .into(),
         };
     }
-    route_verified_signed(signed, recipient, amount_sats, None, false).await
+    let recipient_hash = identifier_hash(recipient);
+    route_verified_signed(signed, recipient, &recipient_hash, amount_sats, None, false).await
 }
 
 // ─── QR / payment payload ──────────────────────────────────────────────────────
@@ -237,8 +239,10 @@ async fn quote_inner<R>(
 where
     R: ProfileResolver + Sync + ?Sized,
 {
+    let recipient_hash = identifier_hash(recipient);
+
     // 1. Resolve. Anything unresolvable becomes an invite — never a hard error.
-    let resolve_span = tracing::info_span!("satspath.resolve", recipient = %recipient);
+    let resolve_span = tracing::info_span!("satspath.resolve", identifier_hash = %recipient_hash);
     let signed = match resolver
         .resolve_alias(recipient)
         .instrument(resolve_span)
@@ -255,7 +259,7 @@ where
     };
 
     // 2. Verify signature.
-    let verify_span = tracing::info_span!("satspath.verify", recipient = %recipient);
+    let verify_span = tracing::info_span!("satspath.verify", identifier_hash = %recipient_hash);
     let verified = {
         let _guard = verify_span.enter();
         verify_signed_profile(&signed).unwrap_or(false)
@@ -267,12 +271,21 @@ where
         };
     }
 
-    route_verified_signed(signed, recipient, amount_sats, fees, fetch_ln_invoice).await
+    route_verified_signed(
+        signed,
+        recipient,
+        &recipient_hash,
+        amount_sats,
+        fees,
+        fetch_ln_invoice,
+    )
+    .await
 }
 
 async fn route_verified_signed(
     signed: satspath_core::SignedPaymentProfile,
     recipient: &str,
+    recipient_hash: &str,
     amount_sats: u64,
     fees: Option<FeeEstimate>,
     fetch_ln_invoice: bool,
@@ -289,7 +302,7 @@ async fn route_verified_signed(
     // 4. Route.
     let route_span = tracing::info_span!(
         "satspath.route",
-        recipient = %recipient,
+        identifier_hash = %recipient_hash,
         amount_sats = %amount_sats
     );
     let req = RouteRequest {

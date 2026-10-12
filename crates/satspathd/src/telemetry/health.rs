@@ -110,7 +110,9 @@ pub async fn check_fee_api_health() -> DependencyHealth {
     if let Some(cached) = satspath_router::fees::get_cached_fee() {
         let now_secs = satspath_router::fees::current_time_secs();
         let age_secs = now_secs.saturating_sub(cached.timestamp_secs);
-        let is_stale = age_secs > 1800;
+        let max_staleness_secs =
+            satspath_router::fees::FeeEstimatorConfig::from_env().max_staleness_secs;
+        let is_stale = age_secs >= max_staleness_secs;
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         return DependencyHealth {
             status: if is_stale {
@@ -205,7 +207,7 @@ pub async fn check_fee_api_health() -> DependencyHealth {
 /// Checks the state and checkpoint age of the local Transparency Log.
 pub fn check_transparency_health(home: &Path) -> DependencyHealth {
     let start = Instant::now();
-    match crate::handlers::transparency::transparency_log_at(home) {
+    match TransactionalTransparencyStore::open_read_only(home).and_then(|store| store.load_log()) {
         Ok(log) => {
             let latest_ts = log.checkpoints().last().map(|c| c.created_at).unwrap_or(0);
             let now = chrono::Utc::now().timestamp();
@@ -319,6 +321,32 @@ pub fn spawn_metrics_refresher(home: std::path::PathBuf) -> tokio::task::JoinHan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparency_health_does_not_initialize_missing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_home = dir.path().join("missing");
+        for home in [dir.path(), missing_home.as_path()] {
+            let health = check_transparency_health(home);
+            assert_eq!(health.status, "unhealthy");
+            assert!(health.error.is_some());
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn transparency_health_preserves_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        TransactionalTransparencyStore::open(dir.path()).unwrap();
+        let db_path = dir.path().join(TRANSPARENCY_DB_FILE);
+        let before = std::fs::read(&db_path).unwrap();
+
+        let health = check_transparency_health(dir.path());
+
+        assert_eq!(health.status, "healthy");
+        assert_eq!(health.details["checkpoint_count"], 0);
+        assert_eq!(std::fs::read(db_path).unwrap(), before);
+    }
 
     #[tokio::test]
     async fn test_deep_health_check_with_tempdir() {

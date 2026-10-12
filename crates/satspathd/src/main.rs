@@ -1726,7 +1726,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(ct.contains("text/plain"));
+        assert_eq!(ct, prometheus::TEXT_FORMAT);
         let metrics_text = metrics_res.text().await.unwrap();
         assert!(metrics_text.contains("satspathd_http_requests_total"));
         assert!(metrics_text.contains("satspathd_http_request_duration_seconds"));

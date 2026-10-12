@@ -59,9 +59,11 @@ pub(crate) fn route_template(path: &str) -> &'static str {
         "/v1/profile" => "/v1/profile",
         "/v1/profile/challenge" => "/v1/profile/challenge",
         "/v1/profile/verify" => "/v1/profile/verify",
-        "/v1/profile/rotate" => "/v1/profile/rotate",
+        "/v1/profile/rotate-key" => "/v1/profile/rotate-key",
         "/v1/profile/recover" => "/v1/profile/recover",
         "/v1/profile/methods" => "/v1/profile/methods",
+        "/v1/resolve" => "/v1/resolve",
+        "/v1/preview" => "/v1/preview",
         "/v1/quote" => "/v1/quote",
         "/v1/pay" => "/v1/pay",
         "/v1/dns/resolve" => "/v1/dns/resolve",
@@ -71,6 +73,8 @@ pub(crate) fn route_template(path: &str) -> &'static str {
         "/v1/invites/notifications/read-all" => "/v1/invites/notifications/read-all",
         "/v1/transparency/status" => "/v1/transparency/status",
         "/v1/transparency/checkpoints" => "/v1/transparency/checkpoints",
+        "/v1/transparency/anchors" => "/v1/transparency/anchors",
+        "/v1/transparency/consistency" => "/v1/transparency/consistency",
         "/v1/transparency/events" => "/v1/transparency/events",
         "/v1/transparency/catena/chain" => "/v1/transparency/catena/chain",
         "/v1/transparency/catena/anchor" => "/v1/transparency/catena/anchor",
@@ -83,6 +87,7 @@ pub(crate) fn route_template(path: &str) -> &'static str {
         p if p.starts_with("/v1/transparency/inclusion/") => "/v1/transparency/inclusion/:hash",
         p if p.starts_with("/v1/transparency/anchors/") => "/v1/transparency/anchors/:txid",
         p if p.starts_with("/v1/invites/notifications/") => "/v1/invites/notifications/:id",
+        p if p.starts_with("/v1/claim/") => "/v1/claim/:id",
         p if p.starts_with("/v1/invites/") => "/v1/invites/:id",
         _ => "other",
     }
@@ -256,7 +261,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
                 Ok(metrics_text) => crate::http::text_response(
                     StatusCode(200),
                     metrics_text,
-                    "text/plain; version=0.04; charset=utf-8",
+                    prometheus::TEXT_FORMAT,
                 ),
                 Err(e) => json_error(StatusCode(500), e),
             }
@@ -735,4 +740,28 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     }
     .instrument(request_span)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_template;
+
+    #[test]
+    fn templates_cover_dispatched_routes_without_identifier_labels() {
+        for path in [
+            "/v1/profile/rotate-key",
+            "/v1/resolve",
+            "/v1/preview",
+            "/v1/transparency/anchors",
+            "/v1/transparency/consistency",
+            "/v1/claim",
+        ] {
+            assert_eq!(route_template(path), path);
+        }
+        for id in ["invite-one", "invite-two"] {
+            assert_eq!(route_template(&format!("/v1/claim/{id}")), "/v1/claim/:id");
+        }
+        assert_eq!(route_template("/v1/profile/rotate"), "other");
+        assert_eq!(route_template("/unknown"), "other");
+    }
 }

@@ -13,6 +13,18 @@ groups:
           summary: "High HTTP 5xx error rate on satspathd"
           description: "HTTP 5xx error rate is {{ $value | printf \"%.2f\" }}% (> 5%) over the last 5 minutes."
 
+      - alert: FeeApiDown
+        expr: |
+          sum(rate(satspathd_fee_api_requests_total{status=~"error|timeout"}[10m]))
+          /
+          sum(rate(satspathd_fee_api_requests_total[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fee API requests are failing"
+          description: "More than half of fee API requests failed or timed out over the last 10 minutes, sustained for 10 minutes."
+
       - alert: CheckpointStale
         expr: satspathd_transparency_checkpoint_age_seconds > 86400
         for: 15m
