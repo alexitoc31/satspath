@@ -303,6 +303,19 @@ pub async fn perform_deep_health_check(home: &Path) -> DeepHealthResponse {
     resp
 }
 
+/// Spawns a background task that periodically refreshes checkpoint-age and fee metrics
+/// so Prometheus scrapes always have fresh samples even without separate health check calls.
+pub fn spawn_metrics_refresher(home: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            check_transparency_health(&home);
+            let _ = check_fee_api_health().await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

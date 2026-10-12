@@ -159,10 +159,21 @@ async fn run() -> Result<()> {
         p2p: p2p::Bridge::new(cli.p2p),
         home,
         bind,
-        allowed_hosts: host::configured_hosts(
-            std::env::var("SATSPATH_AUTHORITY_DOMAIN").ok().as_deref(),
-            std::env::var("SATSPATH_AUTHORITY_URL").ok().as_deref(),
-        )?,
+        allowed_hosts: {
+            let mut list = host::configured_hosts(
+                std::env::var("SATSPATH_AUTHORITY_DOMAIN").ok().as_deref(),
+                std::env::var("SATSPATH_AUTHORITY_URL").ok().as_deref(),
+            )?;
+            if let Ok(extra) = std::env::var("SATSPATH_ALLOWED_HOSTS") {
+                for part in extra.split(',') {
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        list.push(host::parse_authority(trimmed)?.to_string());
+                    }
+                }
+            }
+            list
+        },
         network,
         open_ui: !cli.no_open,
         auth_token,
@@ -180,10 +191,12 @@ async fn run() -> Result<()> {
 
     print_startup_status(&state)?;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let metrics_refresher = crate::telemetry::health::spawn_metrics_refresher(state.home.clone());
     let bridge = cli
         .p2p
         .then(|| tokio::spawn(p2p::supervise(state.clone(), stop_rx)));
     let result = serve(state, tls_config).await;
+    metrics_refresher.abort();
     let _ = stop_tx.send(());
     if let Some(task) = bridge {
         task.await?;

@@ -79,6 +79,9 @@ pub(crate) fn route_template(path: &str) -> &'static str {
         "/v1/transparency/verify/catena" => "/v1/transparency/verify/catena",
         p if p.starts_with("/v1/transparency/checkpoints/") => "/v1/transparency/checkpoints/:hash",
         p if p.starts_with("/v1/transparency/events/") => "/v1/transparency/events/:hash",
+        p if p.starts_with("/v1/transparency/identifiers/") => "/v1/transparency/identifiers/:id",
+        p if p.starts_with("/v1/transparency/inclusion/") => "/v1/transparency/inclusion/:hash",
+        p if p.starts_with("/v1/transparency/anchors/") => "/v1/transparency/anchors/:txid",
         p if p.starts_with("/v1/invites/notifications/") => "/v1/invites/notifications/:id",
         p if p.starts_with("/v1/invites/") => "/v1/invites/:id",
         _ => "other",
@@ -116,18 +119,29 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
 
     use tracing::Instrument;
     async {
-        if !crate::host::is_allowed_host(request.headers(), state.bind, &state.allowed_hosts) {
-        let resp = json_error(StatusCode(400), anyhow::anyhow!("untrusted HTTP Host"))
-            .with_header(crate::http::request_id_header(&request_id));
-        let _ = request.respond(resp);
-        crate::telemetry::record_http_request(
-            method_str,
-            template,
-            400,
-            req_start.elapsed().as_secs_f64(),
-        );
-        return Ok(());
-    }
+        let is_internal_scrape = template == "/metrics"
+            && request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Host"))
+                .and_then(|h| crate::host::parse_authority(h.value.as_str()).ok())
+                .map(|h| h.to_string() == "satspathd")
+                .unwrap_or(false);
+
+        if !crate::host::is_allowed_host(request.headers(), state.bind, &state.allowed_hosts)
+            && !is_internal_scrape
+        {
+            let resp = json_error(StatusCode(400), anyhow::anyhow!("untrusted HTTP Host"))
+                .with_header(crate::http::request_id_header(&request_id));
+            let _ = request.respond(resp);
+            crate::telemetry::record_http_request(
+                method_str,
+                template,
+                400,
+                req_start.elapsed().as_secs_f64(),
+            );
+            return Ok(());
+        }
 
     // 1. Guard against oversized request bodies (HTTP 413 Payload Too Large)
     let max_body = state.rate_limiter.max_body_bytes();
@@ -236,13 +250,16 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             Err(e) => handle_read_error(e),
         },
         (Method::Post, "/v1/broadcast") => json_result(StatusCode(200), broadcast(state)),
-        (Method::Get, "/metrics") => match crate::telemetry::gather_metrics() {
-            Ok(metrics_text) => crate::http::text_response(
-                StatusCode(200),
-                metrics_text,
-                "text/plain; version=0.04; charset=utf-8",
-            ),
-            Err(e) => json_error(StatusCode(500), e),
+        (Method::Get, "/metrics") => {
+            crate::telemetry::health::check_transparency_health(&state.home);
+            match crate::telemetry::gather_metrics() {
+                Ok(metrics_text) => crate::http::text_response(
+                    StatusCode(200),
+                    metrics_text,
+                    "text/plain; version=0.04; charset=utf-8",
+                ),
+                Err(e) => json_error(StatusCode(500), e),
+            }
         },
         (Method::Get, "/health") => json_response(
             StatusCode(200),
