@@ -60,16 +60,11 @@ pub fn check_sqlite_health(home: &Path) -> DependencyHealth {
     match TransactionalTransparencyStore::open_read_only(home) {
         Ok(store) => {
             let log_id = store.log_id().to_string();
-            let write_probe = (|| -> rusqlite::Result<()> {
-                let mut conn = rusqlite::Connection::open(&db_path)?;
-                conn.busy_timeout(std::time::Duration::from_millis(250))?;
-                let tx =
-                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                tx.execute("INSERT INTO schema_migrations(version) VALUES (-999)", [])?;
-                tx.rollback()?;
-                Ok(())
-            })();
-            let is_writable = write_probe.is_ok();
+            let is_writable = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .is_ok();
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             if is_writable {
                 DependencyHealth {
@@ -85,10 +80,7 @@ pub fn check_sqlite_health(home: &Path) -> DependencyHealth {
                 DependencyHealth {
                     status: "unhealthy".to_string(),
                     latency_ms,
-                    error: Some(match write_probe {
-                        Err(e) => format!("database write check failed: {e}"),
-                        Ok(_) => "transparency database file is not writable".to_string(),
-                    }),
+                    error: Some("transparency database file is not writable".to_string()),
                     details: serde_json::json!({
                         "writable": false,
                         "log_id": log_id,

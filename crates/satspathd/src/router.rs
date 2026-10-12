@@ -188,10 +188,9 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         rate_limit::RateLimitResult::RateLimited { retry_after_secs } => {
             crate::telemetry::metrics::record_rate_limit_dropped("rate_limited");
             tracing::warn!(
-                client_ip = %client_ip,
+                endpoint = template,
                 retry_after_secs = retry_after_secs,
-                "client IP {} exceeded rate limit on {} {}, retry after {}s",
-                client_ip,
+                "rate limit exceeded on {} {}, retry after {}s",
                 method_str,
                 template,
                 retry_after_secs
