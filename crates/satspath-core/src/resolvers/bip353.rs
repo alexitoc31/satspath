@@ -35,21 +35,20 @@ use crate::{Result, SatsPathError, SignedPaymentProfile};
 
 /// Return the set of trusted DNSSEC root trust anchors.
 ///
-/// Bundles historical roots (19036, 20326) and the active ICANN KSK
-/// (Key tag 38696) to enable autonomous validation of the root zone `.`
-/// without relying on upstream server trust.
+/// Combines Hickory's default historical trust anchors (including KSK 19036 and 20326)
+/// with the explicitly bundled active ICANN KSK (Key tag 38696) to enable autonomous
+/// validation of the root zone `.` without relying on upstream server trust.
 pub fn root_trust_anchors() -> TrustAnchor {
     let mut anchor = TrustAnchor::default();
     // ICANN Root Key Signing Key (KSK 2024-2026, Key Tag 38696)
     // RFC 3110 format RSA public key bytes (exponent + modulus).
     const KSK_38696_B64: &str = "AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyGwCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGOHOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2vaF18UYH9Z9GNUUeayffKC73PYc=";
-    if let Ok(ksk_bytes) =
+    let ksk_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, KSK_38696_B64)
-    {
-        if let Ok(rsa) = Rsa::from_public_bytes(&ksk_bytes) {
-            anchor.insert_trust_anchor(&rsa);
-        }
-    }
+            .expect("embedded ICANN root KSK base64 must decode");
+    let rsa = Rsa::from_public_bytes(&ksk_bytes)
+        .expect("embedded ICANN root KSK must parse as valid RSA public key");
+    anchor.insert_trust_anchor(&rsa);
     anchor
 }
 
@@ -223,28 +222,49 @@ impl ProfileResolver for Bip353Resolver {
         let parsed = crate::bip321::parse_bip321(&resolution.bitcoin_uri)?;
         if let Some(profile_url) = parsed.sp_profile {
             #[cfg(feature = "std")]
-            crate::ssrf::validate_url(&profile_url, false)?;
+            {
+                crate::ssrf::validate_url(&profile_url, false)?;
 
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .map_err(|e| SatsPathError::NetworkError(e.to_string()))?;
-            let resp = client
-                .get(&profile_url)
-                .send()
-                .await
-                .map_err(|e| SatsPathError::NetworkError(e.to_string()))?;
-            let signed: SignedPaymentProfile = resp
-                .json()
-                .await
-                .map_err(|e| SatsPathError::SerializationError(e.to_string()))?;
+                // Resolve hostname and verify no private or reserved IPs (prevent DNS rebinding)
+                let parsed_url = url::Url::parse(&profile_url).map_err(|e| {
+                    SatsPathError::ValidationError(format!("invalid sp-profile URL: {e}"))
+                })?;
+                if let Some(host) = parsed_url.host_str() {
+                    let port = parsed_url.port_or_known_default().unwrap_or(443);
+                    let addrs: Vec<std::net::SocketAddr> =
+                        tokio::net::lookup_host(format!("{host}:{port}"))
+                            .await
+                            .map_err(|e| {
+                                SatsPathError::NetworkError(format!(
+                                    "DNS resolution failed for {host}: {e}"
+                                ))
+                            })?
+                            .collect();
+                    for addr in &addrs {
+                        if crate::ssrf::is_private_or_reserved_ip(addr.ip()) {
+                            return Err(SatsPathError::ValidationError(format!(
+                                "Blocked resolved IP for {host}: {} (private/reserved range)",
+                                addr.ip()
+                            )));
+                        }
+                    }
+                }
 
-            if crate::bip353::verify_bip353_ownership(&resolution, &signed)? {
-                return Ok(signed);
-            } else {
-                return Err(SatsPathError::OwnershipProofInvalid(
-                    "BIP-353 sp-profile ownership verification failed".into(),
-                ));
+                // Fetch using HttpResolver (enforces redirect=none, 50KB DoS bound, signature & expiry check)
+                let http_resolver = crate::resolvers::http::HttpResolver::new();
+                let signed = http_resolver.resolve_from_url(&profile_url).await?;
+
+                if signed.profile.revoked {
+                    return Err(SatsPathError::RegistryError("profile is revoked".into()));
+                }
+
+                if crate::bip353::verify_bip353_ownership(&resolution, &signed)? {
+                    return Ok(signed);
+                } else {
+                    return Err(SatsPathError::OwnershipProofInvalid(
+                        "BIP-353 sp-profile ownership verification failed".into(),
+                    ));
+                }
             }
         }
 

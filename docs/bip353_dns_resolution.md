@@ -74,9 +74,9 @@ compromised or MITM recursive resolver.
 SatsPath ships a full cryptographic DNSSEC validator based on Hickory DNS (`hickory-resolver`), executing local trust-chain verification:
 
 1. **Bundled Root Trust Anchors:**
-   - Active ICANN Root KSK: Key tag `38696` (RSA 2048-bit, active in global DNS root).
-   - Standby / Historical KSKs: Key tag `20326` and `19036`.
-   - Hardcoded in `satspath-core::resolvers::bip353::root_trust_anchors()` to eliminate reliance on host OS trust stores.
+   - Active ICANN Root KSK: Key tag `38696` (RSA 2048-bit, active in global DNS root) bundled explicitly.
+   - Historical / Standby KSKs: Key tags `20326` and `19036` (included from Hickory's default trust anchors).
+   - Bundled in `satspath-core::resolvers::bip353::root_trust_anchors()` to eliminate reliance on host OS trust stores.
 2. **Multi-Provider Recursive Resolver Pool:**
    Queries are routed with retries across independent public DNS providers over both TCP and UDP (port 53):
    - **Cloudflare:** `1.0.0.1`, `1.1.1.1`
@@ -84,8 +84,8 @@ SatsPath ships a full cryptographic DNSSEC validator based on Hickory DNS (`hick
    - **Google:** `8.8.8.8`, `8.8.4.4`
    - Dual TCP/UDP transport ensures resilience against UDP filtering, packet loss, or oversized DNSSEC responses.
 3. **Fail-Closed Guarantees:**
-   - Any broken signature (RRSIG mismatch, expired signatures, missing DS record, bogus key) fails closed and returns an error immediately.
-   - Unsigned domains queried under `Strict` mode fail closed (`DnssecUnvalidated` / `DnssecValidationFailed`).
+   - Any broken signature (RRSIG mismatch, expired signatures, missing DS record, bogus key) fails closed and returns an error immediately (`SatsPathError::NetworkError`).
+   - Unsigned domains queried under `Strict` mode fail closed (`SatsPathError::DnssecUnavailable` or `SatsPathError::NetworkError` on DNSSEC failure).
    - Upstream recursive servers act solely as untrusted transport carriers; all cryptographic signature checking happens locally on the client.
 
 ## Direct TXT model (Option A)

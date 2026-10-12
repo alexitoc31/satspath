@@ -21,6 +21,7 @@ use satspath_core::SatsPathError;
 // ─── Live DNSSEC Integration Tests ──────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "Live external network DNS test; run explicitly with -- --ignored"]
 async fn test_dnssec_local_chain_validation_for_signed_domain() {
     let resolver = HickoryDnssecTxtResolver::new();
 
@@ -43,6 +44,7 @@ async fn test_dnssec_local_chain_validation_for_signed_domain() {
 }
 
 #[tokio::test]
+#[ignore = "Live external network DNS test; run explicitly with -- --ignored"]
 async fn test_dnssec_known_bogus_signature_fails_closed() {
     let resolver = HickoryDnssecTxtResolver::new();
 
@@ -61,6 +63,7 @@ async fn test_dnssec_known_bogus_signature_fails_closed() {
 }
 
 #[tokio::test]
+#[ignore = "Live external network DNS test; run explicitly with -- --ignored"]
 async fn test_dnssec_unsigned_domain_rejected_in_strict_mode() {
     let resolver = HickoryDnssecTxtResolver::new();
 
@@ -76,12 +79,21 @@ async fn test_dnssec_unsigned_domain_rejected_in_strict_mode() {
 #[test]
 fn test_root_trust_anchors_bundle_active_ksk() {
     let anchor = root_trust_anchors();
-    // Default Hickory TrustAnchor has 2 historical keys (19036 and 20326).
+    // Default Hickory TrustAnchor has historical keys (19036 and 20326).
     // Our bundle adds the active ICANN KSK 38696 (3 keys total).
     assert!(
         anchor.len() >= 3,
         "trust anchor bundle must contain at least 3 root keys, found {}",
         anchor.len()
+    );
+
+    // Verify specifically that active ICANN KSK 38696 is contained in the trust anchor set
+    const KSK_38696_B64: &str = "AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyGwCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGOHOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2vaF18UYH9Z9GNUUeayffKC73PYc=";
+    let ksk_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, KSK_38696_B64).unwrap();
+    assert!(
+        anchor.contains_dnskey_bytes(&ksk_bytes),
+        "trust anchor bundle must contain active KSK 38696 key bytes"
     );
 }
 
