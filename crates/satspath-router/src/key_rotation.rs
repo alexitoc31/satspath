@@ -44,6 +44,23 @@ pub fn apply_key_rotation(
     rotation: &KeyRotation,
     new_secret_key: &SecretKey,
 ) -> Result<SignedPaymentProfile, SatsPathError> {
+    if rotation.previous_pubkey != profile.profile.identity_pubkey {
+        return Err(SatsPathError::InvalidRotation(
+            "rotation previous_pubkey does not match profile identity_pubkey".into(),
+        ));
+    }
+    if rotation.identifier_hash != satspath_core::privacy::identifier_hash(&profile.profile.alias) {
+        return Err(SatsPathError::InvalidRotation(
+            "rotation identifier_hash does not match profile alias".into(),
+        ));
+    }
+    let expected_sequence = profile.profile.sequence.unwrap_or(0).saturating_add(1);
+    if rotation.sequence != expected_sequence {
+        return Err(SatsPathError::InvalidRotation(
+            "rotation sequence must equal next sequence".into(),
+        ));
+    }
+
     // Verify the rotation first
     if !verify_key_rotation(rotation)? {
         return Err(SatsPathError::InvalidSignature);
@@ -59,7 +76,7 @@ pub fn apply_key_rotation(
     // Create new profile with rotated key
     let mut new_profile = profile.profile.clone();
     new_profile.identity_pubkey = rotation.new_pubkey.clone();
-    new_profile.sequence = Some(profile.profile.sequence.unwrap_or(0) + 1);
+    new_profile.sequence = Some(expected_sequence);
     new_profile.rotation = Some(rotation.clone());
     new_profile.updated_at = chrono::Utc::now().timestamp();
     new_profile.nonce = Some(crypto::generate_nonce());
@@ -71,9 +88,29 @@ pub fn apply_key_rotation(
     Ok(signed)
 }
 
-/// Check if a profile's key rotation is valid
+/// Check if a profile's key rotation is valid and strictly bound to the profile
 pub fn is_rotation_valid(profile: &SignedPaymentProfile) -> bool {
     if let Some(rotation) = &profile.profile.rotation {
+        if rotation.identifier_hash
+            != satspath_core::privacy::identifier_hash(&profile.profile.alias)
+        {
+            return false;
+        }
+        if rotation.previous_pubkey != profile.profile.identity_pubkey
+            && rotation.new_pubkey != profile.profile.identity_pubkey
+        {
+            return false;
+        }
+        if let Some(seq) = profile.profile.sequence {
+            if rotation.new_pubkey == profile.profile.identity_pubkey && rotation.sequence != seq {
+                return false;
+            }
+            if rotation.previous_pubkey == profile.profile.identity_pubkey
+                && rotation.sequence != seq.saturating_add(1)
+            {
+                return false;
+            }
+        }
         rotation.verify().unwrap_or(false)
     } else {
         false
@@ -83,8 +120,8 @@ pub fn is_rotation_valid(profile: &SignedPaymentProfile) -> bool {
 /// Get the current effective identity key for a profile
 /// Returns the rotated key if a valid rotation exists, otherwise the original
 pub fn get_effective_identity_pubkey(profile: &SignedPaymentProfile) -> String {
-    if let Some(rotation) = &profile.profile.rotation {
-        if rotation.verify().unwrap_or(false) {
+    if is_rotation_valid(profile) {
+        if let Some(rotation) = &profile.profile.rotation {
             return rotation.new_pubkey.clone();
         }
     }
@@ -175,5 +212,36 @@ mod tests {
         let rotated_profile = apply_key_rotation(&profile, &rotation, &new_kp.secret_key).unwrap();
         let effective = get_effective_identity_pubkey(&rotated_profile);
         assert_eq!(effective, rotation.new_pubkey);
+    }
+
+    #[test]
+    fn test_foreign_rotation_rejected_for_profile() {
+        let (profile, _) = make_profile(vec![]);
+        let (unrelated_profile, unrelated_sk) = make_profile(vec![]);
+        let attacker_kp = generate_identity_keypair();
+
+        // Valid rotation created for unrelated_profile
+        let foreign_rotation = rotate_identity_key(
+            &unrelated_profile,
+            &unrelated_sk,
+            &attacker_kp.secret_key,
+            "22bb",
+        )
+        .unwrap();
+
+        // Injected into victim profile
+        let mut hijacked_profile = profile.clone();
+        hijacked_profile.profile.rotation = Some(foreign_rotation.clone());
+
+        assert!(!is_rotation_valid(&hijacked_profile));
+        // Effective identity pubkey must NOT switch to attacker pubkey
+        assert_eq!(
+            get_effective_identity_pubkey(&hijacked_profile),
+            profile.profile.identity_pubkey
+        );
+
+        // Applying foreign rotation to victim profile must fail
+        let result = apply_key_rotation(&profile, &foreign_rotation, &attacker_kp.secret_key);
+        assert!(result.is_err());
     }
 }

@@ -149,6 +149,25 @@ pub fn apply_key_rotation(
         ));
     }
 
+    if rotation.previous_pubkey != profile.profile.identity_pubkey {
+        return Err(crate::errors::SatsPathError::InvalidRotation(
+            "rotation previous_pubkey does not match profile identity_pubkey".into(),
+        ));
+    }
+
+    if rotation.identifier_hash != crate::privacy::identifier_hash(&profile.profile.alias) {
+        return Err(crate::errors::SatsPathError::InvalidRotation(
+            "rotation identifier_hash does not match profile alias".into(),
+        ));
+    }
+
+    let expected_sequence = profile.profile.sequence.unwrap_or(0).saturating_add(1);
+    if rotation.sequence != expected_sequence {
+        return Err(crate::errors::SatsPathError::InvalidRotation(
+            "rotation sequence must equal the next profile sequence".into(),
+        ));
+    }
+
     if !rotation.verify()? {
         return Err(crate::errors::SatsPathError::InvalidSignature);
     }
@@ -156,6 +175,7 @@ pub fn apply_key_rotation(
     // Create new profile with updated identity pubkey
     let mut new_profile = profile.profile.clone();
     new_profile.identity_pubkey = new_pubkey_hex.to_string();
+    new_profile.sequence = Some(rotation.sequence);
     // Clear rotation since it's been applied
     new_profile.rotation = None;
 
@@ -169,20 +189,38 @@ pub fn apply_key_rotation(
 }
 
 /// Get the effective identity pubkey, considering key rotation.
-/// If a valid key rotation is present, returns the new pubkey.
+/// If a valid key rotation bound to this profile is present, returns the new pubkey.
 /// Otherwise returns the profile's identity_pubkey.
 pub fn get_effective_identity_pubkey(profile: &SignedPaymentProfile) -> Result<String> {
-    if let Some(rotation) = &profile.profile.rotation {
-        if rotation.verify()? {
+    if is_rotation_valid(profile)? {
+        if let Some(rotation) = &profile.profile.rotation {
             return Ok(rotation.new_pubkey.clone());
         }
     }
     Ok(profile.profile.identity_pubkey.clone())
 }
 
-/// Check if a key rotation is valid.
+/// Check if a key rotation is valid and strictly bound to the profile.
 pub fn is_rotation_valid(profile: &SignedPaymentProfile) -> Result<bool> {
     if let Some(rotation) = &profile.profile.rotation {
+        if rotation.identifier_hash != crate::privacy::identifier_hash(&profile.profile.alias) {
+            return Ok(false);
+        }
+        if rotation.previous_pubkey != profile.profile.identity_pubkey
+            && rotation.new_pubkey != profile.profile.identity_pubkey
+        {
+            return Ok(false);
+        }
+        if let Some(seq) = profile.profile.sequence {
+            if rotation.new_pubkey == profile.profile.identity_pubkey && rotation.sequence != seq {
+                return Ok(false);
+            }
+            if rotation.previous_pubkey == profile.profile.identity_pubkey
+                && rotation.sequence != seq.saturating_add(1)
+            {
+                return Ok(false);
+            }
+        }
         rotation.verify()
     } else {
         Ok(false)

@@ -137,6 +137,14 @@ impl HttpResolver {
         // SEC-01: enforce expiry — fail closed.
         check_profile_expiry(&signed.profile)?;
 
+        // Enforce revocation — fail closed. Revoked profiles must never be returned to callers.
+        if signed.profile.revoked {
+            return Err(SatsPathError::RegistryError(format!(
+                "Alias {} has been revoked",
+                signed.profile.alias
+            )));
+        }
+
         Ok(signed)
     }
 }

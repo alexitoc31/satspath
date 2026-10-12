@@ -173,6 +173,12 @@ impl ProfileResolver for ChainResolver {
                             requested_canonical, returned_canonical
                         )));
                     }
+                    if profile.profile.revoked {
+                        return Err(SatsPathError::RegistryError(format!(
+                            "Alias {} has been revoked",
+                            profile.profile.alias
+                        )));
+                    }
                     return Ok(profile);
                 }
                 Err(SatsPathError::AliasNotFound(_)) => continue,

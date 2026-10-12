@@ -127,6 +127,9 @@ pub fn verify_signed_profile(signed: &SignedPaymentProfile) -> Result<bool> {
         if let (Some(hybrid_pubkey), Some(hybrid_sig)) =
             (&signed.profile.hybrid_pubkey, &signed.hybrid_signature)
         {
+            if hybrid_pubkey.classical_pubkey != signed.profile.identity_pubkey {
+                return Ok(false);
+            }
             let pqc_ok = satspath_pqc::hybrid_sig::hybrid_verify(&bytes, hybrid_sig, hybrid_pubkey);
             if !pqc_ok {
                 return Ok(false);
@@ -139,6 +142,9 @@ pub fn verify_signed_profile(signed: &SignedPaymentProfile) -> Result<bool> {
         (&signed.profile.hybrid_pubkey, &signed.hybrid_signature)
     {
         // Optional verification if present
+        if hybrid_pubkey.classical_pubkey != signed.profile.identity_pubkey {
+            return Ok(false);
+        }
         let pqc_ok = satspath_pqc::hybrid_sig::hybrid_verify(&bytes, hybrid_sig, hybrid_pubkey);
         if !pqc_ok {
             return Ok(false);

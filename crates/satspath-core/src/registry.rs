@@ -86,6 +86,11 @@ impl Registry {
         signed: SignedPaymentProfile,
     ) -> Result<()> {
         Self::validate_profile_write(requested_alias, &signed)?;
+        if signed.profile.revoked {
+            return Err(SatsPathError::RegistryError(
+                "cannot register an already-revoked profile".into(),
+            ));
+        }
         if signed.profile.recovery.is_some() {
             return Err(SatsPathError::Transparency(
                 crate::transparency::TransparencyError::InvalidRecovery(
@@ -130,6 +135,12 @@ impl Registry {
             .get(&key)
             .or_else(|| self.data.profiles.get(&alias))
         {
+            if existing.profile.revoked {
+                return Err(SatsPathError::RegistryError(format!(
+                    "Update rejected: alias '{}' has been revoked",
+                    alias
+                )));
+            }
             if signed.profile.identity_pubkey != existing.profile.identity_pubkey {
                 if let Some(recovery) = &signed.profile.recovery {
                     if signed.profile.rotation.is_some() {
