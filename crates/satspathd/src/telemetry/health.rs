@@ -60,11 +60,16 @@ pub fn check_sqlite_health(home: &Path) -> DependencyHealth {
     match TransactionalTransparencyStore::open_read_only(home) {
         Ok(store) => {
             let log_id = store.log_id().to_string();
-            let is_writable = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&db_path)
-                .is_ok();
+            let write_probe = (|| -> rusqlite::Result<()> {
+                let mut conn = rusqlite::Connection::open(&db_path)?;
+                conn.busy_timeout(std::time::Duration::from_millis(250))?;
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute("INSERT INTO schema_migrations(version) VALUES (-999)", [])?;
+                tx.rollback()?;
+                Ok(())
+            })();
+            let is_writable = write_probe.is_ok();
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             if is_writable {
                 DependencyHealth {
@@ -80,7 +85,10 @@ pub fn check_sqlite_health(home: &Path) -> DependencyHealth {
                 DependencyHealth {
                     status: "unhealthy".to_string(),
                     latency_ms,
-                    error: Some("transparency database file is not writable".to_string()),
+                    error: Some(match write_probe {
+                        Err(e) => format!("database write check failed: {e}"),
+                        Ok(_) => "transparency database file is not writable".to_string(),
+                    }),
                     details: serde_json::json!({
                         "writable": false,
                         "log_id": log_id,
@@ -106,36 +114,29 @@ pub fn check_sqlite_health(home: &Path) -> DependencyHealth {
 pub async fn check_fee_api_health() -> DependencyHealth {
     let start = Instant::now();
 
-    // 1. Check if a recent fee estimate is already cached
+    // 1. Check if a recent fee estimate is already cached and still fresh
     if let Some(cached) = satspath_router::fees::get_cached_fee() {
         let now_secs = satspath_router::fees::current_time_secs();
         let age_secs = now_secs.saturating_sub(cached.timestamp_secs);
         let max_staleness_secs =
             satspath_router::fees::FeeEstimatorConfig::from_env().max_staleness_secs;
-        let is_stale = age_secs >= max_staleness_secs;
-        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-        return DependencyHealth {
-            status: if is_stale {
-                "degraded".to_string()
-            } else {
-                "healthy".to_string()
-            },
-            latency_ms,
-            error: if is_stale {
-                Some("cached fee estimate is stale".to_string())
-            } else {
-                None
-            },
-            details: serde_json::json!({
-                "reachable": true,
-                "cached": true,
-                "age_secs": age_secs,
-                "fastest_sat_vb": cached.estimate.fastest_fee,
-                "half_hour_sat_vb": cached.estimate.half_hour_fee,
-                "hour_sat_vb": cached.estimate.hour_fee,
-                "sources_used": cached.sources_used,
-            }),
-        };
+        if age_secs < max_staleness_secs {
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            return DependencyHealth {
+                status: "healthy".to_string(),
+                latency_ms,
+                error: None,
+                details: serde_json::json!({
+                    "reachable": true,
+                    "cached": true,
+                    "age_secs": age_secs,
+                    "fastest_sat_vb": cached.estimate.fastest_fee,
+                    "half_hour_sat_vb": cached.estimate.half_hour_fee,
+                    "hour_sat_vb": cached.estimate.hour_fee,
+                    "sources_used": cached.sources_used,
+                }),
+            };
+        }
     }
 
     // 2. Perform an on-demand probe with a short timeout to prevent slow health endpoints

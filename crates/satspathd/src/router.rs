@@ -299,39 +299,37 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             json_result(StatusCode(200), namespace_descriptor(state))
         }
         (Method::Get, v2_api::routes::RESOLVE) => {
-            let identifier = match crate::handlers::transparency::query_str(&raw_url, "identifier")
-            {
-                Some(id) if !id.trim().is_empty() => id,
-                _ => {
-                    return Ok(request.respond(json_error(
-                        StatusCode(400),
-                        anyhow::anyhow!("missing or empty 'identifier' query parameter"),
-                    ))?)
+            match crate::handlers::transparency::query_str(&raw_url, "identifier") {
+                Some(identifier) if !identifier.trim().is_empty() => {
+                    let res_start = std::time::Instant::now();
+                    match resolve_v2_envelope(state, &identifier) {
+                        Ok(envelope) => {
+                            crate::telemetry::record_profile_resolution(
+                                "success",
+                                false,
+                                res_start.elapsed().as_secs_f64(),
+                            );
+                            json_response(StatusCode(200), &envelope)
+                        }
+                        Err(e) => {
+                            crate::telemetry::record_profile_resolution(
+                                "error",
+                                false,
+                                res_start.elapsed().as_secs_f64(),
+                            );
+                            let status = if e.to_string().contains("not found") {
+                                StatusCode(404)
+                            } else {
+                                StatusCode(400)
+                            };
+                            json_error(status, e)
+                        }
+                    }
                 }
-            };
-            let res_start = std::time::Instant::now();
-            match resolve_v2_envelope(state, &identifier) {
-                Ok(envelope) => {
-                    crate::telemetry::record_profile_resolution(
-                        "success",
-                        false,
-                        res_start.elapsed().as_secs_f64(),
-                    );
-                    json_response(StatusCode(200), &envelope)
-                }
-                Err(e) => {
-                    crate::telemetry::record_profile_resolution(
-                        "error",
-                        false,
-                        res_start.elapsed().as_secs_f64(),
-                    );
-                    let status = if e.to_string().contains("not found") {
-                        StatusCode(404)
-                    } else {
-                        StatusCode(400)
-                    };
-                    json_error(status, e)
-                }
+                _ => json_error(
+                    StatusCode(400),
+                    anyhow::anyhow!("missing or empty 'identifier' query parameter"),
+                ),
             }
         }
         (Method::Post, v2_api::routes::RESOLVE) => {
