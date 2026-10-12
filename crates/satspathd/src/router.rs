@@ -255,16 +255,13 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             Err(e) => handle_read_error(e),
         },
         (Method::Post, "/v1/broadcast") => json_result(StatusCode(200), broadcast(state)),
-        (Method::Get, "/metrics") => {
-            crate::telemetry::health::check_transparency_health(&state.home);
-            match crate::telemetry::gather_metrics() {
-                Ok(metrics_text) => crate::http::text_response(
-                    StatusCode(200),
-                    metrics_text,
-                    prometheus::TEXT_FORMAT,
-                ),
-                Err(e) => json_error(StatusCode(500), e),
-            }
+        (Method::Get, "/metrics") => match crate::telemetry::gather_metrics() {
+            Ok(metrics_text) => crate::http::text_response(
+                StatusCode(200),
+                metrics_text,
+                prometheus::TEXT_FORMAT,
+            ),
+            Err(e) => json_error(StatusCode(500), e),
         },
         (Method::Get, "/health") => json_response(
             StatusCode(200),

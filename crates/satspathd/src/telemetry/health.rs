@@ -146,25 +146,45 @@ pub async fn check_fee_api_health() -> DependencyHealth {
     match probe {
         Ok(Ok(report)) => {
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let is_fallback = !report.is_from_cache && report.sources_succeeded == 0;
+            let status = if is_fallback { "error" } else { "success" };
             crate::telemetry::metrics::record_fee_api_request(
                 "combined",
-                "success",
+                status,
                 latency_ms / 1000.0,
             );
-            DependencyHealth {
-                status: "healthy".to_string(),
-                latency_ms,
-                error: None,
-                details: serde_json::json!({
-                    "reachable": true,
-                    "fastest_sat_vb": report.estimate.fastest_fee,
-                    "half_hour_sat_vb": report.estimate.half_hour_fee,
-                    "hour_sat_vb": report.estimate.hour_fee,
-                    "sources_queried": report.sources_queried,
-                    "sources_succeeded": report.sources_succeeded,
-                    "source_names": report.source_names,
-                    "is_from_cache": report.is_from_cache,
-                }),
+            if is_fallback {
+                DependencyHealth {
+                    status: "degraded".to_string(),
+                    latency_ms,
+                    error: Some("all fee API sources failed, using fallback fees".to_string()),
+                    details: serde_json::json!({
+                        "reachable": false,
+                        "fastest_sat_vb": report.estimate.fastest_fee,
+                        "half_hour_sat_vb": report.estimate.half_hour_fee,
+                        "hour_sat_vb": report.estimate.hour_fee,
+                        "sources_queried": report.sources_queried,
+                        "sources_succeeded": report.sources_succeeded,
+                        "source_names": report.source_names,
+                        "is_from_cache": report.is_from_cache,
+                    }),
+                }
+            } else {
+                DependencyHealth {
+                    status: "healthy".to_string(),
+                    latency_ms,
+                    error: None,
+                    details: serde_json::json!({
+                        "reachable": true,
+                        "fastest_sat_vb": report.estimate.fastest_fee,
+                        "half_hour_sat_vb": report.estimate.half_hour_fee,
+                        "hour_sat_vb": report.estimate.hour_fee,
+                        "sources_queried": report.sources_queried,
+                        "sources_succeeded": report.sources_succeeded,
+                        "source_names": report.source_names,
+                        "is_from_cache": report.is_from_cache,
+                    }),
+                }
             }
         }
         Ok(Err(e)) => {
