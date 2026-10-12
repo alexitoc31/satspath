@@ -35,6 +35,9 @@ pub enum SatsPathError {
     #[error("BIP-353 resolution error: {0}")]
     Bip353(String),
 
+    #[error("BIP-353 DNS payment instructions do not provide an authenticated signed profile")]
+    Bip353Unauthenticated,
+
     #[error("DNSSEC validation unavailable — failing closed (Strict mode)")]
     DnssecUnavailable,
 

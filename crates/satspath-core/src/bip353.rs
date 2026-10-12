@@ -177,33 +177,7 @@ where
     let name = parse_bip353_name(input)?;
     let records = resolver.query_txt(&name.dns_name).await?;
 
-    // Keep only TXT records that reconstruct to a `bitcoin:` URI. Each record is
-    // reconstructed independently — never concatenate across records.
-    let mut matching: Vec<&DnsTxtRecord> = Vec::new();
-    for record in &records {
-        if record.reconstruct().starts_with("bitcoin:") {
-            matching.push(record);
-        }
-    }
-
-    if matching.is_empty() {
-        return Err(SatsPathError::Bip353(
-            "no bitcoin: TXT record at this name".into(),
-        ));
-    }
-    if matching.len() > 1 {
-        return Err(SatsPathError::Bip353(
-            "multiple bitcoin: TXT records present — invalid per BIP-353".into(),
-        ));
-    }
-
-    let record = matching[0];
-    let uri = record.reconstruct();
-
-    // Safety: a public payment instruction must never carry private material...
-    assert_no_private_material(&uri)?;
-    // ...and must be a valid BIP-321 URI (this also rejects unknown req-* keys).
-    parse_bip321(&uri)?;
+    let (record, uri) = validated_bitcoin_record(&records)?;
 
     let mut warnings = Vec::new();
     match policy {
@@ -229,6 +203,42 @@ where
         resolved_at: now,
         warnings,
     })
+}
+
+/// Reconstruct and validate the unique BIP-353 payment record without asserting
+/// DNSSEC validation or signed-profile authentication.
+pub(crate) fn validated_bitcoin_record(
+    records: &[DnsTxtRecord],
+) -> Result<(&DnsTxtRecord, String)> {
+    // Keep only TXT records that reconstruct to a `bitcoin:` URI. Each record is
+    // reconstructed independently — never concatenate across records.
+    let mut matching: Vec<&DnsTxtRecord> = Vec::new();
+    for record in records {
+        if record.reconstruct().starts_with("bitcoin:") {
+            matching.push(record);
+        }
+    }
+
+    if matching.is_empty() {
+        return Err(SatsPathError::Bip353(
+            "no bitcoin: TXT record at this name".into(),
+        ));
+    }
+    if matching.len() > 1 {
+        return Err(SatsPathError::Bip353(
+            "multiple bitcoin: TXT records present — invalid per BIP-353".into(),
+        ));
+    }
+
+    let record = matching[0];
+    let uri = record.reconstruct();
+
+    // Safety: a public payment instruction must never carry private material...
+    assert_no_private_material(&uri)?;
+    // ...and must be a valid BIP-321 URI (this also rejects unknown req-* keys).
+    parse_bip321(&uri)?;
+
+    Ok((record, uri))
 }
 
 /// Resolve a BIP-353 name with the default backend and **Strict** policy.
