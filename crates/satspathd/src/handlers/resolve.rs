@@ -3,7 +3,9 @@
 use anyhow::Result;
 use satspath_core::{
     bip321::parse_bip321,
-    bip353::{resolve_bip353_with, DnssecPolicy, DohTxtResolver},
+    bip353::{
+        resolve_bip353_with, DnsTxtResolver, DnssecPolicy, DohTxtResolver, HickoryDnssecTxtResolver,
+    },
     crypto::verify_signed_profile,
     resolver::ChainResolver,
     resolvers::{bip353::Bip353Resolver, http::HttpResolver, nostr::NostrResolver},
@@ -210,8 +212,12 @@ pub(crate) async fn dns_resolve_response(body: DnsResolveRequest) -> DnsResolveR
     } else {
         DnssecPolicy::Strict
     };
-    let resolver = DohTxtResolver::new();
-    match resolve_bip353_with(&resolver, &body.name, policy, now()).await {
+    let resolver: Box<dyn DnsTxtResolver + Send + Sync> = if body.allow_insecure_dns_for_dev {
+        Box::new(DohTxtResolver::new())
+    } else {
+        Box::new(HickoryDnssecTxtResolver::new())
+    };
+    match resolve_bip353_with(resolver.as_ref(), &body.name, policy, now()).await {
         Ok(resolution) => match parse_bip321(&resolution.bitcoin_uri) {
             Ok(parsed) => DnsResolveResponse::Ok { resolution, parsed },
             Err(e) => DnsResolveResponse::Error {
