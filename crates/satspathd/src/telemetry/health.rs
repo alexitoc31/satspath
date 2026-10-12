@@ -125,7 +125,7 @@ pub async fn check_fee_api_health() -> DependencyHealth {
                     "fastest_sat_vb": cached.estimate.fastest_fee,
                     "half_hour_sat_vb": cached.estimate.half_hour_fee,
                     "hour_sat_vb": cached.estimate.hour_fee,
-                    "sources_used": cached.sources_used,
+                    "sources_used": fee_source_types(&cached.sources_used),
                 }),
             };
         }
@@ -137,49 +137,7 @@ pub async fn check_fee_api_health() -> DependencyHealth {
         tokio::time::timeout(std::time::Duration::from_millis(500), estimator.estimate()).await;
 
     match probe {
-        Ok(Ok(report)) => {
-            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let is_fallback = !report.is_from_cache && report.sources_succeeded == 0;
-            let status = if is_fallback { "error" } else { "success" };
-            crate::telemetry::metrics::record_fee_api_request(
-                "combined",
-                status,
-                latency_ms / 1000.0,
-            );
-            if is_fallback {
-                DependencyHealth {
-                    status: "degraded".to_string(),
-                    latency_ms,
-                    error: Some("all fee API sources failed, using fallback fees".to_string()),
-                    details: serde_json::json!({
-                        "reachable": false,
-                        "fastest_sat_vb": report.estimate.fastest_fee,
-                        "half_hour_sat_vb": report.estimate.half_hour_fee,
-                        "hour_sat_vb": report.estimate.hour_fee,
-                        "sources_queried": report.sources_queried,
-                        "sources_succeeded": report.sources_succeeded,
-                        "source_names": report.source_names,
-                        "is_from_cache": report.is_from_cache,
-                    }),
-                }
-            } else {
-                DependencyHealth {
-                    status: "healthy".to_string(),
-                    latency_ms,
-                    error: None,
-                    details: serde_json::json!({
-                        "reachable": true,
-                        "fastest_sat_vb": report.estimate.fastest_fee,
-                        "half_hour_sat_vb": report.estimate.half_hour_fee,
-                        "hour_sat_vb": report.estimate.hour_fee,
-                        "sources_queried": report.sources_queried,
-                        "sources_succeeded": report.sources_succeeded,
-                        "source_names": report.source_names,
-                        "is_from_cache": report.is_from_cache,
-                    }),
-                }
-            }
-        }
+        Ok(Ok(report)) => fee_report_health(report, start.elapsed().as_secs_f64() * 1000.0),
         Ok(Err(e)) => {
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             crate::telemetry::metrics::record_fee_api_request(
@@ -214,6 +172,52 @@ pub async fn check_fee_api_health() -> DependencyHealth {
                 }),
             }
         }
+    }
+}
+
+// Only expose known source types; URLs and unrecognized names may contain credentials.
+fn fee_source_types(names: &[String]) -> Vec<&'static str> {
+    names
+        .iter()
+        .map(|name| match name.split('(').next().unwrap_or_default() {
+            "BitcoinCore" => "BitcoinCore",
+            "MempoolSpace" => "MempoolSpace",
+            "Esplora" => "Esplora",
+            "Static" => "Static",
+            "FallbackFees" => "FallbackFees",
+            _ => "Unknown",
+        })
+        .collect()
+}
+
+fn fee_report_health(
+    report: satspath_router::fees::ConsensusFeeReport,
+    latency_ms: f64,
+) -> DependencyHealth {
+    // A successful consensus can happen to match the fallback rates.
+    let is_fallback = !report.is_from_cache
+        && report.estimate == satspath_router::fees::FALLBACK_FEES
+        && report
+            .source_names
+            .iter()
+            .any(|name| name == "FallbackFees");
+    let status = if is_fallback { "error" } else { "success" };
+    crate::telemetry::metrics::record_fee_api_request("combined", status, latency_ms / 1000.0);
+    DependencyHealth {
+        status: if is_fallback { "degraded" } else { "healthy" }.to_string(),
+        latency_ms,
+        error: is_fallback
+            .then(|| "insufficient fee API sources for consensus, using fallback fees".to_string()),
+        details: serde_json::json!({
+            "reachable": !is_fallback,
+            "fastest_sat_vb": report.estimate.fastest_fee,
+            "half_hour_sat_vb": report.estimate.half_hour_fee,
+            "hour_sat_vb": report.estimate.hour_fee,
+            "sources_queried": report.sources_queried,
+            "sources_succeeded": report.sources_succeeded,
+            "source_names": fee_source_types(&report.source_names),
+            "is_from_cache": report.is_from_cache,
+        }),
     }
 }
 
@@ -334,6 +338,132 @@ pub fn spawn_metrics_refresher(home: std::path::PathBuf) -> tokio::task::JoinHan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fee_health_is_degraded_when_consensus_minimum_is_not_met() {
+        use satspath_router::fees::{
+            FeeEstimatorConfig, FeeSource, MultiSourceFeeEstimator, FALLBACK_FEES,
+        };
+
+        let mut live_estimate = FALLBACK_FEES;
+        live_estimate.fastest_fee = 30;
+        for sources in [vec![], vec![FeeSource::Static(live_estimate)]] {
+            let sources_succeeded = sources.len();
+            let estimator = MultiSourceFeeEstimator::new(
+                FeeEstimatorConfig {
+                    sources,
+                    min_sources_for_consensus: 2,
+                    max_staleness_secs: 1800,
+                    request_timeout_ms: 100,
+                    cache: None,
+                }
+                .with_isolated_cache(),
+            );
+            let report = estimator.estimate().await.unwrap();
+            assert_eq!(report.sources_succeeded, sources_succeeded);
+            assert_eq!(report.estimate, FALLBACK_FEES);
+            assert!(!report.is_from_cache);
+
+            let health = fee_report_health(report, 1.0);
+            assert_eq!(health.status, "degraded");
+            assert_eq!(health.details["reachable"], false);
+            assert_eq!(health.details["sources_succeeded"], sources_succeeded);
+            assert!(health.error.unwrap().contains("insufficient"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fee_health_is_healthy_when_consensus_matches_fallback_rates() {
+        use satspath_router::fees::{
+            FeeEstimatorConfig, FeeSource, MultiSourceFeeEstimator, FALLBACK_FEES,
+        };
+
+        let estimator = MultiSourceFeeEstimator::new(
+            FeeEstimatorConfig {
+                sources: vec![FeeSource::Static(FALLBACK_FEES)],
+                min_sources_for_consensus: 1,
+                max_staleness_secs: 1800,
+                request_timeout_ms: 100,
+                cache: None,
+            }
+            .with_isolated_cache(),
+        );
+        let report = estimator.estimate().await.unwrap();
+        assert!(!report.is_from_cache);
+        let health = fee_report_health(report, 1.0);
+        assert_eq!(health.status, "healthy");
+        assert_eq!(health.details["reachable"], true);
+        assert!(health.error.is_none());
+    }
+
+    #[test]
+    fn fee_health_preserves_cached_fallback_status() {
+        let health = fee_report_health(
+            satspath_router::fees::ConsensusFeeReport {
+                estimate: satspath_router::fees::FALLBACK_FEES,
+                timestamp_secs: 0,
+                sources_queried: 2,
+                sources_succeeded: 0,
+                source_names: vec!["Static".into()],
+                is_from_cache: true,
+                is_decayed: true,
+            },
+            1.0,
+        );
+        assert_eq!(health.status, "healthy");
+        assert_eq!(health.details["reachable"], true);
+        assert_eq!(health.details["is_from_cache"], true);
+        assert!(health.error.is_none());
+    }
+
+    #[test]
+    fn fee_health_exposes_only_source_types() {
+        let source_names: Vec<String> = [
+            "BitcoinCore(https://user:password@rpc.example/wallet/secret?token=secret#secret)",
+            "MempoolSpace(https://user:password@fees.example/secret?token=secret)",
+            "Esplora(http://user:password@[::1]:3000/secret?token=secret)",
+            "MempoolSpace(invalid URL with secret)",
+            "Static",
+            "FallbackFees",
+            "https://user:password@unknown.example/secret?token=secret",
+            "secret",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let expected = serde_json::json!([
+            "BitcoinCore",
+            "MempoolSpace",
+            "Esplora",
+            "MempoolSpace",
+            "Static",
+            "FallbackFees",
+            "Unknown",
+            "Unknown",
+        ]);
+        assert_eq!(serde_json::json!(fee_source_types(&source_names)), expected);
+        for is_from_cache in [false, true] {
+            let report = satspath_router::fees::ConsensusFeeReport {
+                estimate: satspath_router::fees::FALLBACK_FEES,
+                timestamp_secs: 0,
+                sources_queried: 2,
+                sources_succeeded: 1,
+                source_names: source_names.clone(),
+                is_from_cache,
+                is_decayed: false,
+            };
+            let health = fee_report_health(report, 1.0);
+            assert_eq!(
+                health.status,
+                if is_from_cache { "healthy" } else { "degraded" }
+            );
+            assert_eq!(health.details["source_names"], expected);
+            let serialized = serde_json::to_string(&health).unwrap();
+            for sensitive in ["user", "password", "secret", "token", "https://", "http://"] {
+                assert!(!serialized.contains(sensitive), "leaked {sensitive}");
+            }
+        }
+    }
 
     #[test]
     fn transparency_health_does_not_initialize_missing_state() {
