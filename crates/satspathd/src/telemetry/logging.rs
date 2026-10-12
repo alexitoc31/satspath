@@ -32,7 +32,7 @@ pub fn init_telemetry(format_override: Option<&str>) -> Result<()> {
             .with(fmt_layer)
             .try_init()
             .ok();
-    } else {
+    } else if log_format.eq_ignore_ascii_case("text") {
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(false)
             .with_thread_ids(false);
@@ -42,6 +42,10 @@ pub fn init_telemetry(format_override: Option<&str>) -> Result<()> {
             .with(fmt_layer)
             .try_init()
             .ok();
+    } else {
+        anyhow::bail!(
+            "unsupported log format '{log_format}': supported formats are 'text' and 'json'"
+        );
     }
 
     Ok(())
@@ -91,5 +95,15 @@ mod tests {
         let id = get_or_generate_request_id(&[header]);
         assert_ne!(id, "invalid/injection\nheader");
         assert_eq!(id.len(), 36);
+    }
+
+    #[test]
+    fn test_init_telemetry_rejects_unsupported_format() {
+        let res = init_telemetry(Some("jsno"));
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported log format"));
     }
 }
