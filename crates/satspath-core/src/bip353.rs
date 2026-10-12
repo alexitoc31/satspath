@@ -7,11 +7,11 @@
 //!
 //! # DNSSEC is mandatory
 //!
-//! Per BIP-353 all payment instructions must be DNSSEC-signed. The default
-//! [`resolve_bip353`] runs in [`DnssecPolicy::Strict`] and validates DNSSEC
-//! locally against bundled root trust anchors, failing closed if validation
-//! fails. The unvalidating [`DohTxtResolver`] is only usable under
-//! [`DnssecPolicy::DevInsecure`] for local testing and emits loud warnings.
+//! Per BIP-353 all payment instructions must be DNSSEC-signed. This crate does
+//! not ship a local DNSSEC validator, so the default [`resolve_bip353`] runs in
+//! [`DnssecPolicy::Strict`] and **fails closed** ([`SatsPathError::DnssecUnavailable`])
+//! rather than trusting an upstream resolver's AD bit. [`DnssecPolicy::DevInsecure`]
+//! exists for local testing only, is never the default, and emits loud warnings.
 
 use std::collections::HashMap;
 
@@ -177,33 +177,7 @@ where
     let name = parse_bip353_name(input)?;
     let records = resolver.query_txt(&name.dns_name).await?;
 
-    // Keep only TXT records that reconstruct to a `bitcoin:` URI. Each record is
-    // reconstructed independently — never concatenate across records.
-    let mut matching: Vec<&DnsTxtRecord> = Vec::new();
-    for record in &records {
-        if record.reconstruct().starts_with("bitcoin:") {
-            matching.push(record);
-        }
-    }
-
-    if matching.is_empty() {
-        return Err(SatsPathError::Bip353(
-            "no bitcoin: TXT record at this name".into(),
-        ));
-    }
-    if matching.len() > 1 {
-        return Err(SatsPathError::Bip353(
-            "multiple bitcoin: TXT records present — invalid per BIP-353".into(),
-        ));
-    }
-
-    let record = matching[0];
-    let uri = record.reconstruct();
-
-    // Safety: a public payment instruction must never carry private material...
-    assert_no_private_material(&uri)?;
-    // ...and must be a valid BIP-321 URI (this also rejects unknown req-* keys).
-    parse_bip321(&uri)?;
+    let (record, uri) = validated_bitcoin_record(&records)?;
 
     let mut warnings = Vec::new();
     match policy {
@@ -231,27 +205,53 @@ where
     })
 }
 
-/// Resolve a BIP-353 name with local DNSSEC validation and **Strict** policy.
-///
-/// Validates DNSSEC locally against bundled root trust anchors using
-/// [`HickoryDnssecTxtResolver`]. Anything that cannot be validated
-/// fails closed.
-pub async fn resolve_bip353(name: &str) -> Result<Bip353Resolution> {
-    #[cfg(feature = "std")]
-    {
-        let resolver = crate::resolvers::bip353::HickoryDnssecTxtResolver::new();
-        let now = chrono::Utc::now().timestamp();
-        resolve_bip353_with(&resolver, name, DnssecPolicy::Strict, now).await
+/// Reconstruct and validate the unique BIP-353 payment record without asserting
+/// DNSSEC validation or signed-profile authentication.
+pub(crate) fn validated_bitcoin_record(
+    records: &[DnsTxtRecord],
+) -> Result<(&DnsTxtRecord, String)> {
+    // Keep only TXT records that reconstruct to a `bitcoin:` URI. Each record is
+    // reconstructed independently — never concatenate across records.
+    let mut matching: Vec<&DnsTxtRecord> = Vec::new();
+    for record in records {
+        if record.reconstruct().starts_with("bitcoin:") {
+            matching.push(record);
+        }
     }
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = name;
-        Err(SatsPathError::DnssecUnavailable)
+
+    if matching.is_empty() {
+        return Err(SatsPathError::Bip353(
+            "no bitcoin: TXT record at this name".into(),
+        ));
     }
+    if matching.len() > 1 {
+        return Err(SatsPathError::Bip353(
+            "multiple bitcoin: TXT records present — invalid per BIP-353".into(),
+        ));
+    }
+
+    let record = matching[0];
+    let uri = record.reconstruct();
+
+    // Safety: a public payment instruction must never carry private material...
+    assert_no_private_material(&uri)?;
+    // ...and must be a valid BIP-321 URI (this also rejects unknown req-* keys).
+    parse_bip321(&uri)?;
+
+    Ok((record, uri))
 }
 
-#[cfg(feature = "std")]
-pub use crate::resolvers::bip353::HickoryDnssecTxtResolver;
+/// Resolve a BIP-353 name with the default backend and **Strict** policy.
+///
+/// The default backend does not perform local DNSSEC validation, so in Strict
+/// mode this fails closed with [`SatsPathError::DnssecUnavailable`]. Use
+/// [`resolve_bip353_with`] + a DNSSEC-validating resolver (or `DevInsecure` for
+/// local testing) to obtain a resolution.
+pub async fn resolve_bip353(name: &str) -> Result<Bip353Resolution> {
+    let resolver = DohTxtResolver::new();
+    let now = chrono::Utc::now().timestamp();
+    resolve_bip353_with(&resolver, name, DnssecPolicy::Strict, now).await
+}
 
 // ─── Ownership verification ─────────────────────────────────────────────────────
 

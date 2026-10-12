@@ -222,7 +222,7 @@ mod tests {
         profile::{recover_profile_key, rotate_profile_key, sign_and_store},
         quote::{pay_response, quote_response},
         resolve::resolve_v2_envelope,
-        send::send_response,
+        send::{send_response, send_response_with_resolver},
         wallet::{load_or_create_identity, save_identity_key, save_wallet},
     };
     use crate::rate_limit;
@@ -1392,6 +1392,101 @@ mod tests {
         assert_eq!(body["ok"], true);
 
         server.unblock();
+    }
+
+    struct SendErrorResolver(fn() -> satspath_core::SatsPathError);
+
+    #[async_trait::async_trait]
+    impl satspath_core::ProfileResolver for SendErrorResolver {
+        async fn resolve_alias(
+            &self,
+            _alias: &str,
+        ) -> satspath_core::Result<satspath_core::SignedPaymentProfile> {
+            Err((self.0)())
+        }
+    }
+
+    #[tokio::test]
+    async fn send_unauthenticated_bip353_does_not_create_or_persist_invites() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let resolver = SendErrorResolver(|| satspath_core::SatsPathError::Bip353Unauthenticated);
+        let path = dir.path().join(satspath_core::invite_store::INVITES_FILE);
+
+        // Exercise both an absent store and a store containing an existing invite.
+        for existing in [false, true] {
+            let before = if existing {
+                let mut store = satspath_core::InviteStore::open(dir.path()).unwrap();
+                store
+                    .insert(satspath_core::create_invite_record(
+                        "carol@example.com",
+                        10_000,
+                        None,
+                        "local-sender".into(),
+                        86400,
+                    ))
+                    .unwrap();
+                Some(std::fs::read(&path).unwrap())
+            } else {
+                None
+            };
+            let response = send_response_with_resolver(
+                &state,
+                SendRequest {
+                    recipient: "₿alice@example.com".into(),
+                    amount_sats: 25_000,
+                    routing_ok: Some(true),
+                },
+                &resolver,
+            )
+            .await;
+
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(json["status"], "no_route");
+            assert_eq!(
+                json["reason"],
+                satspath_core::SatsPathError::Bip353Unauthenticated.to_string()
+            );
+            assert!(json.get("claim_url").is_none());
+            if let Some(before) = before {
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn send_other_resolver_errors_still_create_and_persist_invites() {
+        use satspath_core::SatsPathError;
+        let errors: [fn() -> SatsPathError; 3] = [
+            || SatsPathError::AliasNotFound("₿alice@example.com".into()),
+            || SatsPathError::NetworkError("DNS lookup failed".into()),
+            || SatsPathError::Bip353("no bitcoin: TXT record".into()),
+        ];
+        for error in errors {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state(dir.path());
+            let response = send_response_with_resolver(
+                &state,
+                SendRequest {
+                    recipient: "₿alice@example.com".into(),
+                    amount_sats: 25_000,
+                    routing_ok: Some(true),
+                },
+                &SendErrorResolver(error),
+            )
+            .await;
+
+            let SendResponse::Invite { claim_url, .. } = response else {
+                panic!("expected an invite, got {response:?}");
+            };
+            let mut store = satspath_core::InviteStore::open(dir.path()).unwrap();
+            let invites = store.list().unwrap();
+            assert_eq!(invites.len(), 1);
+            assert_eq!(invites[0].amount_sats, 25_000);
+            assert!(claim_url.contains(&format!("invite_id={}", invites[0].invite_id)));
+        }
     }
 
     #[tokio::test]

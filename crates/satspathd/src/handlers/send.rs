@@ -4,7 +4,7 @@ use anyhow::Result;
 use satspath_core::{
     privacy::mask_identifier,
     validation::{assert_no_private_material, validate_amount_sats},
-    PaymentMethod, ProfileResolver,
+    PaymentMethod, ProfileResolver, SatsPathError,
 };
 use satspath_router::{fees::fetch_fee_estimate, select_priority_route};
 
@@ -115,6 +115,14 @@ pub(crate) async fn send_response(state: &AppState, body: SendRequest) -> SendRe
         };
     }
     let resolver = resolver_chain(&state.home);
+    send_response_with_resolver(state, body, &resolver).await
+}
+
+pub(crate) async fn send_response_with_resolver(
+    state: &AppState,
+    body: SendRequest,
+    resolver: &(impl ProfileResolver + Sync),
+) -> SendResponse {
     match resolver.resolve_alias(&body.recipient).await {
         Ok(signed) => {
             if !matches!(
@@ -170,6 +178,9 @@ pub(crate) async fn send_response(state: &AppState, body: SendRequest) -> SendRe
                 },
             }
         }
+        Err(SatsPathError::Bip353Unauthenticated) => SendResponse::NoRoute {
+            reason: SatsPathError::Bip353Unauthenticated.to_string(),
+        },
         Err(_) => {
             let secret_opt = load_wallet(&state.home).ok().and_then(|w| {
                 w.identity_pubkey.and_then(|pk| {
