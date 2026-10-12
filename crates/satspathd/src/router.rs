@@ -36,29 +36,142 @@ use crate::types::{
 use crate::ui::{html_response, INDEX_HTML};
 use crate::v2_api;
 
+pub(crate) fn route_template(path: &str) -> &'static str {
+    match path {
+        "/" => "/",
+        "/claim" => "/claim",
+        "/metrics" => "/metrics",
+        "/health" => "/health",
+        "/v1/health" => "/v1/health",
+        "/v2/health" => "/v2/health",
+        "/v1/dashboard/auth" => "/v1/dashboard/auth",
+        "/dashboard-auth.mjs" => "/dashboard-auth.mjs",
+        "/v1/diagnostics/rate_limit" => "/v1/diagnostics/rate_limit",
+        "/v1/receive" => "/v1/receive",
+        "/v1/send" => "/v1/send",
+        "/v1/broadcast" => "/v1/broadcast",
+        "/.well-known/satspath-authority" | "/v2/namespace" => "/v2/namespace",
+        "/v2/resolve" => "/v2/resolve",
+        "/v1/node" => "/v1/node",
+        "/v1/control" => "/v1/control",
+        "/v1/p2p/resolve" => "/v1/p2p/resolve",
+        "/v1/status" => "/v1/status",
+        "/v1/profile" => "/v1/profile",
+        "/v1/profile/challenge" => "/v1/profile/challenge",
+        "/v1/profile/verify" => "/v1/profile/verify",
+        "/v1/profile/rotate-key" => "/v1/profile/rotate-key",
+        "/v1/profile/recover" => "/v1/profile/recover",
+        "/v1/profile/methods" => "/v1/profile/methods",
+        "/v1/resolve" => "/v1/resolve",
+        "/v1/preview" => "/v1/preview",
+        "/v1/quote" => "/v1/quote",
+        "/v1/pay" => "/v1/pay",
+        "/v1/dns/resolve" => "/v1/dns/resolve",
+        "/v1/claim" => "/v1/claim",
+        "/v1/invites" => "/v1/invites",
+        "/v1/invites/notifications" => "/v1/invites/notifications",
+        "/v1/invites/notifications/read-all" => "/v1/invites/notifications/read-all",
+        "/v1/transparency/status" => "/v1/transparency/status",
+        "/v1/transparency/checkpoints" => "/v1/transparency/checkpoints",
+        "/v1/transparency/anchors" => "/v1/transparency/anchors",
+        "/v1/transparency/consistency" => "/v1/transparency/consistency",
+        "/v1/transparency/events" => "/v1/transparency/events",
+        "/v1/transparency/catena/chain" => "/v1/transparency/catena/chain",
+        "/v1/transparency/catena/anchor" => "/v1/transparency/catena/anchor",
+        "/v1/transparency/verify/inclusion" => "/v1/transparency/verify/inclusion",
+        "/v1/transparency/verify/consistency" => "/v1/transparency/verify/consistency",
+        "/v1/transparency/verify/catena" => "/v1/transparency/verify/catena",
+        p if p.starts_with("/v1/transparency/checkpoints/") => "/v1/transparency/checkpoints/:hash",
+        p if p.starts_with("/v1/transparency/events/") => "/v1/transparency/events/:hash",
+        p if p.starts_with("/v1/transparency/identifiers/") => "/v1/transparency/identifiers/:id",
+        p if p.starts_with("/v1/transparency/inclusion/") => "/v1/transparency/inclusion/:hash",
+        p if p.starts_with("/v1/transparency/anchors/") => "/v1/transparency/anchors/:txid",
+        p if p.starts_with("/v1/invites/notifications/") => "/v1/invites/notifications/:id",
+        p if p.starts_with("/v1/claim/") => "/v1/claim/:id",
+        p if p.starts_with("/v1/invites/") => "/v1/invites/:id",
+        _ => "other",
+    }
+}
+
+pub(crate) fn method_label(m: &Method) -> &'static str {
+    match m {
+        Method::Get => "GET",
+        Method::Post => "POST",
+        Method::Put => "PUT",
+        Method::Delete => "DELETE",
+        Method::Head => "HEAD",
+        Method::Options => "OPTIONS",
+        Method::Patch => "PATCH",
+        _ => "OTHER",
+    }
+}
+
 pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Result<()> {
+    let req_start = std::time::Instant::now();
+    let request_id = crate::telemetry::get_or_generate_request_id(request.headers());
     let method = request.method().clone();
+    let method_str = method_label(&method);
     let raw_url = request.url().to_string();
     let path = raw_url.split('?').next().unwrap_or("/").to_string();
+    let template = route_template(&path);
 
-    if !crate::host::is_allowed_host(request.headers(), state.bind, &state.allowed_hosts) {
-        request.respond(json_error(
-            StatusCode(400),
-            anyhow::anyhow!("untrusted HTTP Host"),
-        ))?;
-        return Ok(());
-    }
+    let request_span = tracing::info_span!(
+        "http_request",
+        request_id = %request_id,
+        method = method_str,
+        endpoint = template,
+    );
+
+    use tracing::Instrument;
+    async {
+        let is_internal_scrape = template == "/metrics"
+            && request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Host"))
+                .and_then(|h| crate::host::parse_authority(h.value.as_str()).ok())
+                .map(|h| h.to_string() == "satspathd")
+                .unwrap_or(false);
+
+        if !crate::host::is_allowed_host(request.headers(), state.bind, &state.allowed_hosts)
+            && !is_internal_scrape
+        {
+            let resp = json_error(StatusCode(400), anyhow::anyhow!("untrusted HTTP Host"))
+                .with_header(crate::http::request_id_header(&request_id));
+            let _ = request.respond(resp);
+            crate::telemetry::record_http_request(
+                method_str,
+                template,
+                400,
+                req_start.elapsed().as_secs_f64(),
+            );
+            return Ok(());
+        }
 
     // 1. Guard against oversized request bodies (HTTP 413 Payload Too Large)
     let max_body = state.rate_limiter.max_body_bytes();
     if let Some(body_len) = request.body_length() {
         if body_len > max_body {
             state.rate_limiter.record_payload_too_large();
-            eprintln!(
-                "[rate_limit] payload too large: {} bytes (limit: {}) on {} {}",
-                body_len, max_body, method, path
+            crate::telemetry::metrics::record_rate_limit_dropped("payload_too_large");
+            tracing::warn!(
+                body_len = body_len,
+                max_body = max_body,
+                "payload too large: {} bytes (limit: {}) on {} {}",
+                body_len,
+                max_body,
+                method_str,
+                template
             );
-            let _ = request.respond(rate_limit::payload_too_large_response(max_body));
+            let resp = rate_limit::payload_too_large_response(max_body)
+                .with_header(crate::http::request_id_header(&request_id));
+            let _ = request.respond(resp);
+            crate::telemetry::record_http_request(
+                method_str,
+                template,
+                413,
+                req_start.elapsed().as_secs_f64(),
+            );
             return Ok(());
         }
     }
@@ -73,11 +186,24 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     match state.rate_limiter.check(&client_ip) {
         rate_limit::RateLimitResult::Allowed { remaining: _ } => {}
         rate_limit::RateLimitResult::RateLimited { retry_after_secs } => {
-            eprintln!(
-                "[rate_limit] client IP {} exceeded rate limit on {} {}, retry after {}s",
-                client_ip, method, path, retry_after_secs
+            crate::telemetry::metrics::record_rate_limit_dropped("rate_limited");
+            tracing::warn!(
+                endpoint = template,
+                retry_after_secs = retry_after_secs,
+                "rate limit exceeded on {} {}, retry after {}s",
+                method_str,
+                template,
+                retry_after_secs
             );
-            let _ = request.respond(rate_limit::rate_limit_response(retry_after_secs));
+            let resp = rate_limit::rate_limit_response(retry_after_secs)
+                .with_header(crate::http::request_id_header(&request_id));
+            let _ = request.respond(resp);
+            crate::telemetry::record_http_request(
+                method_str,
+                template,
+                429,
+                req_start.elapsed().as_secs_f64(),
+            );
             return Ok(());
         }
     }
@@ -94,7 +220,15 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
 
     if is_mutation && !is_public_mutation {
         if let Err(e) = check_auth(&request, &state.auth_token) {
-            let _ = request.respond(json_error(StatusCode(401), e));
+            let resp = json_error(StatusCode(401), e)
+                .with_header(crate::http::request_id_header(&request_id));
+            let _ = request.respond(resp);
+            crate::telemetry::record_http_request(
+                method_str,
+                template,
+                401,
+                req_start.elapsed().as_secs_f64(),
+            );
             return Ok(());
         }
     }
@@ -120,8 +254,26 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             Err(e) => handle_read_error(e),
         },
         (Method::Post, "/v1/broadcast") => json_result(StatusCode(200), broadcast(state)),
-        (Method::Get, "/health") => {
-            json_response(StatusCode(200), &serde_json::json!({"ok": true}))
+        (Method::Get, "/metrics") => match crate::telemetry::gather_metrics() {
+            Ok(metrics_text) => crate::http::text_response(
+                StatusCode(200),
+                metrics_text,
+                prometheus::TEXT_FORMAT,
+            ),
+            Err(e) => json_error(StatusCode(500), e),
+        },
+        (Method::Get, "/health") => json_response(
+            StatusCode(200),
+            &serde_json::json!({ "ok": true, "status": "healthy" }),
+        ),
+        (Method::Get, "/v1/health") => {
+            let health = crate::telemetry::perform_deep_health_check(&state.home).await;
+            let status = if health.status == "healthy" || health.status == "degraded" {
+                StatusCode(200)
+            } else {
+                StatusCode(503)
+            };
+            json_response(status, &health)
         }
         (Method::Get, v2_api::routes::HEALTH) => {
             let (checkpoint_age, log_ok) = match transparency_log(state) {
@@ -146,41 +298,67 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
             json_result(StatusCode(200), namespace_descriptor(state))
         }
         (Method::Get, v2_api::routes::RESOLVE) => {
-            let identifier = match crate::handlers::transparency::query_str(&raw_url, "identifier")
-            {
-                Some(id) if !id.trim().is_empty() => id,
-                _ => {
-                    return Ok(request.respond(json_error(
-                        StatusCode(400),
-                        anyhow::anyhow!("missing or empty 'identifier' query parameter"),
-                    ))?)
+            match crate::handlers::transparency::query_str(&raw_url, "identifier") {
+                Some(identifier) if !identifier.trim().is_empty() => {
+                    let res_start = std::time::Instant::now();
+                    match resolve_v2_envelope(state, &identifier) {
+                        Ok(envelope) => {
+                            crate::telemetry::record_profile_resolution(
+                                "success",
+                                false,
+                                res_start.elapsed().as_secs_f64(),
+                            );
+                            json_response(StatusCode(200), &envelope)
+                        }
+                        Err(e) => {
+                            crate::telemetry::record_profile_resolution(
+                                "error",
+                                false,
+                                res_start.elapsed().as_secs_f64(),
+                            );
+                            let status = if e.to_string().contains("not found") {
+                                StatusCode(404)
+                            } else {
+                                StatusCode(400)
+                            };
+                            json_error(status, e)
+                        }
+                    }
                 }
-            };
-            match resolve_v2_envelope(state, &identifier) {
-                Ok(envelope) => json_response(StatusCode(200), &envelope),
-                Err(e) => {
-                    let status = if e.to_string().contains("not found") {
-                        StatusCode(404)
-                    } else {
-                        StatusCode(400)
-                    };
-                    json_error(status, e)
-                }
+                _ => json_error(
+                    StatusCode(400),
+                    anyhow::anyhow!("missing or empty 'identifier' query parameter"),
+                ),
             }
         }
         (Method::Post, v2_api::routes::RESOLVE) => {
             match read_json::<satspath_core::transparency::ResolutionRequest>(&mut request) {
-                Ok(body) => match resolve_v2_envelope(state, &body.identifier) {
-                    Ok(envelope) => json_response(StatusCode(200), &envelope),
-                    Err(e) => {
-                        let status = if e.to_string().contains("not found") {
-                            StatusCode(404)
-                        } else {
-                            StatusCode(400)
-                        };
-                        json_error(status, e)
+                Ok(body) => {
+                    let res_start = std::time::Instant::now();
+                    match resolve_v2_envelope(state, &body.identifier) {
+                        Ok(envelope) => {
+                            crate::telemetry::record_profile_resolution(
+                                "success",
+                                false,
+                                res_start.elapsed().as_secs_f64(),
+                            );
+                            json_response(StatusCode(200), &envelope)
+                        }
+                        Err(e) => {
+                            crate::telemetry::record_profile_resolution(
+                                "error",
+                                false,
+                                res_start.elapsed().as_secs_f64(),
+                            );
+                            let status = if e.to_string().contains("not found") {
+                                StatusCode(404)
+                            } else {
+                                StatusCode(400)
+                            };
+                            json_error(status, e)
+                        }
                     }
-                },
+                }
                 Err(e) => handle_read_error(e),
             }
         }
@@ -541,6 +719,43 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         }
         _ => json_error(StatusCode(404), anyhow::anyhow!("endpoint not found")),
     };
+    let status_code = response.status_code().0;
+    let duration_secs = req_start.elapsed().as_secs_f64();
+    crate::telemetry::record_http_request(method_str, template, status_code, duration_secs);
+    tracing::info!(
+        endpoint = template,
+        status = status_code,
+        duration_ms = duration_secs * 1000.0,
+        "request completed"
+    );
+    let response = response.with_header(crate::http::request_id_header(&request_id));
     request.respond(response)?;
     Ok(())
+    }
+    .instrument(request_span)
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_template;
+
+    #[test]
+    fn templates_cover_dispatched_routes_without_identifier_labels() {
+        for path in [
+            "/v1/profile/rotate-key",
+            "/v1/resolve",
+            "/v1/preview",
+            "/v1/transparency/anchors",
+            "/v1/transparency/consistency",
+            "/v1/claim",
+        ] {
+            assert_eq!(route_template(path), path);
+        }
+        for id in ["invite-one", "invite-two"] {
+            assert_eq!(route_template(&format!("/v1/claim/{id}")), "/v1/claim/:id");
+        }
+        assert_eq!(route_template("/v1/profile/rotate"), "other");
+        assert_eq!(route_template("/unknown"), "other");
+    }
 }

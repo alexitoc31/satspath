@@ -14,7 +14,7 @@ fn normalized_host(host: Host<&str>) -> Host<String> {
     }
 }
 
-fn parse_authority(authority: &str) -> Result<Host<String>> {
+pub(crate) fn parse_authority(authority: &str) -> Result<Host<String>> {
     if authority.is_empty()
         || authority
             .chars()
@@ -38,7 +38,12 @@ pub(crate) fn configured_hosts(
 ) -> Result<Vec<String>> {
     let mut hosts = Vec::new();
     if let Some(domain) = domain {
-        hosts.push(parse_authority(domain)?.to_string());
+        for part in domain.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                hosts.push(parse_authority(trimmed)?.to_string());
+            }
+        }
     }
     if let Some(authority_url) = authority_url {
         let url = Url::parse(authority_url)?;

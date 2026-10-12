@@ -13,6 +13,7 @@ mod p2p;
 mod rate_limit;
 mod router;
 mod server;
+pub mod telemetry;
 mod types;
 mod ui;
 mod v2_api;
@@ -41,6 +42,7 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    telemetry::init_telemetry(cli.log_format.as_deref())?;
     let bind = cli
         .bind
         .or_else(|| std::env::var("SATSPATHD_BIND").ok())
@@ -157,10 +159,21 @@ async fn run() -> Result<()> {
         p2p: p2p::Bridge::new(cli.p2p),
         home,
         bind,
-        allowed_hosts: host::configured_hosts(
-            std::env::var("SATSPATH_AUTHORITY_DOMAIN").ok().as_deref(),
-            std::env::var("SATSPATH_AUTHORITY_URL").ok().as_deref(),
-        )?,
+        allowed_hosts: {
+            let mut list = host::configured_hosts(
+                std::env::var("SATSPATH_AUTHORITY_DOMAIN").ok().as_deref(),
+                std::env::var("SATSPATH_AUTHORITY_URL").ok().as_deref(),
+            )?;
+            if let Ok(extra) = std::env::var("SATSPATH_ALLOWED_HOSTS") {
+                for part in extra.split(',') {
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        list.push(host::parse_authority(trimmed)?.to_string());
+                    }
+                }
+            }
+            list
+        },
         network,
         open_ui: !cli.no_open,
         auth_token,
@@ -178,10 +191,12 @@ async fn run() -> Result<()> {
 
     print_startup_status(&state)?;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let metrics_refresher = crate::telemetry::health::spawn_metrics_refresher(state.home.clone());
     let bridge = cli
         .p2p
         .then(|| tokio::spawn(p2p::supervise(state.clone(), stop_rx)));
     let result = serve(state, tls_config).await;
+    metrics_refresher.abort();
     let _ = stop_tx.send(());
     if let Some(task) = bridge {
         task.await?;
@@ -1638,5 +1653,85 @@ mod tests {
         assert_eq!(bad_res.status(), reqwest::StatusCode::BAD_REQUEST);
 
         server.unblock();
+    }
+
+    #[tokio::test]
+    async fn test_observability_metrics_health_and_request_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path());
+        load_or_create_identity(&state.home).unwrap();
+        crate::handlers::transparency::transparency_log_at(&state.home).unwrap();
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        state.bind = server.server_addr().to_ip().unwrap();
+        let base_url = format!("http://{}", state.bind);
+
+        let srv = server.clone();
+        let handle = tokio::spawn(serve_server(Arc::new(state), srv));
+
+        let client = reqwest::Client::new();
+
+        // 1. GET /health fast liveness check returns 200
+        let liveness_res = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(liveness_res.status(), reqwest::StatusCode::OK);
+        let req_id_header = liveness_res.headers().get("X-Request-Id");
+        assert!(
+            req_id_header.is_some(),
+            "X-Request-Id header must be present on response"
+        );
+        let liveness_json: serde_json::Value = liveness_res.json().await.unwrap();
+        assert_eq!(liveness_json["status"], "healthy");
+        assert_eq!(liveness_json["ok"], true);
+
+        // 2. GET /v1/health deep readiness check returns 200 with dependency statuses
+        let custom_id = "test-custom-trace-uuid-123456";
+        let health_res = client
+            .get(format!("{base_url}/v1/health"))
+            .header("X-Request-Id", custom_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health_res.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            health_res
+                .headers()
+                .get("X-Request-Id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            custom_id
+        );
+        let health_json: serde_json::Value = health_res.json().await.unwrap();
+        assert!(health_json["status"] == "healthy" || health_json["status"] == "degraded");
+        assert_eq!(health_json["dependencies"]["sqlite"]["status"], "healthy");
+        assert_eq!(health_json["dependencies"]["sqlite"]["writable"], true);
+        assert_eq!(
+            health_json["dependencies"]["transparency_log"]["status"],
+            "healthy"
+        );
+
+        // 3. GET /metrics returns Prometheus metrics exposition
+        let metrics_res = client
+            .get(format!("{base_url}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(metrics_res.status(), reqwest::StatusCode::OK);
+        let ct = metrics_res
+            .headers()
+            .get("Content-Type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, prometheus::TEXT_FORMAT);
+        let metrics_text = metrics_res.text().await.unwrap();
+        assert!(metrics_text.contains("satspathd_http_requests_total"));
+        assert!(metrics_text.contains("satspathd_http_request_duration_seconds"));
+
+        server.unblock();
+        handle.abort();
     }
 }

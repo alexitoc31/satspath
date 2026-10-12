@@ -1,0 +1,63 @@
+groups:
+  - name: satspathd_alerts
+    rules:
+      - alert: HighHttpErrorRate
+        expr: |
+          (sum(rate(satspathd_http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(satspathd_http_requests_total[5m]))) * 100 > 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High HTTP 5xx error rate on satspathd"
+          description: "HTTP 5xx error rate is {{ $value | printf \"%.2f\" }}% (> 5%) over the last 5 minutes."
+
+      - alert: FeeApiDown
+        expr: |
+          sum(rate(satspathd_fee_api_requests_total{status=~"error|timeout"}[10m]))
+          /
+          sum(rate(satspathd_fee_api_requests_total[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fee API requests are failing"
+          description: "More than half of fee API requests failed or timed out over the last 10 minutes, sustained for 10 minutes."
+
+      - alert: CheckpointStale
+        expr: satspathd_transparency_checkpoint_age_seconds > 86400
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Transparency Log checkpoint is stale"
+          description: "The latest transparency log checkpoint age is {{ $value | printf \"%.0f\" }} seconds (> 24 hours). Check anchoring and witness synchronization."
+
+      - alert: HighHttpLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(satspathd_http_request_duration_seconds_bucket[5m])) by (le, endpoint)) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P99 latency on satspathd endpoint"
+          description: "Endpoint {{ $labels.endpoint }} P99 latency is {{ $value | printf \"%.2f\" }}s (> 2.0s) over the last 5 minutes."
+
+      - alert: ExcessiveRateLimiting
+        expr: sum(rate(satspathd_rate_limit_dropped_total[2m])) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spike in rate-limited or payload-dropped requests"
+          description: "satspathd is dropping {{ $value | printf \"%.0f\" }} requests/sec due to rate limiting or payload body bounds."
+
+      - alert: SatspathdInstanceDown
+        expr: up{job="satspathd"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "satspathd daemon is unreachable"
+          description: "Prometheus cannot scrape satspathd metrics endpoint. Process may be crashed or blocked."

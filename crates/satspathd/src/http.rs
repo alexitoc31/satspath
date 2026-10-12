@@ -55,6 +55,26 @@ pub(crate) fn empty_response(status: StatusCode) -> Response<std::io::Cursor<Vec
         .with_header(cors_headers_header())
 }
 
+pub(crate) fn text_response(
+    status: StatusCode,
+    body: String,
+    content_type: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let ct_header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
+        .unwrap_or_else(|_| Header::from_bytes(&b"Content-Type"[..], &b"text/plain"[..]).unwrap());
+    Response::from_data(body.into_bytes())
+        .with_status_code(status)
+        .with_header(ct_header)
+        .with_header(cors_origin_header())
+        .with_header(cors_methods_header())
+        .with_header(cors_headers_header())
+}
+
+pub(crate) fn request_id_header(request_id: &str) -> Header {
+    Header::from_bytes(&b"X-Request-Id"[..], request_id.as_bytes())
+        .expect("valid request id header")
+}
+
 pub(crate) fn json_error(
     status: StatusCode,
     error: anyhow::Error,

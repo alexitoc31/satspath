@@ -60,6 +60,9 @@ pub(crate) struct Cli {
     /// Maximum age in seconds before a cached fee estimate is considered stale (default: 1800).
     #[arg(long)]
     pub(crate) fee_max_staleness: Option<u64>,
+    /// Log output format: "text" (default) or "json" (structured JSON with correlation IDs).
+    #[arg(long)]
+    pub(crate) log_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
