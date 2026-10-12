@@ -13,20 +13,6 @@ groups:
           summary: "High HTTP 5xx error rate on satspathd"
           description: "HTTP 5xx error rate is {{ $value | printf \"%.2f\" }}% (> 5%) over the last 5 minutes."
 
-      - alert: FeeApiDown
-        expr: |
-          sum(rate(satspathd_fee_api_requests_total{status="error"}[3m]))
-          /
-          sum(rate(satspathd_fee_api_requests_total[3m])) > 0.5
-          or
-          histogram_quantile(0.95, sum(rate(satspathd_fee_api_latency_seconds_bucket[5m])) by (le)) > 5.0
-        for: 3m
-        labels:
-          severity: warning
-        annotations:
-          summary: "External Bitcoin fee estimation API failing or high latency"
-          description: "Over 50% of fee API requests failed or P95 fee latency exceeded 5 seconds over the last 3 minutes."
-
       - alert: CheckpointStale
         expr: satspathd_transparency_checkpoint_age_seconds > 86400
         for: 15m

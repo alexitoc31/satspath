@@ -85,10 +85,24 @@ pub(crate) fn route_template(path: &str) -> &'static str {
     }
 }
 
+pub(crate) fn method_label(m: &Method) -> &'static str {
+    match m {
+        Method::Get => "GET",
+        Method::Post => "POST",
+        Method::Put => "PUT",
+        Method::Delete => "DELETE",
+        Method::Head => "HEAD",
+        Method::Options => "OPTIONS",
+        Method::Patch => "PATCH",
+        _ => "OTHER",
+    }
+}
+
 pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Result<()> {
     let req_start = std::time::Instant::now();
     let request_id = crate::telemetry::get_or_generate_request_id(request.headers());
     let method = request.method().clone();
+    let method_str = method_label(&method);
     let raw_url = request.url().to_string();
     let path = raw_url.split('?').next().unwrap_or("/").to_string();
     let template = route_template(&path);
@@ -96,17 +110,18 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     let request_span = tracing::info_span!(
         "http_request",
         request_id = %request_id,
-        method = %method,
-        path = %path
+        method = method_str,
+        endpoint = template,
     );
-    let _span_guard = request_span.enter();
 
-    if !crate::host::is_allowed_host(request.headers(), state.bind, &state.allowed_hosts) {
+    use tracing::Instrument;
+    async {
+        if !crate::host::is_allowed_host(request.headers(), state.bind, &state.allowed_hosts) {
         let resp = json_error(StatusCode(400), anyhow::anyhow!("untrusted HTTP Host"))
             .with_header(crate::http::request_id_header(&request_id));
         let _ = request.respond(resp);
         crate::telemetry::record_http_request(
-            method.as_str(),
+            method_str,
             template,
             400,
             req_start.elapsed().as_secs_f64(),
@@ -126,14 +141,14 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
                 "payload too large: {} bytes (limit: {}) on {} {}",
                 body_len,
                 max_body,
-                method,
-                path
+                method_str,
+                template
             );
             let resp = rate_limit::payload_too_large_response(max_body)
                 .with_header(crate::http::request_id_header(&request_id));
             let _ = request.respond(resp);
             crate::telemetry::record_http_request(
-                method.as_str(),
+                method_str,
                 template,
                 413,
                 req_start.elapsed().as_secs_f64(),
@@ -157,13 +172,16 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
                 client_ip = %client_ip,
                 retry_after_secs = retry_after_secs,
                 "client IP {} exceeded rate limit on {} {}, retry after {}s",
-                client_ip, method, path, retry_after_secs
+                client_ip,
+                method_str,
+                template,
+                retry_after_secs
             );
             let resp = rate_limit::rate_limit_response(retry_after_secs)
                 .with_header(crate::http::request_id_header(&request_id));
             let _ = request.respond(resp);
             crate::telemetry::record_http_request(
-                method.as_str(),
+                method_str,
                 template,
                 429,
                 req_start.elapsed().as_secs_f64(),
@@ -188,7 +206,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
                 .with_header(crate::http::request_id_header(&request_id));
             let _ = request.respond(resp);
             crate::telemetry::record_http_request(
-                method.as_str(),
+                method_str,
                 template,
                 401,
                 req_start.elapsed().as_secs_f64(),
@@ -687,7 +705,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     };
     let status_code = response.status_code().0;
     let duration_secs = req_start.elapsed().as_secs_f64();
-    crate::telemetry::record_http_request(method.as_str(), template, status_code, duration_secs);
+    crate::telemetry::record_http_request(method_str, template, status_code, duration_secs);
     tracing::info!(
         endpoint = template,
         status = status_code,
@@ -697,4 +715,7 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     let response = response.with_header(crate::http::request_id_header(&request_id));
     request.respond(response)?;
     Ok(())
+    }
+    .instrument(request_span)
+    .await
 }

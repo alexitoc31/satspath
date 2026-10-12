@@ -1647,6 +1647,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = test_state(dir.path());
         load_or_create_identity(&state.home).unwrap();
+        crate::handlers::transparency::transparency_log_at(&state.home).unwrap();
         let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
         state.bind = server.server_addr().to_ip().unwrap();
         let base_url = format!("http://{}", state.bind);

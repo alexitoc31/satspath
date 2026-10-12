@@ -38,26 +38,36 @@ pub fn uptime_seconds() -> u64 {
     START_TIME.elapsed().as_secs()
 }
 
+const TRANSPARENCY_DB_FILE: &str = "satspath-transparency-v1.sqlite3";
+
 /// Checks SQLite database connectivity and writability.
 pub fn check_sqlite_health(home: &Path) -> DependencyHealth {
     let start = Instant::now();
-    match TransactionalTransparencyStore::open(home) {
+    let db_path = home.join(TRANSPARENCY_DB_FILE);
+    if !db_path.exists() {
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        return DependencyHealth {
+            status: "unhealthy".to_string(),
+            latency_ms,
+            error: Some("transparency database not initialized".to_string()),
+            details: serde_json::json!({
+                "writable": false,
+                "initialized": false,
+            }),
+        };
+    }
+
+    match TransactionalTransparencyStore::open_read_only(home) {
         Ok(store) => {
             let log_id = store.log_id().to_string();
-            // Test actual write capability via an immediate transaction probe that rolls back
-            let write_probe = (|| -> anyhow::Result<()> {
-                let db_path = home.join("transparency.db");
-                let mut conn = rusqlite::Connection::open(&db_path)?;
-                let tx =
-                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _health_check_probe(id INTEGER); INSERT INTO _health_check_probe VALUES (1);")?;
-                tx.rollback()?;
-                Ok(())
-            })();
-
+            let is_writable = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .is_ok();
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-            match write_probe {
-                Ok(()) => DependencyHealth {
+            if is_writable {
+                DependencyHealth {
                     status: "healthy".to_string(),
                     latency_ms,
                     error: None,
@@ -65,16 +75,17 @@ pub fn check_sqlite_health(home: &Path) -> DependencyHealth {
                         "writable": true,
                         "log_id": log_id,
                     }),
-                },
-                Err(e) => DependencyHealth {
+                }
+            } else {
+                DependencyHealth {
                     status: "unhealthy".to_string(),
                     latency_ms,
-                    error: Some(format!("database not writable: {e}")),
+                    error: Some("transparency database file is not writable".to_string()),
                     details: serde_json::json!({
                         "writable": false,
                         "log_id": log_id,
                     }),
-                },
+                }
             }
         }
         Err(e) => {
@@ -235,17 +246,21 @@ pub fn check_transparency_health(home: &Path) -> DependencyHealth {
     }
 }
 
-static CACHED_DEEP_HEALTH: std::sync::RwLock<Option<(Instant, DeepHealthResponse)>> =
-    std::sync::RwLock::new(None);
+static CACHED_DEEP_HEALTH: std::sync::RwLock<
+    Option<std::collections::HashMap<std::path::PathBuf, (Instant, DeepHealthResponse)>>,
+> = std::sync::RwLock::new(None);
 const DEEP_HEALTH_CACHE_TTL_SECS: u64 = 5;
 
 /// Performs a comprehensive health check across all daemon dependencies.
-/// Caches result for 5 seconds to prevent outbound request amplification and SQLite thrashing.
+/// Caches result for 5 seconds per home path to prevent outbound request amplification and SQLite thrashing.
 pub async fn perform_deep_health_check(home: &Path) -> DeepHealthResponse {
+    let home_buf = home.to_path_buf();
     if let Ok(guard) = CACHED_DEEP_HEALTH.read() {
-        if let Some((cached_at, ref resp)) = *guard {
-            if cached_at.elapsed().as_secs() < DEEP_HEALTH_CACHE_TTL_SECS {
-                return resp.clone();
+        if let Some(map) = guard.as_ref() {
+            if let Some((cached_at, ref resp)) = map.get(&home_buf) {
+                if cached_at.elapsed().as_secs() < DEEP_HEALTH_CACHE_TTL_SECS {
+                    return resp.clone();
+                }
             }
         }
     }
@@ -281,7 +296,8 @@ pub async fn perform_deep_health_check(home: &Path) -> DeepHealthResponse {
     };
 
     if let Ok(mut guard) = CACHED_DEEP_HEALTH.write() {
-        *guard = Some((Instant::now(), resp.clone()));
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        map.insert(home_buf, (Instant::now(), resp.clone()));
     }
 
     resp
