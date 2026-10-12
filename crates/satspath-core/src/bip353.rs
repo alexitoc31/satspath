@@ -7,11 +7,11 @@
 //!
 //! # DNSSEC is mandatory
 //!
-//! Per BIP-353 all payment instructions must be DNSSEC-signed. The default
-//! [`resolve_bip353`] runs in [`DnssecPolicy::Strict`] and validates DNSSEC
-//! locally against bundled root trust anchors, failing closed if validation
-//! fails. The unvalidating [`DohTxtResolver`] is only usable under
-//! [`DnssecPolicy::DevInsecure`] for local testing and emits loud warnings.
+//! Per BIP-353 all payment instructions must be DNSSEC-signed. This crate does
+//! not ship a local DNSSEC validator, so the default [`resolve_bip353`] runs in
+//! [`DnssecPolicy::Strict`] and **fails closed** ([`SatsPathError::DnssecUnavailable`])
+//! rather than trusting an upstream resolver's AD bit. [`DnssecPolicy::DevInsecure`]
+//! exists for local testing only, is never the default, and emits loud warnings.
 
 use std::collections::HashMap;
 
@@ -231,27 +231,17 @@ where
     })
 }
 
-/// Resolve a BIP-353 name with local DNSSEC validation and **Strict** policy.
+/// Resolve a BIP-353 name with the default backend and **Strict** policy.
 ///
-/// Validates DNSSEC locally against bundled root trust anchors using
-/// [`HickoryDnssecTxtResolver`]. Anything that cannot be validated
-/// fails closed.
+/// The default backend does not perform local DNSSEC validation, so in Strict
+/// mode this fails closed with [`SatsPathError::DnssecUnavailable`]. Use
+/// [`resolve_bip353_with`] + a DNSSEC-validating resolver (or `DevInsecure` for
+/// local testing) to obtain a resolution.
 pub async fn resolve_bip353(name: &str) -> Result<Bip353Resolution> {
-    #[cfg(feature = "std")]
-    {
-        let resolver = crate::resolvers::bip353::HickoryDnssecTxtResolver::new();
-        let now = chrono::Utc::now().timestamp();
-        resolve_bip353_with(&resolver, name, DnssecPolicy::Strict, now).await
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = name;
-        Err(SatsPathError::DnssecUnavailable)
-    }
+    let resolver = DohTxtResolver::new();
+    let now = chrono::Utc::now().timestamp();
+    resolve_bip353_with(&resolver, name, DnssecPolicy::Strict, now).await
 }
-
-#[cfg(feature = "std")]
-pub use crate::resolvers::bip353::HickoryDnssecTxtResolver;
 
 // ─── Ownership verification ─────────────────────────────────────────────────────
 
