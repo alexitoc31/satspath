@@ -60,20 +60,33 @@ Resolution rules SatsPath enforces (per BIP-353):
 
 BIP-353 payment instructions are only trustworthy if DNSSEC-validated. SatsPath
 **does not trust an upstream resolver's AD bit** — that can be spoofed by a
-malicious resolver.
+compromised or MITM recursive resolver.
 
 `DnssecPolicy` has two modes:
 
 | Mode               | Behavior                                                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| `Strict` (default) | Require real DNSSEC validation; **fail closed** otherwise.                                                                     |
+| `Strict` (default) | Require real local cryptographic DNSSEC validation; **fail closed** otherwise.                                                 |
 | `DevInsecure`      | Local testing only. Accept unvalidated records with loud warnings. Never the default; requires `--allow-insecure-dns-for-dev`. |
 
-This build does not ship a local DNSSEC validator, so `Strict` resolution **fails
-closed** with a clear message (option C of the BIP-353 DNSSEC guidance). A future
-release can plug in a validating resolver without changing the contract. The
-`--allow-insecure-dns-for-dev` flag prints a scary warning and must never be used
-on mainnet.
+### Local DNSSEC Validation Architecture (`HickoryDnssecTxtResolver`)
+
+SatsPath ships a full cryptographic DNSSEC validator based on Hickory DNS (`hickory-resolver`), executing local trust-chain verification:
+
+1. **Bundled Root Trust Anchors:**
+   - Active ICANN Root KSK: Key tag `38696` (RSA 2048-bit, active in global DNS root) bundled explicitly.
+   - Historical / Standby KSKs: Key tags `20326` and `19036` (included from Hickory's default trust anchors).
+   - Bundled in `satspath-core::resolvers::bip353::root_trust_anchors()` to eliminate reliance on host OS trust stores.
+2. **Multi-Provider Recursive Resolver Pool:**
+   Queries are routed with retries across independent public DNS providers over both TCP and UDP (port 53):
+   - **Cloudflare:** `1.0.0.1`, `1.1.1.1`
+   - **Quad9:** `9.9.9.9`, `149.112.112.112`
+   - **Google:** `8.8.8.8`, `8.8.4.4`
+   - Dual TCP/UDP transport ensures resilience against UDP filtering, packet loss, or oversized DNSSEC responses.
+3. **Fail-Closed Guarantees:**
+   - Any broken signature (RRSIG mismatch, expired signatures, missing DS record, bogus key) fails closed and returns an error immediately (`SatsPathError::NetworkError`).
+   - Unsigned domains queried under `Strict` mode fail closed (`SatsPathError::DnssecUnavailable` or `SatsPathError::NetworkError` on DNSSEC failure).
+   - Upstream recursive servers act solely as untrusted transport carriers; all cryptographic signature checking happens locally on the client.
 
 ## Direct TXT model (Option A)
 
