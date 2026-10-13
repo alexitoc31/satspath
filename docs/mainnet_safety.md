@@ -31,6 +31,7 @@
 | **Mainnet Payment Execution by SatsPath** | **Unsupported / Out of Scope** | **Host Wallet Only** |
 | **Transaction Signing (PSBT / Schnorr / ECDSA)** | **Unsupported / Out of Scope** | **Host Wallet Only** |
 | **Mempool Transaction Broadcast** | **Unsupported / Out of Scope** | **Host Wallet Only** |
+| **Post-Quantum Cryptography (ML-DSA / ML-KEM)** | **Experimental (Feature-Gated)** (Optional `pqc` feature flag; not part of production safety claim; classical-only verification is the default production path) | SatsPath (Core / PQC) |
 | **Mainnet Swaps Execution** | **Unsupported** | Scaffolding in `satspath-swaps` is testnet/regtest only |
 
 ---
@@ -67,3 +68,12 @@ BIP-353 resolution is a preview layer: SatsPath resolves and displays DNSSEC-bac
 * **Zero Private Material:** No private material may ever appear in a published or resolved DNS payload (`seed`, `xprv`, `mnemonic`, `macaroon`, `cert`, `api_key`, `claim_key`, `refund_key`, `preimage`) — screened on both publish and resolve.
 * **Cryptographic Authorization:** DNSSEC cryptographically authorizes the DNS record, while the signed profile (including its `secp256k1` identity-key signature) remains strictly required for profile-based payments. Email inbox access alone never authorizes a payment-instruction change.
 * **Consumer Domains:** Consumer email domains (e.g. `gmail.com`) cannot use direct BIP-353 DNS; they fall back to platform verification or the invite flow.
+
+---
+
+## 5. Post-Quantum Cryptography (PQC) Boundaries
+
+* **Experimental Classification:** The `satspath-pqc` crate and post-quantum hybrid verification primitives (ML-DSA-65, ML-KEM-768) are experimental research code and are strictly feature-gated behind the optional `pqc` Cargo feature flag in `satspath-core`.
+* **Exclusion from Production Safety Claim:** Production mainnet profile resolution and validation rely exclusively on classical, battle-tested `secp256k1` BIP-340 Schnorr signatures. PQC is not part of the production mainnet safety claim.
+* **Fail-Closed Default:** When the `pqc` feature is not enabled (the default for production builds), any profile specifying `pqc_required: true` or supplying `hybrid_pubkey` or `hybrid_signature` (even when `pqc_required` is false) is rejected (`Ok(false)`). In builds with the `pqc` feature disabled, this guarantees that verifiers never accept unverified post-quantum assertions, unverified hybrid extensions, or false security guarantees.
+

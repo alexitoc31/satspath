@@ -192,7 +192,7 @@ pub struct PaymentProfile {
     pub method_verifications: Vec<crate::ownership::MethodVerification>,
     /// PQC: Post-quantum hybrid public key bundle (classical + PQC)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hybrid_pubkey: Option<satspath_pqc::types::HybridPublicKey>,
+    pub hybrid_pubkey: Option<crate::pqc::HybridPublicKey>,
     /// PQC: If true, verifiers MUST check the hybrid_signature. If false, it's optional.
     #[serde(default)]
     pub pqc_required: bool,
@@ -215,7 +215,7 @@ pub struct SignedPaymentProfile {
     pub signature: String,
     /// PQC: Hybrid signature (Schnorr + ML-DSA)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hybrid_signature: Option<satspath_pqc::types::HybridSignature>,
+    pub hybrid_signature: Option<crate::pqc::HybridSignature>,
 }
 
 /// A parsed universal SatsPath payment request.

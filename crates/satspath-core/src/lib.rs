@@ -11,6 +11,7 @@ pub mod ownership;
 pub mod peer_registry;
 pub mod platform;
 pub mod pointer;
+pub mod pqc;
 pub mod privacy;
 pub mod profile;
 pub mod recovery;
