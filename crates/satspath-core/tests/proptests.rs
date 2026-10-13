@@ -398,7 +398,9 @@ proptest! {
             _ => {
                 // Mutate leaf index to another in-range index
                 prop_assume!(tampered.tree_size > 1);
-                tampered.leaf_index = (tampered.leaf_index + 1) % tampered.tree_size;
+                let next_index = (index + 1) % leaves.len();
+                prop_assume!(leaves[next_index] != leaves[index]);
+                tampered.leaf_index = next_index as u64;
             }
         }
 
