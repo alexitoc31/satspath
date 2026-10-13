@@ -6,7 +6,8 @@ use satspath_core::{
 };
 use satspath_router::ark_routes::SenderCapabilities;
 use satspath_router::bolt12::{
-    encode_tlv_stream, BlindedHop, BlindedPath, TlvRecord, TLV_OFFER_DESCRIPTION, TLV_OFFER_PATHS,
+    encode_tlv_stream, BlindedHop, BlindedPath, TlvRecord, TLV_OFFER_DESCRIPTION,
+    TLV_OFFER_NODE_ID, TLV_OFFER_PATHS,
 };
 use satspath_router::fees::FeeEstimate;
 use satspath_router::router::{select_route_with_fees, RouteRequest};
@@ -40,8 +41,20 @@ fn valid_blinded_bolt12_offer() -> String {
     bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).expect("bech32")
 }
 
-const VALID_UNBLINDED_BOLT12_OFFER: &str =
-    "lno1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+fn valid_unblinded_bolt12_offer() -> String {
+    let records = vec![
+        TlvRecord {
+            tag: TLV_OFFER_DESCRIPTION,
+            value: b"Unblinded Offer".to_vec(),
+        },
+        TlvRecord {
+            tag: TLV_OFFER_NODE_ID,
+            value: [vec![0x02], vec![0x11; 32]].concat(),
+        },
+    ];
+    let raw = encode_tlv_stream(&records);
+    bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).expect("bech32")
+}
 
 // ── Strategies ─────────────────────────────────────────────────────────────
 
@@ -92,7 +105,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
             proptest::option::of("https://example.com/lnurl"),
             prop_oneof![
                 Just(Some(valid_blinded_bolt12_offer())),
-                Just(Some(VALID_UNBLINDED_BOLT12_OFFER.to_string())),
+                Just(Some(valid_unblinded_bolt12_offer())),
                 proptest::option::of("lno1[a-z0-9]{20,50}"),
             ],
         )
@@ -125,7 +138,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
             "[a-zA-Z0-9_-]{1,16}",
             prop_oneof![
                 Just(valid_blinded_bolt12_offer()),
-                Just(VALID_UNBLINDED_BOLT12_OFFER.to_string()),
+                Just(valid_unblinded_bolt12_offer()),
                 "lno1[a-z0-9]{20,50}".prop_map(|s| s),
             ],
             arb_bitcoin_network(),

@@ -296,10 +296,12 @@ proptest! {
                 tampered.profile.alias.push_str("_tampered");
             }
             1 => {
-                // Tamper with identity_pubkey
-                let mut pk_bytes = hex::decode(&tampered.profile.identity_pubkey).unwrap();
-                pk_bytes[0] ^= tamper_byte;
-                tampered.profile.identity_pubkey = hex::encode(pk_bytes);
+                // Tamper with identity_pubkey: replace with a different valid public key
+                let other = SecretKey::from_slice(&[1u8; 32]).unwrap();
+                let pk = PublicKey::from_secret_key(&Secp256k1::new(), &other);
+                let pk_hex = hex::encode(pk.serialize());
+                prop_assume!(pk_hex != tampered.profile.identity_pubkey);
+                tampered.profile.identity_pubkey = pk_hex;
             }
             2 => {
                 // Tamper with sequence number
