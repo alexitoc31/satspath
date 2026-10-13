@@ -256,11 +256,10 @@ proptest! {
 
     #[test]
     fn test_canonical_json_idempotency_on_arbitrary_json(val in arb_json_value()) {
-        if let Ok(c1) = canonical_json::to_string(&val) {
-            let val2: serde_json::Value = serde_json::from_str(&c1).expect("reparse canonical JSON");
-            let c2 = canonical_json::to_string(&val2).expect("re-canonicalize parsed JSON");
-            prop_assert_eq!(c1, c2, "canonical_json(canonical_json(x)) == canonical_json(x)");
-        }
+        let c1 = canonical_json::to_string(&val).expect("canonicalize generated JSON");
+        let val2: serde_json::Value = serde_json::from_str(&c1).expect("reparse canonical JSON");
+        let c2 = canonical_json::to_string(&val2).expect("re-canonicalize parsed JSON");
+        prop_assert_eq!(c1, c2, "canonical_json(canonical_json(x)) == canonical_json(x)");
     }
 
     #[test]
