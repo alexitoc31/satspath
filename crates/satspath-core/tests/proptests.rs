@@ -450,7 +450,7 @@ proptest! {
 
     #[test]
     fn test_ssrf_rejects_forbidden_schemes_and_ports(
-        scheme in prop_oneof![Just("http"), Just("ftp"), Just("file"), Just("gopher")],
+        scheme in prop_oneof![Just("https"), Just("http"), Just("ftp"), Just("file"), Just("gopher")],
         port in prop_oneof![Just(22u16), Just(25u16), Just(3306u16), Just(6379u16)]
     ) {
         let url = format!("{scheme}://satspath.example.com:{port}/profile");
