@@ -296,8 +296,10 @@ proptest! {
                 tampered.profile.alias.push_str("_tampered");
             }
             1 => {
-                // Tamper with identity_pubkey: replace with a different valid public key
-                let other = SecretKey::from_slice(&[1u8; 32]).unwrap();
+                // Tamper with identity_pubkey: replace with a distinct valid public key
+                let mut key_bytes = [0u8; 32];
+                key_bytes[0] = tamper_byte;
+                let other = SecretKey::from_slice(&key_bytes).unwrap();
                 let pk = PublicKey::from_secret_key(&Secp256k1::new(), &other);
                 let pk_hex = hex::encode(pk.serialize());
                 prop_assume!(pk_hex != tampered.profile.identity_pubkey);
@@ -339,10 +341,12 @@ proptest! {
             }
         }
 
-        // Must fail verification: if verification succeeded, that is an invalid false positive
-        if let Ok(verified) = verify_signed_profile(&tampered) {
-            prop_assert!(!verified, "tampered profile must never verify as valid");
-        }
+        let result = verify_signed_profile(&tampered);
+        prop_assert!(
+            matches!(result, Ok(false)),
+            "tampered profile must return Ok(false), got {:?}",
+            result
+        );
     }
 
     // ── 4. Merkle Inclusion Proof Roundtrip & Tamper Rejection ─────────────
@@ -392,14 +396,18 @@ proptest! {
                 }
             }
             _ => {
-                // Mutate leaf index
-                tampered.leaf_index = (tampered.leaf_index + 1) % (tampered.tree_size + 1);
+                // Mutate leaf index to another in-range index
+                prop_assume!(tampered.tree_size > 1);
+                tampered.leaf_index = (tampered.leaf_index + 1) % tampered.tree_size;
             }
         }
 
-        if let Ok(verified) = verify_inclusion_proof(&tampered) {
-            prop_assert!(!verified, "tampered Merkle proof must not verify");
-        }
+        let result = verify_inclusion_proof(&tampered);
+        prop_assert!(
+            matches!(result, Ok(false)),
+            "tampered Merkle proof must return Ok(false), got {:?}",
+            result
+        );
     }
 
     // ── 5. SSRF Validation Never Allows Private IPs Regardless of Encoding ──
