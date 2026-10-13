@@ -88,11 +88,11 @@ pub use transparency::next_identifier_sequence;
 #[cfg(feature = "std")]
 pub use transparency::TransactionalTransparencyStore;
 pub use transparency::{
-    validate_catena_successor, BitcoinAnchor as TransparencyBitcoinAnchor, CheckpointStore,
-    ConsistencyStatus, IdentifierAttestation, IdentifierVerificationMethod, MerkleConsistencyProof,
-    MerkleInclusionProof, NameAction, NameEvent, OperatorKeyRotation, PinnedCheckpoint,
-    TransparencyCheckpoint, TransparencyError, TransparencyLog, TransparencyLogIdentity,
-    TransparencyStatus, TrustedVerifier,
+    inclusion_proof, validate_catena_successor, BitcoinAnchor as TransparencyBitcoinAnchor,
+    CheckpointStore, ConsistencyStatus, IdentifierAttestation, IdentifierVerificationMethod,
+    MerkleConsistencyProof, MerkleInclusionProof, NameAction, NameEvent, OperatorKeyRotation,
+    PinnedCheckpoint, TransparencyCheckpoint, TransparencyError, TransparencyLog,
+    TransparencyLogIdentity, TransparencyStatus, TrustedVerifier,
 };
 
 #[cfg(feature = "std")]

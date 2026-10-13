@@ -71,7 +71,9 @@ pub use state_map::{
 };
 pub use status::{S2SErrorCode, VerificationStatus};
 pub use store::CheckpointStore;
-pub use tree::{consistency_proof, leaf_hash, merkle_root, node_hash, verify_consistency};
+pub use tree::{
+    consistency_proof, inclusion_proof, leaf_hash, merkle_root, node_hash, verify_consistency,
+};
 pub use verifier::{
     next_identifier_sequence, verify_checkpoint, verify_checkpoint_inclusion,
     verify_checkpoint_state_binding, verify_checkpoint_transition, verify_consistency_proof,
