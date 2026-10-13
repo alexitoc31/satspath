@@ -1,14 +1,47 @@
+use bech32::ToBase32;
 use proptest::prelude::*;
 use satspath_core::crypto::sign_profile;
 use satspath_core::{
     BitcoinNetwork, Bolt12Offer, PaymentMethod, PaymentProfile, SignedPaymentProfile,
 };
 use satspath_router::ark_routes::SenderCapabilities;
+use satspath_router::bolt12::{
+    encode_tlv_stream, BlindedHop, BlindedPath, TlvRecord, TLV_OFFER_DESCRIPTION, TLV_OFFER_PATHS,
+};
 use satspath_router::fees::FeeEstimate;
 use satspath_router::router::{select_route_with_fees, RouteRequest};
 use satspath_router::scoring::{score_routes, FeeSnapshot, RoutePreferences};
 use satspath_router::urgency::PaymentUrgency;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+fn valid_blinded_bolt12_offer() -> String {
+    let bp = BlindedPath {
+        introduction_node_id: "02".to_string() + &"11".repeat(32),
+        blinding_point: Some("02".to_string() + &"22".repeat(32)),
+        blinded_hops: vec![BlindedHop {
+            blinded_node_id: "03".to_string() + &"33".repeat(32),
+            encrypted_payload: "aabbccddeeff".to_string(),
+        }],
+    };
+    let bp_bytes = bp.encode_bytes().expect("encode bp");
+    let records = vec![
+        TlvRecord {
+            tag: TLV_OFFER_DESCRIPTION,
+            value: b"Blinded Offer".to_vec(),
+        },
+        TlvRecord {
+            tag: TLV_OFFER_PATHS,
+            value: bp_bytes,
+        },
+    ];
+    let raw = encode_tlv_stream(&records);
+    bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).expect("bech32")
+}
+
+const VALID_UNBLINDED_BOLT12_OFFER: &str =
+    "lno1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 
 // ── Strategies ─────────────────────────────────────────────────────────────
 
@@ -26,30 +59,42 @@ fn arb_bitcoin_network() -> impl Strategy<Value = BitcoinNetwork> {
     ]
 }
 
+fn arb_onchain_address(network: BitcoinNetwork) -> impl Strategy<Value = Option<String>> {
+    let addr = match network {
+        BitcoinNetwork::Mainnet => "bc1q00000000000000000000000000000000000000",
+        BitcoinNetwork::Testnet => "tb1q00000000000000000000000000000000000000",
+        BitcoinNetwork::Regtest => "bcrt1q000000000000000000000000000000000000",
+    };
+    prop_oneof![Just(None), Just(Some(addr.to_string())),]
+}
+
 fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
     prop_oneof![
         (
             "[a-zA-Z0-9_-]{1,16}",
             arb_bitcoin_network(),
-            proptest::option::of("bc1q[a-z0-9]{20,40}"),
-            proptest::option::of("sp1q[a-z0-9]{30,50}"),
+            proptest::option::of("sp1q00000000000000000000000000000000000000000000000000000000"),
         )
-            .prop_map(|(label, network, address, silent_payment_pubkey)| {
-                PaymentMethod::Onchain {
-                    label,
+            .prop_flat_map(|(label, network, silent_payment_pubkey)| {
+                arb_onchain_address(network).prop_map(move |address| PaymentMethod::Onchain {
+                    label: label.clone(),
                     network,
                     address,
-                    silent_payment_pubkey,
+                    silent_payment_pubkey: silent_payment_pubkey.clone(),
                     pubkey_hint: None,
                     descriptor_hint: None,
                     address_list: vec![],
-                }
+                })
             }),
         (
             "[a-zA-Z0-9_-]{1,16}",
             proptest::option::of("[a-z0-9_]{1,15}@[a-z0-9_]{1,10}\\.com"),
-            proptest::option::of("https://[a-z0-9.]+/lnurl"),
-            proptest::option::of("lno1[a-z0-9]{20,50}"),
+            proptest::option::of("https://example.com/lnurl"),
+            prop_oneof![
+                Just(Some(valid_blinded_bolt12_offer())),
+                Just(Some(VALID_UNBLINDED_BOLT12_OFFER.to_string())),
+                proptest::option::of("lno1[a-z0-9]{20,50}"),
+            ],
         )
             .prop_map(|(label, lightning_address, lnurl, bolt12)| {
                 PaymentMethod::Lightning {
@@ -62,7 +107,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
             }),
         (
             "[a-zA-Z0-9_-]{1,16}",
-            "https://[a-z0-9.]+/ark",
+            "https://example.com/ark",
             "[0-9a-f]{66}",
         )
             .prop_map(|(label, server, pubkey)| {
@@ -78,7 +123,11 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
             }),
         (
             "[a-zA-Z0-9_-]{1,16}",
-            "lno1[a-z0-9]{20,50}",
+            prop_oneof![
+                Just(valid_blinded_bolt12_offer()),
+                Just(VALID_UNBLINDED_BOLT12_OFFER.to_string()),
+                "lno1[a-z0-9]{20,50}".prop_map(|s| s),
+            ],
             arb_bitcoin_network(),
             proptest::option::of(100u64..10_000_000u64),
             "[0-9a-f]{66}",
@@ -204,7 +253,7 @@ fn arb_payment_urgency() -> impl Strategy<Value = PaymentUrgency> {
 // ── Property Tests ─────────────────────────────────────────────────────────
 
 proptest! {
-    // ── 1. Route Scoring Determinism ───────────────────────────────────────
+    // ── 1. Route Scoring Determinism & Contract Invariants ─────────────────
 
     #[test]
     fn test_score_routes_is_deterministic(
@@ -219,6 +268,11 @@ proptest! {
         match (&decision1, &decision2) {
             (Ok(d1), Ok(d2)) => {
                 prop_assert_eq!(d1, d2, "score_routes must return identical RouteDecision for identical inputs");
+                // Contract: selected candidate must be available
+                prop_assert!(d1.selected.available, "selected candidate must be marked available");
+                // Contract: selected + alternatives is bounded by candidate methods count
+                let total_candidates = d1.alternatives.len() + 1;
+                prop_assert!(total_candidates <= signed_profile.profile.methods.len(), "candidates count bounded by methods count");
             }
             (Err(e1), Err(e2)) => {
                 prop_assert_eq!(e1.to_string(), e2.to_string(), "score_routes must return identical error for identical inputs");
@@ -229,7 +283,7 @@ proptest! {
         }
     }
 
-    // ── 2. Route Selection With Fees Determinism ───────────────────────────
+    // ── 2. Route Selection With Fees Determinism & Contract Invariants ─────
 
     #[test]
     fn test_select_route_with_fees_is_deterministic(
@@ -237,14 +291,16 @@ proptest! {
         signed_profile in arb_signed_profile(),
         urgency in arb_payment_urgency(),
         fee_est in arb_fee_estimate(),
+        max_fee_sats in proptest::option::of(100u64..100_000u64),
+        max_fee_percent in proptest::option::of(0.01f64..10.0f64),
     ) {
         let req = RouteRequest {
             alias: signed_profile.profile.alias.clone(),
             amount_sats,
-            signed_profile,
+            signed_profile: signed_profile.clone(),
             urgency,
-            max_fee_sats: None,
-            max_fee_percent: None,
+            max_fee_sats,
+            max_fee_percent,
         };
 
         let quote1 = select_route_with_fees(&req, &fee_est);
@@ -253,6 +309,17 @@ proptest! {
         match (&quote1, &quote2) {
             (Ok(q1), Ok(q2)) => {
                 prop_assert_eq!(q1, q2, "select_route_with_fees must return identical RouteQuote for identical inputs");
+
+                // Contract: When amount < 100,000 sats and an available Lightning method exists, Lightning is chosen
+                let has_available_ln = req.signed_profile.profile.methods.iter().any(|m| {
+                    satspath_router::lightning::is_lightning_available_for_amount_sync(m, amount_sats)
+                });
+                if amount_sats < 100_000 && has_available_ln {
+                    prop_assert!(
+                        matches!(q1.selected_method, PaymentMethod::Lightning { .. } | PaymentMethod::Bolt12(_)),
+                        "Amount < 100,000 sats with available Lightning must choose Lightning/Bolt12"
+                    );
+                }
             }
             (Err(e1), Err(e2)) => {
                 prop_assert_eq!(e1.to_string(), e2.to_string(), "select_route_with_fees must return identical error for identical inputs");
@@ -263,37 +330,18 @@ proptest! {
         }
     }
 
-    // ── 3. Repeated Route Selection Idempotency ────────────────────────────
+    // ── 3. Payment Urgency Fee Rate Monotonicity ───────────────────────────
 
     #[test]
-    fn test_route_selection_repeated_invocations_remain_consistent(
-        amount_sats in 1u64..100_000u64,
-        signed_profile in arb_signed_profile(),
-        fee_est in arb_fee_estimate(),
-    ) {
-        let req = RouteRequest {
-            alias: signed_profile.profile.alias.clone(),
-            amount_sats,
-            signed_profile,
-            urgency: PaymentUrgency::Normal,
-            max_fee_sats: None,
-            max_fee_percent: None,
-        };
+    fn test_payment_urgency_fee_rate_monotonicity(fee_est in arb_fee_estimate()) {
+        let urgent = PaymentUrgency::Urgent.select_fee_rate(&fee_est);
+        let commercial = PaymentUrgency::Commercial.select_fee_rate(&fee_est);
+        let normal = PaymentUrgency::Normal.select_fee_rate(&fee_est);
+        let economy = PaymentUrgency::Economy.select_fee_rate(&fee_est);
 
-        let first = select_route_with_fees(&req, &fee_est);
-        for _ in 0..5 {
-            let repeated = select_route_with_fees(&req, &fee_est);
-            match (&first, &repeated) {
-                (Ok(q1), Ok(q2)) => {
-                    prop_assert_eq!(q1, q2, "repeated route evaluations must never fluctuate");
-                }
-                (Err(e1), Err(e2)) => {
-                    prop_assert_eq!(e1.to_string(), e2.to_string(), "repeated route evaluations must return identical error");
-                }
-                _ => {
-                    prop_assert!(false, "repeated route evaluations produced divergent outcomes");
-                }
-            }
-        }
+        prop_assert!(urgent >= commercial, "urgent fee rate must be >= commercial");
+        prop_assert!(commercial >= normal, "commercial fee rate must be >= normal");
+        prop_assert!(normal >= economy, "normal fee rate must be >= economy");
+        prop_assert!(economy >= 1, "economy fee rate must be >= 1");
     }
 }

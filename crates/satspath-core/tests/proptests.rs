@@ -416,6 +416,22 @@ proptest! {
     }
 
     #[test]
+    fn test_ssrf_rejects_private_ipv4_alternate_encodings(ip in arb_private_ipv4()) {
+        let n = u32::from(ip);
+        let o = ip.octets();
+        let encodings = [
+            format!("https://{n}/profile"),
+            format!("https://0x{n:08x}/profile"),
+            format!("https://0{n:o}/profile"),
+            format!("https://{}.{}/profile", o[0], (u32::from(o[1]) << 16) | (u32::from(o[2]) << 8) | u32::from(o[3])),
+            format!("https://0x{:02x}.0{:o}.{}.{}/profile", o[0], o[1], o[2], o[3]),
+        ];
+        for url in encodings {
+            prop_assert!(validate_url(&url, false).is_err(), "validate_url must reject encoded private IPv4 URL: {url}");
+        }
+    }
+
+    #[test]
     fn test_ssrf_rejects_private_ipv6(ip in arb_private_ipv6()) {
         prop_assert!(
             is_private_or_reserved_ip(IpAddr::V6(ip)),
