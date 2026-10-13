@@ -1,17 +1,22 @@
-use bech32::ToBase32;
+use bech32::{FromBase32, ToBase32};
+use bitcoin::{Address, CompressedPublicKey, Network};
 use proptest::prelude::*;
 use satspath_core::crypto::sign_profile;
+use satspath_core::validation::validate_public_profile;
 use satspath_core::{
     BitcoinNetwork, Bolt12Offer, PaymentMethod, PaymentProfile, SignedPaymentProfile,
 };
 use satspath_router::ark_routes::SenderCapabilities;
 use satspath_router::bolt12::{
-    encode_tlv_stream, BlindedHop, BlindedPath, TlvRecord, TLV_OFFER_DESCRIPTION,
-    TLV_OFFER_NODE_ID, TLV_OFFER_PATHS,
+    encode_tlv_stream, write_tu64, BlindedHop, BlindedPath, TlvRecord, TLV_OFFER_AMOUNT,
+    TLV_OFFER_DESCRIPTION, TLV_OFFER_NODE_ID, TLV_OFFER_PATHS,
 };
 use satspath_router::fees::FeeEstimate;
 use satspath_router::router::{select_route_with_fees, RouteRequest};
-use satspath_router::scoring::{score_routes, FeeSnapshot, RoutePreferences};
+use satspath_router::scoring::{
+    score_routes, FeeSnapshot, PaymentRail, RouteCandidate, RoutePreferences,
+};
+use satspath_router::silent_payments::create_silent_payment_address_for_network;
 use satspath_router::urgency::PaymentUrgency;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
@@ -41,8 +46,8 @@ fn valid_blinded_bolt12_offer() -> String {
     bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).expect("bech32")
 }
 
-fn valid_unblinded_bolt12_offer() -> String {
-    let records = vec![
+fn valid_unblinded_bolt12_offer(minimum_amount_sats: Option<u64>) -> String {
+    let mut records = vec![
         TlvRecord {
             tag: TLV_OFFER_DESCRIPTION,
             value: b"Unblinded Offer".to_vec(),
@@ -52,8 +57,97 @@ fn valid_unblinded_bolt12_offer() -> String {
             value: [vec![0x02], vec![0x11; 32]].concat(),
         },
     ];
+    if let Some(minimum) = minimum_amount_sats {
+        records.push(TlvRecord {
+            tag: TLV_OFFER_AMOUNT,
+            value: write_tu64(minimum * 1_000),
+        });
+    }
     let raw = encode_tlv_stream(&records);
     bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).expect("bech32")
+}
+
+fn bitcoin_network(network: BitcoinNetwork) -> Network {
+    match network {
+        BitcoinNetwork::Mainnet => Network::Bitcoin,
+        BitcoinNetwork::Testnet => Network::Testnet,
+        BitcoinNetwork::Regtest => Network::Regtest,
+    }
+}
+
+fn payment_profile(sk: &SecretKey, methods: Vec<PaymentMethod>) -> PaymentProfile {
+    let pk = PublicKey::from_secret_key(&Secp256k1::new(), sk);
+    PaymentProfile {
+        alias: "alice@example.com".into(),
+        identity_pubkey: hex::encode(pk.serialize()),
+        methods,
+        updated_at: 1,
+        expires_at: None,
+        sequence: None,
+        preferences: vec!["lightning".into(), "onchain".into(), "ark".into()],
+        nonce: None,
+        rotation: None,
+        method_verifications: vec![],
+        hybrid_pubkey: None,
+        pqc_required: false,
+        revoked: false,
+        recovery_policy: None,
+        recovery: None,
+    }
+}
+
+fn onchain_method(
+    network: BitcoinNetwork,
+    address: Option<String>,
+    silent_payment_pubkey: Option<String>,
+) -> PaymentMethod {
+    PaymentMethod::Onchain {
+        label: "BTC".into(),
+        network,
+        address,
+        silent_payment_pubkey,
+        pubkey_hint: None,
+        descriptor_hint: None,
+        address_list: vec![],
+    }
+}
+
+// Independent scoring oracle: use only the returned candidate's attributes and inputs.
+fn expected_score(
+    candidate: &RouteCandidate,
+    preferences: &RoutePreferences,
+    amount_sats: u64,
+    profile_preferences: &[String],
+) -> i64 {
+    let mut score = i64::from(candidate.reliability_score) * 10
+        + i64::from(candidate.privacy_score) * if preferences.prefer_privacy { 8 } else { 2 };
+    if preferences.prefer_speed {
+        score -= candidate.estimated_time_seconds.unwrap_or(3_600) as i64 / 30;
+    }
+    if preferences.prefer_low_fee {
+        score -= candidate.estimated_fee_sats.unwrap_or(10_000) as i64 / 10;
+    }
+    match candidate.rail {
+        PaymentRail::Lightning if amount_sats <= 1_000_000 => score += 30,
+        PaymentRail::Onchain if amount_sats >= 1_000_000 => score += 20,
+        PaymentRail::Ark if !preferences.allow_experimental_ark => score -= 1_000,
+        _ => {}
+    }
+    let rail_name = match candidate.rail {
+        PaymentRail::Lightning => "lightning",
+        PaymentRail::Onchain => "onchain",
+        PaymentRail::Ark => "ark",
+    };
+    if let Some(rank) = profile_preferences.iter().position(|p| p == rail_name) {
+        score += 50i64.saturating_sub(rank as i64 * 10);
+    }
+    score
+}
+
+fn corrupt_checksum(mut address: String) -> String {
+    let last = address.pop().expect("nonempty address");
+    address.push(if last == 'q' { 'p' } else { 'q' });
+    address
 }
 
 // ── Strategies ─────────────────────────────────────────────────────────────
@@ -73,12 +167,11 @@ fn arb_bitcoin_network() -> impl Strategy<Value = BitcoinNetwork> {
 }
 
 fn arb_onchain_address(network: BitcoinNetwork) -> impl Strategy<Value = Option<String>> {
-    let addr = match network {
-        BitcoinNetwork::Mainnet => "bc1q00000000000000000000000000000000000000",
-        BitcoinNetwork::Testnet => "tb1q00000000000000000000000000000000000000",
-        BitcoinNetwork::Regtest => "bcrt1q000000000000000000000000000000000000",
-    };
-    prop_oneof![Just(None), Just(Some(addr.to_string())),]
+    let sk = SecretKey::from_slice(&[1; 32]).expect("fixture key");
+    let pk = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+    let address = Address::p2wpkh(&CompressedPublicKey(pk), bitcoin_network(network)).to_string();
+    // Routing properties exercise method presence; validation is tested separately below.
+    prop_oneof![Just(None), Just(Some(address))]
 }
 
 fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
@@ -105,7 +198,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
             proptest::option::of("https://example.com/lnurl"),
             prop_oneof![
                 Just(Some(valid_blinded_bolt12_offer())),
-                Just(Some(valid_unblinded_bolt12_offer())),
+                Just(Some(valid_unblinded_bolt12_offer(None))),
                 proptest::option::of("lno1[a-z0-9]{20,50}"),
             ],
         )
@@ -138,7 +231,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
             "[a-zA-Z0-9_-]{1,16}",
             prop_oneof![
                 Just(valid_blinded_bolt12_offer()),
-                Just(valid_unblinded_bolt12_offer()),
+                Just(valid_unblinded_bolt12_offer(None)),
                 "lno1[a-z0-9]{20,50}".prop_map(|s| s),
             ],
             arb_bitcoin_network(),
@@ -165,27 +258,21 @@ fn arb_signed_profile() -> impl Strategy<Value = SignedPaymentProfile> {
         proptest::collection::vec(arb_payment_method(), 1..5),
         0i64..2_000_000_000i64,
         proptest::option::of(0u64..1_000_000u64),
+        proptest::collection::vec(
+            prop_oneof![
+                Just("lightning".into()),
+                Just("onchain".into()),
+                Just("ark".into())
+            ],
+            0..4,
+        ),
     )
-        .prop_map(|(sk, alias, methods, updated_at, sequence)| {
-            let secp = Secp256k1::new();
-            let pk = PublicKey::from_secret_key(&secp, &sk);
-            let profile = PaymentProfile {
-                alias,
-                identity_pubkey: hex::encode(pk.serialize()),
-                methods,
-                updated_at,
-                expires_at: None,
-                sequence,
-                preferences: vec!["lightning".into(), "onchain".into(), "ark".into()],
-                nonce: None,
-                rotation: None,
-                method_verifications: vec![],
-                hybrid_pubkey: None,
-                pqc_required: false,
-                revoked: false,
-                recovery_policy: None,
-                recovery: None,
-            };
+        .prop_map(|(sk, alias, methods, updated_at, sequence, preferences)| {
+            let mut profile = payment_profile(&sk, methods);
+            profile.alias = alias;
+            profile.updated_at = updated_at;
+            profile.sequence = sequence;
+            profile.preferences = preferences;
             sign_profile(profile, &sk).expect("profile signing")
         })
 }
@@ -283,6 +370,20 @@ proptest! {
                 prop_assert_eq!(d1, d2, "score_routes must return identical RouteDecision for identical inputs");
                 // Contract: selected candidate must be available
                 prop_assert!(d1.selected.available, "selected candidate must be marked available");
+                let fee_eligible = |candidate: &RouteCandidate| preferences.max_fee_sats
+                    .map(|max| candidate.estimated_fee_sats.unwrap_or(u64::MAX) <= max)
+                    .unwrap_or(true);
+                prop_assert!(fee_eligible(&d1.selected), "selected candidate must satisfy the fee limit");
+                let highest_score = std::iter::once(&d1.selected)
+                    .chain(d1.alternatives.iter())
+                    .filter(|candidate| candidate.available && fee_eligible(candidate))
+                    .map(|candidate| expected_score(candidate, &preferences, amount_sats, &signed_profile.profile.preferences))
+                    .max();
+                prop_assert_eq!(
+                    Some(expected_score(&d1.selected, &preferences, amount_sats, &signed_profile.profile.preferences)),
+                    highest_score,
+                    "selected candidate must have the highest score among eligible candidates"
+                );
                 // Contract: selected + alternatives is bounded by candidate methods count
                 let total_candidates = d1.alternatives.len() + 1;
                 prop_assert!(total_candidates <= signed_profile.profile.methods.len(), "candidates count bounded by methods count");
@@ -356,5 +457,126 @@ proptest! {
         prop_assert!(commercial >= normal, "commercial fee rate must be >= normal");
         prop_assert!(normal >= economy, "normal fee rate must be >= economy");
         prop_assert!(economy >= 1, "economy fee rate must be >= 1");
+    }
+
+    // Address validity is a validate_public_profile contract, separate from routing.
+    #[test]
+    fn test_public_profile_validates_bitcoin_network_and_address(
+        sk in arb_secret_key(),
+        network in arb_bitcoin_network(),
+    ) {
+        let pk = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+        let address = Address::p2wpkh(&CompressedPublicKey(pk), bitcoin_network(network)).to_string();
+        let mut profile = payment_profile(&sk, vec![onchain_method(network, Some(address.clone()), None)]);
+        prop_assert!(validate_public_profile(&profile).is_ok(), "valid Bitcoin address must pass");
+
+        let wrong_network = match network {
+            BitcoinNetwork::Mainnet => BitcoinNetwork::Testnet,
+            BitcoinNetwork::Testnet => BitcoinNetwork::Regtest,
+            BitcoinNetwork::Regtest => BitcoinNetwork::Mainnet,
+        };
+        profile.methods = vec![onchain_method(wrong_network, Some(address.clone()), None)];
+        prop_assert!(validate_public_profile(&profile).is_err(), "mismatched Bitcoin network must fail");
+
+        profile.methods = vec![onchain_method(network, Some(corrupt_checksum(address)), None)];
+        prop_assert!(validate_public_profile(&profile).is_err(), "malformed Bitcoin checksum must fail");
+    }
+
+    #[test]
+    fn test_public_profile_validates_bip352_network_and_payload(
+        network in arb_bitcoin_network(),
+        invalid_version in 1u8..=u8::MAX,
+        truncated_length in 0usize..67,
+    ) {
+        // Fixed public-key fixtures avoid accidental private-material keywords in encodings.
+        let scan_sk = SecretKey::from_slice(&[1; 32]).expect("scan fixture key");
+        let spend_sk = SecretKey::from_slice(&[2; 32]).expect("spend fixture key");
+        let secp = Secp256k1::new();
+        let scan_pk = PublicKey::from_secret_key(&secp, &scan_sk);
+        let spend_pk = PublicKey::from_secret_key(&secp, &spend_sk);
+        let address = create_silent_payment_address_for_network(&scan_pk, &spend_pk, bitcoin_network(network))
+            .expect("valid silent payment fixture");
+        let mut profile = payment_profile(&spend_sk, vec![onchain_method(network, None, Some(address.clone()))]);
+        prop_assert!(validate_public_profile(&profile).is_ok(), "valid BIP-352 address must pass");
+
+        // Testnet and regtest both use tsp; only crossing mainnet is a mismatch.
+        let wrong_network = if network == BitcoinNetwork::Mainnet {
+            BitcoinNetwork::Testnet
+        } else {
+            BitcoinNetwork::Mainnet
+        };
+        profile.methods = vec![onchain_method(wrong_network, None, Some(address.clone()))];
+        prop_assert!(validate_public_profile(&profile).is_err(), "mismatched BIP-352 network must fail");
+
+        let (hrp, data, _) = bech32::decode(&address).expect("decode fixture");
+        let payload = Vec::<u8>::from_base32(&data).expect("fixture payload");
+        // Re-encode malformed payloads with valid checksums so structural checks are exercised.
+        for case in 0..6 {
+            let mut malformed_payload = payload.clone();
+            let mut variant = bech32::Variant::Bech32m;
+            match case {
+                0 => variant = bech32::Variant::Bech32,
+                1 => malformed_payload.truncate(truncated_length),
+                2 => malformed_payload[0] = invalid_version,
+                3 => malformed_payload[1] = 4,
+                4 => malformed_payload[2..34].fill(0xff),
+                5 => malformed_payload[35..67].fill(0xff),
+                _ => unreachable!(),
+            }
+            let malformed = bech32::encode(&hrp, malformed_payload.to_base32(), variant).expect("encode malformed fixture");
+            profile.methods = vec![onchain_method(network, None, Some(malformed))];
+            prop_assert!(validate_public_profile(&profile).is_err(), "malformed BIP-352 case {} must fail", case);
+        }
+        profile.methods = vec![onchain_method(network, None, Some(corrupt_checksum(address)))];
+        prop_assert!(validate_public_profile(&profile).is_err(), "malformed BIP-352 checksum must fail");
+    }
+}
+
+#[test]
+fn test_bolt12_only_rejects_amount_below_encoded_minimum() {
+    let sk = SecretKey::from_slice(&[1; 32]).expect("fixture key");
+    let offer = valid_unblinded_bolt12_offer(Some(5_000));
+    let methods = [
+        PaymentMethod::Lightning {
+            label: "BOLT12 only".into(),
+            lightning_address: None,
+            lnurl: None,
+            bolt12: Some(offer.clone()),
+            receiver_pubkey: None,
+        },
+        PaymentMethod::Bolt12(Bolt12Offer {
+            label: "BOLT12 only".into(),
+            offer,
+            network: BitcoinNetwork::Mainnet,
+            // Leave metadata unset to test the minimum encoded in the offer itself.
+            minimum_amount_sats: None,
+            expires_at: None,
+            issuer_pubkey: hex::encode(
+                PublicKey::from_secret_key(&Secp256k1::new(), &sk).serialize(),
+            ),
+        }),
+    ];
+    for method in methods {
+        let mut req = RouteRequest {
+            alias: "alice@example.com".into(),
+            amount_sats: 4_999,
+            signed_profile: sign_profile(payment_profile(&sk, vec![method.clone()]), &sk)
+                .expect("sign fixture"),
+            urgency: PaymentUrgency::Normal,
+            max_fee_sats: None,
+            max_fee_percent: None,
+        };
+        let fees = FeeEstimate::default();
+        assert!(
+            select_route_with_fees(&req, &fees).is_err(),
+            "request below the encoded 5,000 sat minimum must be rejected"
+        );
+        req.amount_sats = 5_000;
+        assert_eq!(
+            select_route_with_fees(&req, &fees)
+                .expect("minimum amount is payable")
+                .selected_method,
+            method
+        );
     }
 }
