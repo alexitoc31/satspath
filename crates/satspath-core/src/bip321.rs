@@ -266,6 +266,7 @@ mod tests {
             .any(|i| matches!(i, Bip321Instruction::Bolt12Offer { offer } if offer == "a b")));
     }
 
+    /// Accept URIs at the 64 KiB limit and reject those one byte over it.
     #[test]
     fn enforces_uri_length_boundary() {
         let prefix = "bitcoin:?message=";
@@ -282,6 +283,7 @@ mod tests {
         ));
     }
 
+    /// Reject an oversized URI with the expected length-limit error.
     #[test]
     fn test_rejects_oversized_uri() {
         let huge_uri = format!(

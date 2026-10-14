@@ -140,6 +140,10 @@ fn validate_user_label(user: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an ASCII domain of at most 253 bytes with nonempty DNS labels.
+///
+/// Each label must be at most 63 bytes and contain only letters, digits, or
+/// hyphens, with no leading or trailing hyphen. At least two labels are required.
 fn validate_domain(domain: &str) -> Result<()> {
     if domain.len() > 253 {
         return Err(SatsPathError::Bip353("domain name too long (>253)".into()));
@@ -584,6 +588,7 @@ mod tests {
         );
     }
 
+    /// Reject names whose full BIP-353 query exceeds the DNS length limit.
     #[test]
     fn test_constructed_dns_name_too_long() {
         // Domain that is <= 253 bytes, but with user label and BIP353_LABEL exceeds 253

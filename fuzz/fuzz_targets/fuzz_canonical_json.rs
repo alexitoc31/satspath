@@ -3,6 +3,9 @@
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
 
+/// Return whether a JSON value contains a number outside its integer variants.
+///
+/// Recurses through arrays and objects to gate the integer-only idempotency check.
 fn has_float(v: &Value) -> bool {
     match v {
         Value::Number(n) => !n.is_i64() && !n.is_u64(),

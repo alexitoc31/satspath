@@ -130,6 +130,12 @@ pub fn write_tu64(mut val: u64) -> Vec<u8> {
     bytes
 }
 
+/// Decode consecutive bigsize type-length-value records from a byte stream.
+///
+/// # Errors
+/// Returns an error for truncated bigsize fields, lengths that do
+/// not fit in `usize`, or values longer than the remaining stream. Value lengths
+/// are checked before allocating their buffers.
 pub fn decode_tlv_stream(bytes: &[u8]) -> Result<Vec<TlvRecord>> {
     let mut cursor = Cursor::new(bytes);
     let mut records = Vec::new();
@@ -216,6 +222,12 @@ impl BlindedPath {
         Ok(buf)
     }
 
+    /// Decode a blinded path containing node IDs, a blinding point, and hops.
+    ///
+    /// # Errors
+    /// Returns an error for truncated fields, lengths that do not fit in
+    /// `usize`, more than 100 hops, or hop and payload lengths that exceed the remaining
+    /// bytes. Length checks precede hop and payload allocations.
     pub fn decode_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let mut intro = [0u8; 33];
@@ -1519,6 +1531,7 @@ mod tests {
         std::env::remove_var("SATSPATH_MOCK_BOLT12");
     }
 
+    /// Reject a TLV value length that exceeds the available payload bytes.
     #[test]
     fn test_decode_tlv_stream_bounds() {
         // Tag 1 (0x01), length 1000 (0xfd, 0x03, 0xe8), but stream only has 2 bytes payload
@@ -1527,6 +1540,7 @@ mod tests {
         assert!(err.to_string().contains("exceeds remaining stream bytes"));
     }
 
+    /// Reject a blinded path declaring more than the maximum 100 hops.
     #[test]
     fn test_blinded_path_bounds() {
         // Introduction node (33 bytes) + blinding point (33 bytes) = 66 bytes, then num_hops = 200 (excessive)
