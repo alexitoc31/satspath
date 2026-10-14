@@ -107,11 +107,18 @@ pub fn parse_bip353_name(input: &str) -> Result<Bip353Name> {
     validate_user_label(user)?;
     validate_domain(domain)?;
 
+    let dns_name = format!("{user}.{BIP353_LABEL}.{domain}");
+    if dns_name.len() > 253 {
+        return Err(SatsPathError::Bip353(
+            "constructed DNS query name too long (>253)".into(),
+        ));
+    }
+
     Ok(Bip353Name {
         user: user.to_string(),
         domain: domain.to_string(),
         display: format!("₿{user}@{domain}"),
-        dns_name: format!("{user}.{BIP353_LABEL}.{domain}"),
+        dns_name,
     })
 }
 
@@ -134,6 +141,9 @@ fn validate_user_label(user: &str) -> Result<()> {
 }
 
 fn validate_domain(domain: &str) -> Result<()> {
+    if domain.len() > 253 {
+        return Err(SatsPathError::Bip353("domain name too long (>253)".into()));
+    }
     if !domain.is_ascii() {
         return Err(SatsPathError::Bip353(
             "non-ASCII domain (punycode not supported)".into(),
@@ -207,9 +217,7 @@ where
 
 /// Reconstruct and validate the unique BIP-353 payment record without asserting
 /// DNSSEC validation or signed-profile authentication.
-pub(crate) fn validated_bitcoin_record(
-    records: &[DnsTxtRecord],
-) -> Result<(&DnsTxtRecord, String)> {
+pub fn validated_bitcoin_record(records: &[DnsTxtRecord]) -> Result<(&DnsTxtRecord, String)> {
     // Keep only TXT records that reconstruct to a `bitcoin:` URI. Each record is
     // reconstructed independently — never concatenate across records.
     let mut matching: Vec<&DnsTxtRecord> = Vec::new();
@@ -574,5 +582,17 @@ mod tests {
             extract_quoted_strings("\"bitcoin:?lno=lno1\" \"continued\""),
             vec!["bitcoin:?lno=lno1".to_string(), "continued".to_string()]
         );
+    }
+
+    #[test]
+    fn test_constructed_dns_name_too_long() {
+        // Domain that is <= 253 bytes, but with user label and BIP353_LABEL exceeds 253
+        let long_label = "a".repeat(60);
+        let domain = format!("{long_label}.{long_label}.{long_label}.com");
+        assert!(domain.len() <= 253);
+        let user = "a".repeat(60);
+        let input = format!("{user}@{domain}");
+        let err = parse_bip353_name(&input).unwrap_err();
+        assert!(matches!(err, SatsPathError::Bip353(msg) if msg.contains("too long")));
     }
 }

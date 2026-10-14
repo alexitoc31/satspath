@@ -54,12 +54,19 @@ pub struct ParsedBip321Uri {
     pub sp_profile_hash: Option<String>,
 }
 
+pub const MAX_BIP321_URI_BYTES: usize = 65_536;
+
 /// Parse a `bitcoin:` URI into structured BIP-321 instructions.
 ///
 /// # Errors
 /// - The URI does not begin with `bitcoin:`.
 /// - It carries an unsupported **required** (`req-*`) parameter.
 pub fn parse_bip321(uri: &str) -> Result<ParsedBip321Uri> {
+    if uri.len() > MAX_BIP321_URI_BYTES {
+        return Err(SatsPathError::InvalidPaymentUri(
+            "URI exceeds maximum allowed length (64KB)".into(),
+        ));
+    }
     let rest = uri.strip_prefix("bitcoin:").ok_or_else(|| {
         SatsPathError::InvalidPaymentUri("payment instruction must start with bitcoin:".into())
     })?;
@@ -257,5 +264,33 @@ mod tests {
             .instructions
             .iter()
             .any(|i| matches!(i, Bip321Instruction::Bolt12Offer { offer } if offer == "a b")));
+    }
+
+    #[test]
+    fn enforces_uri_length_boundary() {
+        let prefix = "bitcoin:?message=";
+        let at_limit = format!("{prefix}{}", "x".repeat(65_536 - prefix.len()));
+        assert_eq!(at_limit.len(), 65_536);
+        assert!(parse_bip321(&at_limit).is_ok());
+
+        let over_limit = format!("{prefix}{}", "x".repeat(65_537 - prefix.len()));
+        assert_eq!(over_limit.len(), 65_537);
+        assert!(matches!(
+            parse_bip321(&over_limit),
+            Err(SatsPathError::InvalidPaymentUri(message))
+                if message.contains("exceeds maximum allowed length")
+        ));
+    }
+
+    #[test]
+    fn test_rejects_oversized_uri() {
+        let huge_uri = format!(
+            "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?message={}",
+            "x".repeat(70_000)
+        );
+        let err = parse_bip321(&huge_uri).unwrap_err();
+        assert!(
+            matches!(err, SatsPathError::InvalidPaymentUri(msg) if msg.contains("exceeds maximum allowed length"))
+        );
     }
 }

@@ -135,7 +135,14 @@ pub fn decode_tlv_stream(bytes: &[u8]) -> Result<Vec<TlvRecord>> {
     let mut records = Vec::new();
     while (cursor.position() as usize) < bytes.len() {
         let tag = read_bigsize(&mut cursor)?;
-        let len = read_bigsize(&mut cursor)? as usize;
+        let len_raw = read_bigsize(&mut cursor)?;
+        let len = usize::try_from(len_raw).context("TLV record length does not fit in usize")?;
+        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
+        if len > remaining {
+            anyhow::bail!(
+                "TLV record value length ({len} bytes) exceeds remaining stream bytes ({remaining} bytes)"
+            );
+        }
         let mut val = vec![0u8; len];
         cursor.read_exact(&mut val).context("reading TLV value")?;
         records.push(TlvRecord { tag, value: val });
@@ -221,7 +228,17 @@ impl BlindedPath {
             .read_exact(&mut bp)
             .context("reading blinding point")?;
 
-        let num_hops = read_bigsize(&mut cursor)? as usize;
+        let num_hops_raw = read_bigsize(&mut cursor)?;
+        if num_hops_raw > 100 {
+            anyhow::bail!("excessive num_hops: {num_hops_raw} exceeds maximum 100");
+        }
+        let num_hops = usize::try_from(num_hops_raw).context("num_hops does not fit in usize")?;
+        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
+        if num_hops > remaining / 34 {
+            anyhow::bail!(
+                "invalid num_hops: {num_hops} requires more bytes than remaining ({remaining})"
+            );
+        }
         let mut hops = Vec::with_capacity(num_hops);
 
         for _ in 0..num_hops {
@@ -229,7 +246,15 @@ impl BlindedPath {
             cursor
                 .read_exact(&mut hop_node)
                 .context("reading blinded node ID")?;
-            let enc_len = read_bigsize(&mut cursor)? as usize;
+            let enc_len_raw = read_bigsize(&mut cursor)?;
+            let enc_len = usize::try_from(enc_len_raw)
+                .context("encrypted payload length does not fit in usize")?;
+            let remaining_enc = bytes.len().saturating_sub(cursor.position() as usize);
+            if enc_len > remaining_enc {
+                anyhow::bail!(
+                    "encrypted payload length ({enc_len} bytes) exceeds remaining bytes ({remaining_enc} bytes)"
+                );
+            }
             let mut enc_payload = vec![0u8; enc_len];
             cursor
                 .read_exact(&mut enc_payload)
@@ -1492,5 +1517,22 @@ mod tests {
         assert!(val_res.is_ok());
 
         std::env::remove_var("SATSPATH_MOCK_BOLT12");
+    }
+
+    #[test]
+    fn test_decode_tlv_stream_bounds() {
+        // Tag 1 (0x01), length 1000 (0xfd, 0x03, 0xe8), but stream only has 2 bytes payload
+        let truncated_tlv = vec![0x01, 0xfd, 0x03, 0xe8, 0xaa, 0xbb];
+        let err = decode_tlv_stream(&truncated_tlv).unwrap_err();
+        assert!(err.to_string().contains("exceeds remaining stream bytes"));
+    }
+
+    #[test]
+    fn test_blinded_path_bounds() {
+        // Introduction node (33 bytes) + blinding point (33 bytes) = 66 bytes, then num_hops = 200 (excessive)
+        let mut malformed_path = vec![0x02; 66];
+        malformed_path.push(200); // num_hops > 100
+        let err = BlindedPath::decode_bytes(&malformed_path).unwrap_err();
+        assert!(err.to_string().contains("excessive num_hops"));
     }
 }

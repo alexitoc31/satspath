@@ -1,0 +1,62 @@
+[package]
+name = "satspath-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+satspath-core = { path = "../crates/satspath-core" }
+satspath-router = { path = "../crates/satspath-router" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+canonical_json = "0.5"
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_bolt12"
+path = "fuzz_targets/fuzz_bolt12.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bip321"
+path = "fuzz_targets/fuzz_bip321.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bip353"
+path = "fuzz_targets/fuzz_bip353.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_canonical_json"
+path = "fuzz_targets/fuzz_canonical_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_profile_deser"
+path = "fuzz_targets/fuzz_profile_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ownership_proof"
+path = "fuzz_targets/fuzz_ownership_proof.rs"
+test = false
+doc = false
+bench = false
