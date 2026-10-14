@@ -58,6 +58,10 @@ jobs:
       - name: Install cargo-fuzz
         run: which cargo-fuzz || cargo install cargo-fuzz --version 0.13.2 --locked
 
+      - name: Install coverage tools for BOLT12
+        if: matrix.target == 'fuzz_bolt12'
+        run: rustup component add llvm-tools-preview
+
       - name: Run fuzzing target (${{ matrix.target }})
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -68,7 +72,25 @@ jobs:
           if [ "$EVENT_NAME" = "schedule" ]; then
             MAX_TIME=900
           fi
-          cargo fuzz run "$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
+          if [ "$FUZZ_TARGET" = "fuzz_bolt12" ]; then
+            cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
+          else
+            cargo fuzz run "$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
+          fi
+
+      - name: Collect BOLT12 corpus coverage
+        if: matrix.target == 'fuzz_bolt12'
+        run: cargo fuzz coverage --target-dir fuzz/target/coverage fuzz_bolt12 fuzz/corpus/fuzz_bolt12
+
+      - name: Upload BOLT12 coverage
+        if: matrix.target == 'fuzz_bolt12'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: fuzz-coverage-fuzz_bolt12
+          path: |
+            fuzz/coverage/fuzz_bolt12
+            fuzz/target/coverage/*/release/fuzz_bolt12
+          if-no-files-found: error
 
       - name: Upload crash artifacts on failure
         if: failure()

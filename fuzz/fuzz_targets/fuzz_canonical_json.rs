@@ -18,15 +18,14 @@ fn has_float(v: &Value) -> bool {
 fuzz_target!(|data: &[u8]| {
     if let Ok(value) = serde_json::from_slice::<Value>(data) {
         if let Ok(canonical1) = canonical_json::to_string(&value) {
-            let _ = canonical1.len();
+            let value2 = serde_json::from_str::<Value>(&canonical1)
+                .expect("canonical_json produced invalid JSON");
             if !has_float(&value) {
-                if let Ok(value2) = serde_json::from_str::<Value>(&canonical1) {
-                    if let Ok(canonical2) = canonical_json::to_string(&value2) {
-                        assert_eq!(
-                            canonical1, canonical2,
-                            "canonical_json idempotency violation"
-                        );
-                    }
+                if let Ok(canonical2) = canonical_json::to_string(&value2) {
+                    assert_eq!(
+                        canonical1, canonical2,
+                        "canonical_json idempotency violation"
+                    );
                 }
             }
         }

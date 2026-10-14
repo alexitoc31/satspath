@@ -1,4 +1,7 @@
 target
-corpus
+corpus/*
+!corpus/fuzz_bolt12/
+corpus/fuzz_bolt12/*
+!corpus/fuzz_bolt12/seed-*
 artifacts
 coverage
