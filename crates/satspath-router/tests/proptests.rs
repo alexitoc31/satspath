@@ -1,4 +1,4 @@
-use bech32::{FromBase32, ToBase32};
+use bech32::ToBase32;
 use bitcoin::{Address, CompressedPublicKey, Network};
 use proptest::prelude::*;
 use satspath_core::crypto::sign_profile;
@@ -16,7 +16,9 @@ use satspath_router::router::{select_route_with_fees, RouteRequest};
 use satspath_router::scoring::{
     score_routes, FeeSnapshot, PaymentRail, RouteCandidate, RoutePreferences,
 };
-use satspath_router::silent_payments::create_silent_payment_address_for_network;
+use satspath_router::silent_payments::{
+    create_silent_payment_address_for_network, parse_silent_payment_address,
+};
 use satspath_router::urgency::PaymentUrgency;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
@@ -148,6 +150,12 @@ fn corrupt_checksum(mut address: String) -> String {
     let last = address.pop().expect("nonempty address");
     address.push(if last == 'q' { 'p' } else { 'q' });
     address
+}
+
+fn bip352_data(version: u8, payload: &[u8]) -> Vec<bech32::u5> {
+    let mut data = vec![bech32::u5::try_from_u8(version).expect("5-bit version")];
+    data.extend(payload.to_base32());
+    data
 }
 
 // ── Strategies ─────────────────────────────────────────────────────────────
@@ -485,8 +493,8 @@ proptest! {
     #[test]
     fn test_public_profile_validates_bip352_network_and_payload(
         network in arb_bitcoin_network(),
-        invalid_version in 1u8..=u8::MAX,
-        truncated_length in 0usize..67,
+        truncated_length in 0usize..66,
+        extra_length in 1usize..32,
     ) {
         // Fixed public-key fixtures avoid accidental private-material keywords in encodings.
         let scan_sk = SecretKey::from_slice(&[1; 32]).expect("scan fixture key");
@@ -494,8 +502,16 @@ proptest! {
         let secp = Secp256k1::new();
         let scan_pk = PublicKey::from_secret_key(&secp, &scan_sk);
         let spend_pk = PublicKey::from_secret_key(&secp, &spend_sk);
-        let address = create_silent_payment_address_for_network(&scan_pk, &spend_pk, bitcoin_network(network))
+        // Independently construct BIP-352's 5-bit version followed by the
+        // Base32 conversion of the 66-byte compressed public-key pair.
+        let hrp = if network == BitcoinNetwork::Mainnet { "sp" } else { "tsp" };
+        let payload = [scan_pk.serialize(), spend_pk.serialize()].concat();
+        let data = bip352_data(0, &payload);
+        let address = bech32::encode(hrp, &data, bech32::Variant::Bech32m)
             .expect("valid silent payment fixture");
+        prop_assert_eq!(address.len(), if hrp == "sp" { 116 } else { 117 });
+        prop_assert_eq!(create_silent_payment_address_for_network(&scan_pk, &spend_pk, bitcoin_network(network))
+            .expect("encode fixture"), address.clone());
         let mut profile = payment_profile(&spend_sk, vec![onchain_method(network, None, Some(address.clone()))]);
         prop_assert!(validate_public_profile(&profile).is_ok(), "valid BIP-352 address must pass");
 
@@ -508,22 +524,51 @@ proptest! {
         profile.methods = vec![onchain_method(wrong_network, None, Some(address.clone()))];
         prop_assert!(validate_public_profile(&profile).is_err(), "mismatched BIP-352 network must fail");
 
-        let (hrp, data, _) = bech32::decode(&address).expect("decode fixture");
-        let payload = Vec::<u8>::from_base32(&data).expect("fixture payload");
+        // Mutate the actual first 5-bit value, preserving the key payload.
+        for version in 1..=31 {
+            let mut versioned_data = data.clone();
+            versioned_data[0] = bech32::u5::try_from_u8(version).expect("5-bit version");
+            let versioned = bech32::encode(hrp, &versioned_data, bech32::Variant::Bech32m)
+                .expect("encode versioned fixture");
+            let parsed = parse_silent_payment_address(&versioned);
+            prop_assert_eq!(parsed.is_ok(), version < 31);
+            if let Ok((scan, spend, _)) = parsed {
+                prop_assert_eq!((scan, spend), (scan_pk, spend_pk));
+            }
+            profile.methods = vec![onchain_method(network, None, Some(versioned))];
+            prop_assert_eq!(validate_public_profile(&profile).is_ok(), version < 31,
+                "BIP-352 version {} compatibility", version);
+
+            // Versions 1–30 permit additional data after the key pair.
+            let mut extended_payload = payload.clone();
+            extended_payload.resize(payload.len() + extra_length, 0);
+            let extended = bech32::encode(hrp, bip352_data(version, &extended_payload), bech32::Variant::Bech32m)
+                .expect("encode extended fixture");
+            let parsed = parse_silent_payment_address(&extended);
+            prop_assert_eq!(parsed.is_ok(), version < 31);
+            if let Ok((scan, spend, _)) = parsed {
+                prop_assert_eq!((scan, spend), (scan_pk, spend_pk));
+            }
+            profile.methods = vec![onchain_method(network, None, Some(extended))];
+            prop_assert_eq!(validate_public_profile(&profile).is_ok(), version < 31,
+                "BIP-352 version {} with extra data", version);
+        }
+
         // Re-encode malformed payloads with valid checksums so structural checks are exercised.
-        for case in 0..6 {
+        for case in 0..7 {
             let mut malformed_payload = payload.clone();
             let mut variant = bech32::Variant::Bech32m;
             match case {
                 0 => variant = bech32::Variant::Bech32,
                 1 => malformed_payload.truncate(truncated_length),
-                2 => malformed_payload[0] = invalid_version,
-                3 => malformed_payload[1] = 4,
-                4 => malformed_payload[2..34].fill(0xff),
-                5 => malformed_payload[35..67].fill(0xff),
+                2 => malformed_payload.resize(payload.len() + extra_length, 0),
+                3 => malformed_payload[0] = 4,
+                4 => malformed_payload[1..33].fill(0xff),
+                5 => malformed_payload[34..66].fill(0xff),
+                6 => malformed_payload[33] = 4,
                 _ => unreachable!(),
             }
-            let malformed = bech32::encode(&hrp, malformed_payload.to_base32(), variant).expect("encode malformed fixture");
+            let malformed = bech32::encode(hrp, bip352_data(0, &malformed_payload), variant).expect("encode malformed fixture");
             profile.methods = vec![onchain_method(network, None, Some(malformed))];
             prop_assert!(validate_public_profile(&profile).is_err(), "malformed BIP-352 case {} must fail", case);
         }
