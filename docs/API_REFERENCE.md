@@ -59,11 +59,11 @@ A production deployment must not expose cleartext HTTP. See
 ### Host header allow-list
 
 Requests normally require exactly one trusted `Host` header before routing.
-Internal `/metrics` scrapes are an exception: when the parsed `Host` is
-`satspathd`, the router may allow the request even if the normal allow-list
-check fails. Loopback binds accept `localhost` and loopback IP literals. For a
-DNS name (proxy or native TLS), set
-`SATSPATH_AUTHORITY_DOMAIN=node.example.com` or
+Requests to `/metrics` are an exception when the parsed `Host` is `satspathd`:
+the router may allow them even if the normal Host allow-list check fails. This
+Host-based exception does not restrict `/metrics` to internal callers. Loopback
+binds accept `localhost` and loopback IP literals. For a DNS name (proxy or
+native TLS), set `SATSPATH_AUTHORITY_DOMAIN=node.example.com` or
 `SATSPATH_AUTHORITY_URL=https://node.example.com/v2`. Missing, duplicate,
 malformed, or untrusted hosts on other requests receive
 `400 {"error":"untrusted HTTP Host"}`.
@@ -118,7 +118,7 @@ Checks run in this order; the first failure wins.
 
 | Order | Check | Response |
 | :--- | :--- | :--- |
-| 1 | `Host` allow-list (except internal `/metrics` scrapes) | `400` `{"error":"untrusted HTTP Host"}` |
+| 1 | `Host` allow-list (except `/metrics` with parsed `Host: satspathd`) | `400` `{"error":"untrusted HTTP Host"}` |
 | 2 | Declared `Content-Length` over limit | `413` `{"error":"...","max_bytes":65536}` |
 | 3 | Per-IP token bucket (burst 60, refill 10/s) | `429` with `Retry-After` header and `{"error":"...","retry_after":N}` |
 | 4 | Bearer token (protected routes) | `401` `{"error":"Unauthorized: ..."}` |
