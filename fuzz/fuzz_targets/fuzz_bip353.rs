@@ -1,6 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use satspath_core::bip321::parse_bip321;
 use satspath_core::bip353::{validated_bitcoin_record, DnsTxtRecord};
 
 fuzz_target!(|data: &[u8]| {
@@ -19,6 +20,7 @@ fuzz_target!(|data: &[u8]| {
         let expected = record.reconstruct();
         if let Ok((_, uri)) = validated_bitcoin_record(&[record]) {
             assert_eq!(uri, expected);
+            assert!(parse_bip321(&uri).is_ok());
         }
 
         // Fuzz multiple records
@@ -32,6 +34,7 @@ fuzz_target!(|data: &[u8]| {
             .collect();
         if let Ok((_, uri)) = validated_bitcoin_record(&records) {
             assert!(uri.starts_with("bitcoin:"));
+            assert!(parse_bip321(&uri).is_ok());
         }
     }
 });

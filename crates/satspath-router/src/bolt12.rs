@@ -671,6 +671,9 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
     }
 
     let (hrp, data, _) = bech32::decode(trimmed).context("invalid BOLT12 offer bech32")?;
+    if !matches!(hrp.as_str(), "lno" | "lnot" | "lnob" | "lnos") {
+        anyhow::bail!("invalid BOLT12 offer HRP: {hrp}");
+    }
     let raw = Vec::<u8>::from_base32(&data).context("invalid BOLT12 offer base32")?;
     let records = decode_tlv_stream(&raw).context("invalid BOLT12 offer TLV stream")?;
 
@@ -1292,7 +1295,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_bolt12_offer_valid() {
+    fn test_parse_bolt12_offer_hrps() {
         let raw = encode_tlv_stream(&[TlvRecord {
             tag: TLV_OFFER_NODE_ID,
             value: hex::decode(
@@ -1300,9 +1303,16 @@ mod tests {
             )
             .unwrap(),
         }]);
-        let offer = bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).unwrap();
-        let result = parse_bolt12_offer(&offer);
-        assert!(result.is_ok());
+        for hrp in ["lno", "lnot", "lnob", "lnos"] {
+            let offer = bech32::encode(hrp, raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+            assert!(parse_bolt12_offer(&offer).is_ok(), "HRP: {hrp}");
+
+            let invalid_hrp = format!("{hrp}1other");
+            let offer =
+                bech32::encode(&invalid_hrp, raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+            let err = parse_bolt12_offer(&offer).unwrap_err();
+            assert!(err.to_string().contains("invalid BOLT12 offer HRP"));
+        }
     }
 
     #[test]
