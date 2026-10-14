@@ -31,6 +31,12 @@ pub fn validate_url(url: &str, allow_http: bool) -> Result<()> {
     let parsed = url::Url::parse(url)
         .map_err(|e| SatsPathError::ValidationError(format!("Invalid URL: {e}")))?;
 
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err(SatsPathError::ValidationError(
+            "URL credentials and fragments are forbidden".into(),
+        ));
+    }
+
     // ── Scheme ────────────────────────────────────────────────────────────
     match parsed.scheme() {
         "https" => {}

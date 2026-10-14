@@ -25,6 +25,7 @@ pub async fn cmd_quote_json(alias: &str, amount_sats: u64) -> Result<()> {
     Ok(())
 }
 
+/// Verify that cmd quote.
 pub async fn cmd_quote(alias: &str, amount_sats: u64) -> Result<()> {
     let resolver = get_resolver()?;
 
@@ -142,6 +143,7 @@ pub async fn cmd_quote(alias: &str, amount_sats: u64) -> Result<()> {
             }
         }
         PaymentMethod::Onchain {
+            network,
             address,
             silent_payment_pubkey,
             ..
@@ -149,7 +151,7 @@ pub async fn cmd_quote(alias: &str, amount_sats: u64) -> Result<()> {
             let target = silent_payment_pubkey
                 .clone()
                 .unwrap_or_else(|| address.clone().unwrap_or_default());
-            let uri = bitcoin_uri(&target, amount_sats);
+            let uri = bitcoin_uri(&target, amount_sats, *network)?;
             println!("  Scan to pay — Bitcoin on-chain ({} sats)", amount_sats);
             println!("  ─────────────────────────────────────────");
             print_qr(&uri)?;

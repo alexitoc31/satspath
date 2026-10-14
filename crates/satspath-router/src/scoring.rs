@@ -61,16 +61,21 @@ pub struct RouteDecision {
     pub explanation: String,
 }
 
+/// Score only validated methods and select an available route within the fee limit.
 pub fn score_routes(
     amount_sats: u64,
     profile: &SignedPaymentProfile,
     fee_snapshot: &FeeSnapshot,
     preferences: &RoutePreferences,
 ) -> Result<RouteDecision> {
+    satspath_core::validation::validate_amount_sats(amount_sats)?;
     let mut candidates = Vec::new();
     let mut pointers = Vec::new();
 
     for method in &profile.profile.methods {
+        if satspath_core::handoff::validate_method(method, amount_sats).is_err() {
+            continue;
+        }
         match method {
             PaymentMethod::Lightning {
                 lightning_address,

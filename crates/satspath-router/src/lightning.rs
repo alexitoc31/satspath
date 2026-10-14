@@ -20,6 +20,9 @@ pub fn is_lightning_available(method: &PaymentMethod) -> bool {
 /// Check if Lightning is available for a specific amount by checking LNURL min_sendable.
 /// Returns true if the amount is >= min_sendable (or if no LNURL to check).
 pub async fn is_lightning_available_for_amount(method: &PaymentMethod, amount_sats: u64) -> bool {
+    if satspath_core::handoff::validate_method(method, amount_sats).is_err() {
+        return false;
+    }
     match method {
         PaymentMethod::Lightning {
             lightning_address: Some(addr),
@@ -46,26 +49,16 @@ pub async fn is_lightning_available_for_amount(method: &PaymentMethod, amount_sa
         PaymentMethod::Lightning {
             bolt12: Some(offer_str),
             ..
-        } => {
-            if let Ok(offer) = crate::bolt12::parse_bolt12_offer(offer_str) {
-                if !offer.is_amount_valid(amount_sats * 1_000) {
-                    return false;
-                }
-            }
-            true
-        }
+        } => crate::bolt12::parse_bolt12_offer(offer_str)
+            .is_ok_and(|offer| offer.is_amount_valid(amount_sats * 1_000)),
         PaymentMethod::Bolt12(offer_data) => {
             if let Some(min_sats) = offer_data.minimum_amount_sats {
                 if amount_sats < min_sats {
                     return false;
                 }
             }
-            if let Ok(offer) = crate::bolt12::parse_bolt12_offer(&offer_data.offer) {
-                if !offer.is_amount_valid(amount_sats * 1_000) {
-                    return false;
-                }
-            }
-            true
+            crate::bolt12::parse_bolt12_offer(&offer_data.offer)
+                .is_ok_and(|offer| offer.is_amount_valid(amount_sats * 1_000))
         }
         _ => false,
     }
@@ -83,6 +76,9 @@ pub fn lightning_address(method: &PaymentMethod) -> Option<&str> {
 /// Check if Lightning is available for a specific amount (synchronous version).
 /// Uses a default minimum of 1000 sats (1,000,000 msats) if LNURL metadata unavailable.
 pub fn is_lightning_available_for_amount_sync(method: &PaymentMethod, amount_sats: u64) -> bool {
+    if satspath_core::handoff::validate_method(method, amount_sats).is_err() {
+        return false;
+    }
     const DEFAULT_MIN_SENDABLE_MSATS: u64 = 1_000_000; // 1000 sats
     match method {
         PaymentMethod::Lightning {
@@ -100,26 +96,16 @@ pub fn is_lightning_available_for_amount_sync(method: &PaymentMethod, amount_sat
         PaymentMethod::Lightning {
             bolt12: Some(offer_str),
             ..
-        } => {
-            if let Ok(offer) = crate::bolt12::parse_bolt12_offer(offer_str) {
-                if !offer.is_amount_valid(amount_sats * 1_000) {
-                    return false;
-                }
-            }
-            true
-        }
+        } => crate::bolt12::parse_bolt12_offer(offer_str)
+            .is_ok_and(|offer| offer.is_amount_valid(amount_sats * 1_000)),
         PaymentMethod::Bolt12(offer_data) => {
             if let Some(min_sats) = offer_data.minimum_amount_sats {
                 if amount_sats < min_sats {
                     return false;
                 }
             }
-            if let Ok(offer) = crate::bolt12::parse_bolt12_offer(&offer_data.offer) {
-                if !offer.is_amount_valid(amount_sats * 1_000) {
-                    return false;
-                }
-            }
-            true
+            crate::bolt12::parse_bolt12_offer(&offer_data.offer)
+                .is_ok_and(|offer| offer.is_amount_valid(amount_sats * 1_000))
         }
         _ => false,
     }
@@ -187,9 +173,8 @@ pub async fn fetch_lnurl_metadata(lightning_address: &str) -> anyhow::Result<Lnu
         domain,
         parts[0].trim()
     );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let client = satspath_core::outbound::http_client(std::time::Duration::from_secs(10));
+    satspath_core::outbound::validate_request_url(&url)?;
     let meta = client
         .get(&url)
         .send()
@@ -216,6 +201,7 @@ pub async fn fetch_invoice(
     amount_sats: u64,
     comment: Option<&str>,
 ) -> anyhow::Result<String> {
+    satspath_core::validation::validate_amount_sats(amount_sats)?;
     let amount_msats = amount_sats * 1_000;
     if amount_msats < meta.min_sendable {
         anyhow::bail!(
@@ -242,9 +228,8 @@ pub async fn fetch_invoice(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let client = satspath_core::outbound::http_client(std::time::Duration::from_secs(10));
+    satspath_core::outbound::validate_request_url(&url)?;
     let raw_body = client.get(&url).send().await?.text().await?;
     let resp: LnurlInvoiceResponse = serde_json::from_str(&raw_body)
         .map_err(|e| anyhow::anyhow!("failed to parse LNURL callback response: {e}"))?;
@@ -284,6 +269,12 @@ pub fn validate_bolt11_invoice(
     let invoice = Bolt11Invoice::from_str(bolt11)
         .map_err(|e| anyhow::anyhow!("failed to parse BOLT11 invoice: {e:?}"))?;
 
+    if expected_msats == 0
+        || expected_msats > satspath_core::validation::MAX_PREVIEW_AMOUNT_SATS * 1000
+        || invoice.network() != bitcoin::Network::Bitcoin
+    {
+        anyhow::bail!("invoice network or amount is invalid");
+    }
     // LNURL-02: verify amount matches
     let invoice_msats = invoice
         .amount_milli_satoshis()

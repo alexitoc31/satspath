@@ -18,6 +18,7 @@ use satspath_router::scoring::{
 };
 use satspath_router::urgency::PaymentUrgency;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use std::str::FromStr;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -93,6 +94,7 @@ fn payment_profile(sk: &SecretKey, methods: Vec<PaymentMethod>) -> PaymentProfil
     }
 }
 
+/// Sign a deterministic request with the fixture identity key.
 fn route_request(amount_sats: u64, methods: Vec<PaymentMethod>) -> RouteRequest {
     let sk = SecretKey::from_slice(&[1u8; 32]).expect("fixture identity key");
     let profile = payment_profile(&sk, methods);
@@ -106,6 +108,7 @@ fn route_request(amount_sats: u64, methods: Vec<PaymentMethod>) -> RouteRequest 
     }
 }
 
+/// Provide a Lightning Address for route boundary tests.
 fn lightning_method() -> PaymentMethod {
     PaymentMethod::Lightning {
         label: "Lightning".into(),
@@ -116,9 +119,11 @@ fn lightning_method() -> PaymentMethod {
     }
 }
 
+/// Provide a mainnet payment address derived solely from public key material.
 fn onchain_method() -> PaymentMethod {
-    let sk = SecretKey::from_slice(&[1u8; 32]).expect("fixture address key");
-    let pk = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+    let pk =
+        PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .expect("fixed public payment key");
     PaymentMethod::Onchain {
         label: "Bitcoin".into(),
         network: BitcoinNetwork::Mainnet,
@@ -130,6 +135,7 @@ fn onchain_method() -> PaymentMethod {
     }
 }
 
+/// Provide a public Ark receiver for routing tests.
 fn ark_method() -> PaymentMethod {
     PaymentMethod::Ark {
         label: "Ark".into(),
@@ -142,6 +148,7 @@ fn ark_method() -> PaymentMethod {
     }
 }
 
+/// Provide fee rates below the on-chain routing threshold.
 fn low_fees() -> FeeEstimate {
     FeeEstimate {
         fastest_fee: 5,
@@ -425,9 +432,9 @@ proptest! {
         }
     }
 
-    /// Below the offer minimum, select a later usable method; at the minimum, select the offer.
+    /// Prototype offers remain unavailable even when their declared minimum is met.
     #[test]
-    fn test_select_route_bolt12_minimum_amount_boundary(minimum in 1_001u64..100_000u64) {
+    fn test_prototype_offer_is_unavailable_at_minimum_amount_boundary(minimum in 1_001u64..100_000u64) {
         let offer = valid_unblinded_bolt12_offer();
         let bolt12 = PaymentMethod::Bolt12(Bolt12Offer {
             label: "Minimum amount offer".into(),
@@ -440,19 +447,15 @@ proptest! {
         let fallback = lightning_method();
         let mut req = route_request(minimum - 1, vec![bolt12.clone(), fallback.clone()]);
         let below = select_route_with_fees(&req, &low_fees()).expect("fallback below offer minimum");
-        prop_assert_eq!(below.selected_method, fallback);
+        prop_assert_eq!(&below.selected_method, &fallback);
         prop_assert!(
             matches!(below.swap_directive, SwapDirective::LightningPayment { .. }),
             "fallback must use a direct Lightning payment"
         );
         req.amount_sats = minimum;
         let at = select_route_with_fees(&req, &low_fees()).expect("offer at minimum");
-        prop_assert_eq!(at.selected_method, bolt12);
-        prop_assert_eq!(at.swap_directive, SwapDirective::Bolt12Payment {
-            offer,
-            target_invoice: None,
-            has_blinded_paths: false,
-        });
+        prop_assert_eq!(at.selected_method, fallback);
+        prop_assert!(!satspath_router::lightning::is_lightning_available_for_amount_sync(&bolt12, minimum));
     }
 
     // ── 1. Route Scoring Determinism & Contract Invariants ─────────────────
@@ -572,6 +575,7 @@ proptest! {
 }
 
 #[test]
+/// Verify that empty profiles return no route at amount boundaries.
 fn test_empty_profiles_return_no_route_at_amount_boundaries() {
     for amount in [0, 1, 999, 1_000, 99_999, 100_000] {
         let req = route_request(amount, vec![]);
@@ -582,16 +586,17 @@ fn test_empty_profiles_return_no_route_at_amount_boundaries() {
                 &FeeSnapshot::default(),
                 &RoutePreferences::default()
             ),
-            Err(SatsPathError::NoRouteFound(_))
+            Err(SatsPathError::NoRouteFound(_) | SatsPathError::InvalidPaymentPointer(_))
         ));
         assert!(matches!(
             select_route_with_fees(&req, &low_fees()),
-            Err(SatsPathError::NoRouteFound(_))
+            Err(SatsPathError::NoRouteFound(_) | SatsPathError::InvalidPaymentPointer(_))
         ));
     }
 }
 
 #[test]
+/// Verify that score routes onchain dust boundary and missing fees.
 fn test_score_routes_onchain_dust_boundary_and_missing_fees() {
     let req = route_request(546, vec![onchain_method()]);
     let fees = FeeSnapshot {
@@ -619,6 +624,7 @@ fn test_score_routes_onchain_dust_boundary_and_missing_fees() {
 }
 
 #[test]
+/// Verify that score routes pointer matches method after skipped candidate.
 fn test_score_routes_pointer_matches_method_after_skipped_candidate() {
     let unavailable = PaymentMethod::Lightning {
         label: "No pointer".into(),
@@ -652,6 +658,7 @@ fn test_score_routes_pointer_matches_method_after_skipped_candidate() {
 }
 
 #[test]
+/// Verify that select route lightning amount thresholds.
 fn test_select_route_lightning_amount_thresholds() {
     let lightning = lightning_method();
     let onchain = onchain_method();
@@ -685,6 +692,7 @@ fn test_select_route_lightning_amount_thresholds() {
 }
 
 #[test]
+/// Verify that select route urgency changes onchain and ark choice.
 fn test_select_route_urgency_changes_onchain_and_ark_choice() {
     let onchain = onchain_method();
     let ark = ark_method();
@@ -712,13 +720,15 @@ fn test_select_route_urgency_changes_onchain_and_ark_choice() {
     }
 }
 
+/// Prototype offer encodings must never be handed to wallets as valid BOLT12.
 #[test]
-fn test_bolt12_fixture_privacy_and_directives_for_both_method_variants() {
-    for (offer, blinded, privacy) in [
-        (valid_blinded_bolt12_offer(), true, 9),
-        (valid_unblinded_bolt12_offer(), false, 8),
+fn test_prototype_offers_rejected_for_both_method_variants() {
+    for offer in [
+        valid_blinded_bolt12_offer(),
+        valid_unblinded_bolt12_offer(),
+        "lno1malformed".into(),
     ] {
-        let methods = [
+        for method in [
             PaymentMethod::Lightning {
                 label: "Embedded offer".into(),
                 lightning_address: None,
@@ -735,34 +745,81 @@ fn test_bolt12_fixture_privacy_and_directives_for_both_method_variants() {
                 issuer_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
                     .into(),
             }),
-        ];
-        for method in methods {
+        ] {
             let req = route_request(10_000, vec![method.clone()]);
-            let decision = score_routes(
+            assert!(score_routes(
                 req.amount_sats,
                 &req.signed_profile,
                 &FeeSnapshot::default(),
-                &RoutePreferences::default(),
+                &RoutePreferences::default()
             )
-            .expect("score offer fixture");
-            assert_eq!(decision.selected.rail, PaymentRail::Lightning);
-            assert_eq!(decision.selected.privacy_score, privacy);
-            assert_eq!(
-                decision.payment_pointer,
-                PaymentPointer::Bolt12Offer {
-                    offer: offer.clone()
-                }
-            );
-            let quote = select_route_with_fees(&req, &low_fees()).expect("select offer fixture");
-            assert_eq!(quote.selected_method, method);
-            assert_eq!(
-                quote.swap_directive,
-                SwapDirective::Bolt12Payment {
-                    offer: offer.clone(),
-                    target_invoice: None,
-                    has_blinded_paths: blinded,
-                }
-            );
+            .is_err());
+            assert!(select_route_with_fees(&req, &low_fees()).is_err());
+            assert!(satspath_router::build_qr_payload(&method, req.amount_sats).is_err());
         }
     }
+}
+
+/// Every native entry point rejects malformed, wrong-network, expired, or unsupported receivers.
+#[tokio::test]
+async fn invalid_methods_never_reach_wallet_handoff() {
+    let mut wrong_network = onchain_method();
+    if let PaymentMethod::Onchain { network, .. } = &mut wrong_network {
+        *network = BitcoinNetwork::Testnet;
+    }
+    let mut invalid_address = onchain_method();
+    if let PaymentMethod::Onchain { address, .. } = &mut invalid_address {
+        *address = Some("bc1invalid".into());
+    }
+    let mut expired_ark = ark_method();
+    if let PaymentMethod::Ark { expires_at, .. } = &mut expired_ark {
+        *expires_at = Some(1);
+    }
+    let mut invalid_ark_key = ark_method();
+    if let PaymentMethod::Ark { pubkey, .. } = &mut invalid_ark_key {
+        *pubkey = "00".repeat(33);
+    }
+    let mut insecure_ark = ark_method();
+    if let PaymentMethod::Ark { server, .. } = &mut insecure_ark {
+        *server = "http://example.com".into();
+    }
+    for method in [
+        wrong_network,
+        invalid_address,
+        expired_ark,
+        invalid_ark_key,
+        insecure_ark,
+    ] {
+        let req = route_request(10_000, vec![method.clone()]);
+        let prefs = RoutePreferences {
+            allow_experimental_ark: true,
+            ..RoutePreferences::default()
+        };
+        assert!(score_routes(
+            req.amount_sats,
+            &req.signed_profile,
+            &FeeSnapshot {
+                onchain_fastest_sat_vb: Some(1),
+                ..FeeSnapshot::default()
+            },
+            &prefs
+        )
+        .is_err());
+        assert!(select_route_with_fees(&req, &low_fees()).is_err());
+        assert!(satspath_router::build_qr_payload(&method, req.amount_sats).is_err());
+    }
+    for amount in [0, u64::MAX] {
+        let req = route_request(amount, vec![lightning_method()]);
+        assert!(satspath_router::select_route(&req).await.is_err());
+        assert!(satspath_router::build_qr_payload(&lightning_method(), amount).is_err());
+    }
+    let method = PaymentMethod::Lightning {
+        label: "bad invoice".into(),
+        lightning_address: None,
+        lnurl: None,
+        bolt12: Some("lnbc1bad".into()),
+        receiver_pubkey: None,
+    };
+    assert!(!satspath_router::lightning::is_lightning_available_for_amount(&method, 1000).await);
+    assert!(!satspath_router::lightning::is_lightning_available_for_amount_sync(&method, 1000));
 }

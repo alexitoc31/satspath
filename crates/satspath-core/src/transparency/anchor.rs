@@ -67,6 +67,7 @@ pub struct RegtestAnchorClient {
 
 #[cfg(feature = "std")]
 impl RegtestAnchorClient {
+    /// Build an explicitly enabled local regtest RPC client from operator configuration.
     pub fn from_env() -> crate::Result<Self> {
         let network = std::env::var("SATSPATH_BITCOIN_NETWORK").unwrap_or_default();
         if network != "regtest" {
@@ -79,12 +80,30 @@ impl RegtestAnchorClient {
             std::env::var(name)
                 .map_err(|_| crate::SatsPathError::ValidationError(format!("missing {name}")))
         };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|e| crate::SatsPathError::NetworkError(e.to_string()))?;
+        let rpc_url = required("SATSPATH_BITCOIN_RPC_URL")?;
+        // Regtest is an operator-configured local service, never a profile URL.
+        // Require a literal loopback address: no DNS or rebinding is possible.
+        let parsed = url::Url::parse(&rpc_url)
+            .map_err(|e| crate::SatsPathError::ValidationError(e.to_string()))?;
+        let loopback = parsed
+            .host_str()
+            .and_then(|host| {
+                host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|ip| ip.is_loopback());
+        if !loopback
+            || !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(crate::SatsPathError::ValidationError("regtest RPC requires a literal loopback HTTP(S) URL without credentials or fragment".into()));
+        }
+        let client = crate::outbound::http_client(std::time::Duration::from_secs(15));
         Ok(Self {
-            rpc_url: required("SATSPATH_BITCOIN_RPC_URL")?,
+            rpc_url,
             rpc_user: required("SATSPATH_BITCOIN_RPC_USER")?,
             rpc_password: required("SATSPATH_BITCOIN_RPC_PASSWORD")?,
             client,

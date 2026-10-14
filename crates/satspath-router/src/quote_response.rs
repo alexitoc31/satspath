@@ -169,6 +169,7 @@ pub async fn quote_verified_profile(
 /// - **Ark** — an Ark pointer: `ark:<pubkey>?server=…&amount=…`
 ///   (preview only; execution is gated elsewhere behind explicit testnet flags).
 pub fn build_qr_payload(method: &PaymentMethod, amount_sats: u64) -> satspath_core::Result<String> {
+    satspath_core::handoff::validate_method(method, amount_sats)?;
     let payload = match method {
         PaymentMethod::Lightning {
             lightning_address,
@@ -674,12 +675,13 @@ mod tests {
 
     // 13: on-chain QR is a BIP-21 URI.
     #[test]
+    /// Verify that qr payload onchain is bip21.
     fn qr_payload_onchain_is_bip21() {
-        let method = onchain_method("bc1qexampleaddr00000000000000000000000000");
+        let method = onchain_method("1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
         let qr = build_qr_payload(&method, 21_000).unwrap();
         assert_eq!(
             qr,
-            "bitcoin:bc1qexampleaddr00000000000000000000000000?amount=0.00021000"
+            "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00021000"
         );
     }
 

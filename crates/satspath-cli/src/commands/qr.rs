@@ -16,7 +16,22 @@ pub fn print_qr(data: &str) -> Result<()> {
 }
 
 /// BIP-21 Bitcoin URI: `bitcoin:<address>?amount=<btc>`
-pub fn bitcoin_uri(address: &str, amount_sats: u64) -> String {
-    let btc = amount_sats as f64 / 100_000_000.0;
-    format!("bitcoin:{}?amount={:.8}", address, btc)
+pub fn bitcoin_uri(
+    address: &str,
+    amount_sats: u64,
+    network: satspath_core::BitcoinNetwork,
+) -> Result<String> {
+    satspath_core::pointer::build_qr_payload(
+        &satspath_core::PaymentPointer::OnchainAddress {
+            network,
+            address: address.into(),
+            claim_policy: None,
+        },
+        amount_sats,
+    )?;
+    Ok(format!(
+        "bitcoin:{address}?amount={}.{:08}",
+        amount_sats / 100_000_000,
+        amount_sats % 100_000_000
+    ))
 }

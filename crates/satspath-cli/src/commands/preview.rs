@@ -237,12 +237,14 @@ fn invalid_profile_response(
     })
 }
 
+/// Build a preview only after validating the selected receiver and amount.
 async fn method_preview(
     quote: &RouteQuote,
     amount_sats: u64,
     fetch_lnurl_invoice: bool,
     ownership: &str,
 ) -> Result<(SelectedMethodResponse, String, Vec<String>)> {
+    satspath_core::handoff::validate_method(&quote.selected_method, amount_sats)?;
     match &quote.selected_method {
         PaymentMethod::Lightning {
             label,
@@ -318,7 +320,7 @@ async fn method_preview(
                 .unwrap_or_else(|| address.clone().unwrap_or_default());
             validate_bitcoin_address(&target, BitcoinNetwork::Mainnet)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let qr = bitcoin_uri(&target, amount_sats);
+            let qr = bitcoin_uri(&target, amount_sats, *network)?;
             Ok((
                 SelectedMethodResponse::Onchain {
                     label: label.clone(),

@@ -130,12 +130,16 @@ pub fn write_tu64(mut val: u64) -> Vec<u8> {
     bytes
 }
 
+/// Decode a TLV stream without allocating beyond the supplied input.
 pub fn decode_tlv_stream(bytes: &[u8]) -> Result<Vec<TlvRecord>> {
     let mut cursor = Cursor::new(bytes);
     let mut records = Vec::new();
     while (cursor.position() as usize) < bytes.len() {
         let tag = read_bigsize(&mut cursor)?;
-        let len = read_bigsize(&mut cursor)? as usize;
+        let len = usize::try_from(read_bigsize(&mut cursor)?).context("TLV length overflow")?;
+        if len > bytes.len().saturating_sub(cursor.position() as usize) {
+            anyhow::bail!("TLV length exceeds remaining input");
+        }
         let mut val = vec![0u8; len];
         cursor.read_exact(&mut val).context("reading TLV value")?;
         records.push(TlvRecord { tag, value: val });
@@ -622,72 +626,9 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
         ));
     }
 
-    let (hrp, data, _) = match bech32::decode(trimmed) {
-        Ok(res) => res,
-        Err(_) => {
-            // Fallback for short mock strings in simple tests (e.g. "lno1pq...")
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
-
-    let raw = match Vec::<u8>::from_base32(&data) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
-
-    let records = match decode_tlv_stream(&raw) {
-        Ok(recs) => recs,
-        Err(_) => {
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
+    let (hrp, data, _) = bech32::decode(trimmed).context("invalid prototype offer encoding")?;
+    let raw = Vec::<u8>::from_base32(&data).context("invalid prototype offer padding")?;
+    let records = decode_tlv_stream(&raw).context("invalid prototype offer TLV")?;
 
     let mut description = None;
     let mut amount_msats = None;
@@ -1302,10 +1243,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_bolt12_offer_valid() {
+    /// Verify that parse bolt12 offer rejects malformed encoding.
+    fn test_parse_bolt12_offer_rejects_malformed_encoding() {
         let offer = "lno1pq...";
         let result = parse_bolt12_offer(offer);
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]

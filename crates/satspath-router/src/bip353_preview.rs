@@ -31,6 +31,15 @@ pub fn quote_from_bip353_resolution(
         }
     };
 
+    if let Err(error) = parsed.validate_handoff(
+        amount_sats,
+        bitcoin::Network::Bitcoin,
+        chrono::Utc::now().timestamp().max(0) as u64,
+    ) {
+        return QuoteResponse::NoRoute {
+            reason: error.to_string(),
+        };
+    }
     let recipient = QuoteRecipient {
         alias: resolution.name.display.clone(),
         // Backward compatibility: for direct BIP-353 previews, `verified`
@@ -112,7 +121,21 @@ pub fn quote_from_bip353_resolution(
              Mainnet preview only — no funds moved."
         ),
         // The authoritative payable is the BIP-353 bitcoin: URI itself.
-        qr: resolution.bitcoin_uri.clone(),
+        qr: if parsed.amount_btc.is_some() {
+            resolution.bitcoin_uri.clone()
+        } else {
+            format!(
+                "{}{}amount={}.{:08}",
+                resolution.bitcoin_uri,
+                if resolution.bitcoin_uri.contains('?') {
+                    "&"
+                } else {
+                    "?"
+                },
+                amount_sats / 100_000_000,
+                amount_sats % 100_000_000
+            )
+        },
         execution: None,
         wallet_hint: None,
     }
@@ -159,35 +182,22 @@ mod tests {
     }
 
     #[test]
-    fn bip353_bolt12_maps_to_ok_quote() {
+    /// Verify that bip353 bolt12 requires protocol validation.
+    fn bip353_bolt12_requires_protocol_validation() {
         let res = resolution("bitcoin:?lno=lno1qoffer", true);
-        let quote = quote_from_bip353_resolution(&res, 1000);
-        match quote {
-            QuoteResponse::Ok {
-                recipient,
-                selected_method,
-                qr,
-                ..
-            } => {
-                assert_eq!(recipient.alias, "₿rodrigo@satspath.dev");
-                assert!(recipient.verified); // DNSSEC validated
-                assert!(recipient.fingerprint.is_none());
-                assert!(matches!(
-                    selected_method,
-                    PaymentMethod::Lightning {
-                        bolt12: Some(_),
-                        ..
-                    }
-                ));
-                assert_eq!(qr, "bitcoin:?lno=lno1qoffer");
-            }
-            other => panic!("expected Ok, got {}", other.status()),
-        }
+        assert!(matches!(
+            quote_from_bip353_resolution(&res, 1000),
+            QuoteResponse::NoRoute { .. }
+        ));
     }
 
     #[test]
+    /// Verify that bip353 onchain maps to onchain method.
     fn bip353_onchain_maps_to_onchain_method() {
-        let res = resolution("bitcoin:bc1qaddr?amount=0.00001000", true);
+        let res = resolution(
+            "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00001000",
+            true,
+        );
         let quote = quote_from_bip353_resolution(&res, 1000);
         match quote {
             QuoteResponse::Ok {
@@ -196,15 +206,19 @@ mod tests {
                 ..
             } => {
                 assert!(matches!(selected_method, PaymentMethod::Onchain { .. }));
-                assert_eq!(qr, "bitcoin:bc1qaddr?amount=0.00001000");
+                assert_eq!(
+                    qr,
+                    "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00001000"
+                );
             }
             other => panic!("expected Ok, got {}", other.status()),
         }
     }
 
     #[test]
+    /// Verify that bip353 unvalidated dnssec marks recipient unverified.
     fn bip353_unvalidated_dnssec_marks_recipient_unverified() {
-        let res = resolution("bitcoin:?lno=lno1qoffer", false);
+        let res = resolution("bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT", false);
         let quote = quote_from_bip353_resolution(&res, 1000);
         if let QuoteResponse::Ok { recipient, .. } = quote {
             assert!(!recipient.verified);

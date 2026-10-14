@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/satspath-handoff",
     "crates/satspath-core",
     "crates/satspath-router",
     "crates/satspath-cli",

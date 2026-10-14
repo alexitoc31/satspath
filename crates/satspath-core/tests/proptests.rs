@@ -638,6 +638,7 @@ proptest! {
 }
 
 #[test]
+/// Verify that inclusion proof public exports handle singleton tree.
 fn test_inclusion_proof_public_exports_handle_singleton_tree() {
     let leaf = leaf_hash(b"only leaf");
     let proof = satspath_core::inclusion_proof(&[leaf], 0).expect("crate-root export");
@@ -651,6 +652,7 @@ fn test_inclusion_proof_public_exports_handle_singleton_tree() {
 }
 
 #[test]
+/// Verify that inclusion proof public exports reject invalid indices.
 fn test_inclusion_proof_public_exports_reject_invalid_indices() {
     let leaves = [leaf_hash(b"a"), leaf_hash(b"b")];
     for (tree, index) in [
@@ -671,6 +673,7 @@ fn test_inclusion_proof_public_exports_reject_invalid_indices() {
 }
 
 #[test]
+/// Verify that inclusion proof paths for three leaf tree.
 fn test_inclusion_proof_paths_for_three_leaf_tree() {
     let leaves = [leaf_hash(b"a"), leaf_hash(b"b"), leaf_hash(b"c")];
     // RFC 6962 splits this tree into a two-leaf left subtree and one right leaf.
@@ -693,6 +696,7 @@ fn test_inclusion_proof_paths_for_three_leaf_tree() {
 }
 
 #[test]
+/// Verify that inclusion proof duplicate leaves at tree size boundaries.
 fn test_inclusion_proof_duplicate_leaves_at_tree_size_boundaries() {
     for size in [1, 2, 3, 7, 8, 9, 63, 64, 65] {
         let leaves = vec![leaf_hash(b"repeated leaf"); size];
@@ -709,6 +713,7 @@ fn test_inclusion_proof_duplicate_leaves_at_tree_size_boundaries() {
 }
 
 #[test]
+/// Verify that canonical json preserves unicode escapes and integer limits.
 fn test_canonical_json_preserves_unicode_escapes_and_integer_limits() {
     let value = serde_json::json!({
         "unicode": "\u{1f680} e\u{301} \u{e9}",
@@ -724,6 +729,7 @@ fn test_canonical_json_preserves_unicode_escapes_and_integer_limits() {
 }
 
 #[test]
+/// Verify that ssrf port boundaries on public host.
 fn test_ssrf_port_boundaries_on_public_host() {
     for port in [80, 443, 8080, 8443] {
         assert!(validate_url(&format!("https://example.com:{port}/profile"), false).is_ok());
@@ -740,6 +746,7 @@ fn test_ssrf_port_boundaries_on_public_host() {
 }
 
 #[test]
+/// Verify that ssrf blocked hostnames with case and trailing dot.
 fn test_ssrf_blocked_hostnames_with_case_and_trailing_dot() {
     for host in [
         "LOCALHOST.",
@@ -757,6 +764,7 @@ fn test_ssrf_blocked_hostnames_with_case_and_trailing_dot() {
 }
 
 #[test]
+/// Verify that ssrf allows public ipv4 and embedded ipv6 addresses.
 fn test_ssrf_allows_public_ipv4_and_embedded_ipv6_addresses() {
     // Positive controls prevent a reject-everything policy from satisfying the SSRF properties.
     for literal in [

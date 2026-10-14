@@ -7,8 +7,8 @@ use satspath_router::bolt12::{
     parse_bolt12_invoice_request, validate_bolt12_invoice_against_offer, BlindedHop, BlindedPath,
     Bolt12Offer,
 };
-use satspath_router::scoring::{score_routes, FeeSnapshot, PaymentRail, RoutePreferences};
-use satspath_router::{select_route, PaymentUrgency, RouteRequest, SwapDirective};
+use satspath_router::scoring::{score_routes, FeeSnapshot, RoutePreferences};
+use satspath_router::{select_route, PaymentUrgency, RouteRequest};
 use secp256k1::rand::RngCore;
 
 fn generate_key() -> secp256k1::SecretKey {
@@ -150,7 +150,8 @@ fn test_bolt12_offer_to_invoice_request_to_invoice_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_bolt12_routing_selection_and_directive() {
+/// Verify that bolt12 routing rejects undecoded offer.
+async fn test_bolt12_routing_rejects_undecoded_offer() {
     let offer_str = "lno1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
     let method = PaymentMethod::Bolt12(CoreBolt12Offer {
         label: "Primary BOLT12".to_string(),
@@ -171,19 +172,12 @@ async fn test_bolt12_routing_selection_and_directive() {
         max_fee_percent: None,
     };
 
-    let quote = select_route(&req).await.unwrap();
-    assert_eq!(quote.selected_method, method);
-    assert!(matches!(
-        quote.swap_directive,
-        SwapDirective::Bolt12Payment {
-            ref offer,
-            ..
-        } if offer == offer_str
-    ));
+    assert!(select_route(&req).await.is_err());
 }
 
 #[test]
-fn test_bolt12_scoring_blinded_path_privacy_bonus() {
+/// Verify that bolt12 scoring rejects undecoded offer.
+fn test_bolt12_scoring_rejects_undecoded_offer() {
     let intro_node = "02".to_string() + &"aa".repeat(32);
     let hop_node = "03".to_string() + &"bb".repeat(32);
 
@@ -227,8 +221,5 @@ fn test_bolt12_scoring_blinded_path_privacy_bonus() {
     let fee_snap = FeeSnapshot::default();
     let prefs = RoutePreferences::default();
 
-    let decision = score_routes(25_000, &profile, &fee_snap, &prefs).unwrap();
-    assert_eq!(decision.selected.rail, PaymentRail::Lightning);
-    // Privacy score receives bonus (score = 9 for blinded paths vs 7 for standard)
-    assert!(decision.selected.privacy_score >= 8);
+    assert!(score_routes(25_000, &profile, &fee_snap, &prefs).is_err());
 }

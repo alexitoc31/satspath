@@ -1,12 +1,17 @@
 use async_trait::async_trait;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::dns::Resolve;
+#[cfg(test)]
+use reqwest::dns::{Addrs, Name, Resolving};
 use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::crypto::{check_profile_expiry, verify_signed_profile};
+#[cfg(test)]
+use crate::outbound::ValidatingDnsResolver;
+use crate::outbound::{http_client_with_resolver, SystemDnsResolver};
 use crate::resolver::ProfileResolver;
-use crate::ssrf::{is_private_or_reserved_ip, validate_url};
+use crate::ssrf::validate_url;
 use crate::{Result, SatsPathError, SignedPaymentProfile};
 
 /// Resolves a profile by making an HTTP GET request to the domain of the alias.
@@ -25,60 +30,16 @@ pub struct HttpResolver {
     client: Client,
 }
 
-struct SystemDnsResolver;
-
-impl Resolve for SystemDnsResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        Box::pin(async move {
-            let addrs: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
-            Ok(Box::new(addrs.into_iter()) as Addrs)
-        })
-    }
-}
-
-/// Validate the exact DNS answers passed to the HTTP connector, without a second lookup.
-struct ValidatingDnsResolver(Arc<dyn Resolve>);
-
-impl Resolve for ValidatingDnsResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        // Match resolve_from_url's explicit localhost exemption for mock servers.
-        let allow_loopback =
-            cfg!(any(test, feature = "test-utils")) && name.as_str() == "localhost";
-        let resolving = self.0.resolve(name);
-        Box::pin(async move {
-            let addrs: Vec<_> = resolving.await?.collect();
-            for addr in &addrs {
-                if is_private_or_reserved_ip(addr.ip())
-                    && !(allow_loopback && addr.ip().is_loopback())
-                {
-                    return Err(SatsPathError::ValidationError(format!(
-                        "Blocked IP: {} (private/reserved DNS answer)",
-                        addr.ip()
-                    ))
-                    .into());
-                }
-            }
-            Ok(Box::new(addrs.into_iter()) as Addrs)
-        })
-    }
-}
-
 impl HttpResolver {
+    /// Construct the resolver with its configured transport policy.
     pub fn new() -> Self {
         Self::with_dns_resolver(Arc::new(SystemDnsResolver))
     }
 
+    /// Build a resolver with injectable DNS for controlled connection tests.
     fn with_dns_resolver<R: Resolve + 'static>(resolver: Arc<R>) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                // Disallow redirects to prevent open redirect → SSRF chains
-                .redirect(reqwest::redirect::Policy::none())
-                // Proxies can resolve destinations without using our resolver.
-                .no_proxy()
-                .dns_resolver(Arc::new(ValidatingDnsResolver(resolver)))
-                .build()
-                .expect("failed to build SSRF-protected HTTP client"),
+            client: http_client_with_resolver(Duration::from_secs(10), resolver),
         }
     }
 
@@ -210,6 +171,7 @@ mod tests {
     }
 
     impl StubResolver {
+        /// Return the supplied socket addresses and track DNS lookup calls.
         fn new(addrs: Vec<std::net::SocketAddr>) -> Self {
             Self {
                 addrs,
@@ -219,6 +181,7 @@ mod tests {
     }
 
     impl Resolve for StubResolver {
+        /// Resolve the hostname at the connector boundary.
         fn resolve(&self, name: Name) -> Resolving {
             assert_eq!(name.as_str(), "profile.example");
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -228,6 +191,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verify that hostname resolving to private ip is rejected before connect.
     async fn hostname_resolving_to_private_ip_is_rejected_before_connect() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -248,6 +212,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verify that dns resolver rejects disallowed and mixed answers.
     async fn dns_resolver_rejects_disallowed_and_mixed_answers() {
         let public = "8.8.8.8:0".parse().unwrap();
         for blocked in [
@@ -277,6 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verify that dns resolver preserves public answers.
     async fn dns_resolver_preserves_public_answers() {
         let addrs = vec![
             "8.8.8.8:0".parse().unwrap(),

@@ -573,7 +573,7 @@ pub fn create_silent_payment_address(
 
 /// Create a silent payment address for a specific network:
 /// Mainnet uses HRP "sp", Testnet/Signet/Regtest use HRP "tsp".
-/// Payload: 1 byte version (0x00) || 33 bytes scan pubkey || 33 bytes spend pubkey (67 bytes total)
+/// Payload: one five-bit version followed by the base32 encoding of two compressed keys.
 pub fn create_silent_payment_address_for_network(
     scan_pubkey: &PublicKey,
     spend_pubkey: &PublicKey,
@@ -585,12 +585,13 @@ pub fn create_silent_payment_address_for_network(
         _ => "tsp",
     };
 
-    let mut payload = Vec::with_capacity(67);
-    payload.push(0x00); // BIP-352 version 0
+    let mut payload = Vec::with_capacity(66);
     payload.extend_from_slice(&scan_pubkey.serialize());
     payload.extend_from_slice(&spend_pubkey.serialize());
 
-    let encoded = bech32::encode(hrp, payload.to_base32(), Variant::Bech32m)
+    let mut data = vec![bech32::u5::try_from_u8(0)?];
+    data.extend(payload.to_base32());
+    let encoded = bech32::encode(hrp, data, Variant::Bech32m)
         .map_err(|e| anyhow!("Failed to encode silent payment address: {e}"))?;
 
     Ok(encoded)
@@ -612,7 +613,7 @@ pub fn parse_silent_payment_address(
     }
 
     let (hrp, data, variant) =
-        bech32::decode(&lower).map_err(|e| anyhow!("Failed to decode bech32 address: {e}"))?;
+        bech32::decode(trimmed).map_err(|e| anyhow!("Failed to decode bech32 address: {e}"))?;
 
     if variant != Variant::Bech32m {
         return Err(anyhow!(
@@ -626,26 +627,22 @@ pub fn parse_silent_payment_address(
         other => return Err(anyhow!("Unknown silent payment HRP: {other}")),
     };
 
-    let bytes =
-        Vec::<u8>::from_base32(&data).map_err(|e| anyhow!("Failed to convert base32 data: {e}"))?;
+    if data.first().map(|v| v.to_u8()) != Some(0) {
+        return Err(anyhow!("Unsupported silent payment address version"));
+    }
+    let bytes = Vec::<u8>::from_base32(&data[1..])
+        .map_err(|e| anyhow!("Failed to convert base32 data: {e}"))?;
 
-    if bytes.len() != 67 {
+    if bytes.len() != 66 {
         return Err(anyhow!(
-            "Invalid silent payment address payload length: expected 67 bytes, got {}",
+            "Invalid silent payment address payload length: expected 66 bytes, got {}",
             bytes.len()
         ));
     }
 
-    if bytes[0] != 0 {
-        return Err(anyhow!(
-            "Unsupported silent payment address version: {}",
-            bytes[0]
-        ));
-    }
-
-    let scan_pubkey = PublicKey::from_slice(&bytes[1..34])
+    let scan_pubkey = PublicKey::from_slice(&bytes[..33])
         .map_err(|e| anyhow!("Invalid scan public key in address: {e}"))?;
-    let spend_pubkey = PublicKey::from_slice(&bytes[34..67])
+    let spend_pubkey = PublicKey::from_slice(&bytes[33..])
         .map_err(|e| anyhow!("Invalid spend public key in address: {e}"))?;
 
     Ok((scan_pubkey, spend_pubkey, network))

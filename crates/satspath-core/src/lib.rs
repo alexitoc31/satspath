@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod dns;
 pub mod errors;
 pub mod execution;
+pub mod handoff;
 pub mod ownership;
 pub mod peer_registry;
 pub mod platform;
@@ -21,6 +22,8 @@ pub mod split;
 pub mod transparency;
 pub mod validation;
 
+#[cfg(feature = "std")]
+pub mod outbound;
 #[cfg(feature = "std")]
 pub mod resolver;
 #[cfg(feature = "std")]

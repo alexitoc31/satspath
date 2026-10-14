@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::outbound::{connect_relay, http_client, validate_relay_url};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::crypto::{check_profile_expiry, verify_signed_profile};
 use crate::peer_registry::canonicalize_identifier;
@@ -57,12 +58,10 @@ impl Default for NostrResolver {
 }
 
 impl NostrResolver {
+    /// Construct the resolver with its configured transport policy.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(6))
-                .build()
-                .unwrap_or_default(),
+            client: http_client(Duration::from_secs(6)),
             fallback_relays: env_relays().unwrap_or_else(|| {
                 DEFAULT_RELAYS
                     .iter()
@@ -72,22 +71,22 @@ impl NostrResolver {
         }
     }
 
+    /// Use the supplied fallback relays with the protected HTTP client.
     pub fn with_relays(relays: Vec<String>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(6))
-                .build()
-                .unwrap_or_default(),
+            client: http_client(Duration::from_secs(6)),
             fallback_relays: relays,
         }
     }
 
+    /// Resolve and validate the NIP-05 identity and relay hints.
     async fn resolve_nip05(&self, alias: &str) -> Result<Nip05Resolution> {
         let canonical = canonicalize_identifier(alias);
         let (name, domain) = canonical
             .split_once('@')
             .ok_or_else(|| SatsPathError::AliasNotFound(alias.to_string()))?;
         let url = format!("https://{domain}/.well-known/nostr.json?name={name}");
+        crate::ssrf::validate_url(&url, false)?;
         let document: Nip05Document = self
             .client
             .get(&url)
@@ -112,24 +111,7 @@ impl NostrResolver {
         if relays.is_empty() {
             relays = self.fallback_relays.clone();
         }
-        relays.retain(|relay| {
-            let (http_url, allow_http) = if let Some(stripped) = relay.strip_prefix("wss://") {
-                (format!("https://{stripped}"), false)
-            } else if let Some(stripped) = relay.strip_prefix("ws://") {
-                (format!("http://{stripped}"), true)
-            } else {
-                return false;
-            };
-            #[cfg(not(test))]
-            {
-                crate::ssrf::validate_url(&http_url, allow_http).is_ok()
-            }
-            #[cfg(test)]
-            {
-                let _ = (http_url, allow_http);
-                true
-            }
-        });
+        relays.retain(|relay| validate_relay_url(relay).is_ok());
         relays.truncate(8);
         if relays.is_empty() {
             return Err(SatsPathError::NetworkError(
@@ -140,6 +122,7 @@ impl NostrResolver {
         Ok(Nip05Resolution { pubkey, relays })
     }
 
+    /// Fetch a signed profile over a validated, pinned relay connection.
     async fn query_relay(
         &self,
         relay: &str,
@@ -161,7 +144,7 @@ impl NostrResolver {
         ]);
 
         let relay_result = timeout(NOSTR_TIMEOUT, async {
-            let (mut ws, _) = connect_async(relay)
+            let (mut ws, _) = connect_relay(relay)
                 .await
                 .map_err(|e| SatsPathError::NetworkError(format!("Nostr relay connect: {e}")))?;
             ws.send(Message::Text(req.to_string().into()))
@@ -407,7 +390,7 @@ pub async fn publish_profile(
 
     for relay in relays_to_use {
         let Ok(Ok((mut ws, _))) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(relay)).await
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_relay(relay)).await
         else {
             continue;
         };

@@ -46,6 +46,7 @@ pub enum PaymentPointer {
 }
 
 impl PaymentPointer {
+    /// Return the human-readable rail name for a payment pointer.
     pub fn rail_name(&self) -> &'static str {
         match self {
             PaymentPointer::LightningAddress { .. } => "Lightning Address",
@@ -58,8 +59,50 @@ impl PaymentPointer {
     }
 }
 
+/// Validate a direct pointer before it becomes a wallet payload.
+fn validate_handoff(pointer: &PaymentPointer, sats: u64) -> Result<()> {
+    use satspath_handoff as check;
+    let now = chrono::Utc::now().timestamp();
+    let result = match pointer {
+        PaymentPointer::LightningAddress { address, .. } => check::lightning_address(address),
+        PaymentPointer::LnurlPay { callback_url, .. } => check::https(callback_url),
+        PaymentPointer::Bolt11Invoice { invoice, .. } => {
+            check::bolt11(invoice, sats, bitcoin::Network::Bitcoin, now.max(0) as u64)
+        }
+        PaymentPointer::Bolt12Offer { offer } => check::bolt12(offer),
+        PaymentPointer::OnchainAddress {
+            network, address, ..
+        } => {
+            let network = match network {
+                BitcoinNetwork::Mainnet => bitcoin::Network::Bitcoin,
+                BitcoinNetwork::Testnet => bitcoin::Network::Testnet,
+                BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
+            };
+            if address.to_ascii_lowercase().starts_with("sp1")
+                || address.to_ascii_lowercase().starts_with("tsp1")
+            {
+                check::silent(address, network)
+            } else {
+                check::onchain(address, network)
+            }
+        }
+        PaymentPointer::Ark {
+            server,
+            receiver_pubkey,
+            vtxo_pointer,
+        } => {
+            let key = hex::decode(receiver_pubkey)
+                .map_err(|e| SatsPathError::InvalidPublicKey(e.to_string()))?;
+            check::ark(server, &key, vtxo_pointer.as_deref(), None, None, now)
+        }
+    };
+    result.map_err(SatsPathError::InvalidPaymentPointer)
+}
+
+/// Build a validated public wallet payload for a positive amount.
 pub fn build_qr_payload(pointer: &PaymentPointer, amount_sats: u64) -> Result<String> {
     validate_amount_sats(amount_sats)?;
+    validate_handoff(pointer, amount_sats)?;
 
     let payload = match pointer {
         PaymentPointer::LightningAddress { address, .. } => {
@@ -131,13 +174,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qr_payload_for_bolt11_returns_invoice() {
+    /// Verify that qr payload for bolt11 rejects malformed invoice.
+    fn qr_payload_for_bolt11_rejects_malformed_invoice() {
         let invoice = "lnbc210n1pexampleinvoice".to_string();
         let pointer = PaymentPointer::Bolt11Invoice {
             invoice: invoice.clone(),
             amount_sats: Some(21_000),
         };
-        assert_eq!(build_qr_payload(&pointer, 21_000).unwrap(), invoice);
+        assert!(build_qr_payload(&pointer, 21_000).is_err());
     }
 
     #[test]

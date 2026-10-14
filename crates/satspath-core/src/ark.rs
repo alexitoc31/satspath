@@ -99,12 +99,32 @@ pub fn validate_arkade_opaque_uri(uri: &str) -> Result<()> {
 /// Build a QR/URI payload for an [`ArkadePointer`].
 ///
 /// - `ServerPubkey`  → `ark:<pubkey>?server=…&amount=…`
-/// - `VtxoPointer`   → `ark:<vtxo>?server=…&amount=…`
-/// - `OpaqueUri`     → the URI itself (prefixed with `ark:` if not already)
 ///
+/// Opaque URIs and VTXO pointers are rejected until protocol decoding is available.
 /// The resulting payload is always checked for private material.
 pub fn build_arkade_qr(pointer: &ArkadePointer, amount_sats: u64) -> Result<String> {
     use url::form_urlencoded;
+    crate::validation::validate_amount_sats(amount_sats)?;
+    match pointer {
+        ArkadePointer::ServerPubkey { server, pubkey } => {
+            let key =
+                hex::decode(pubkey).map_err(|e| SatsPathError::InvalidPublicKey(e.to_string()))?;
+            satspath_handoff::ark(
+                server,
+                &key,
+                None,
+                None,
+                None,
+                chrono::Utc::now().timestamp(),
+            )
+            .map_err(SatsPathError::InvalidPaymentPointer)?;
+        }
+        _ => {
+            return Err(SatsPathError::InvalidPaymentPointer(
+                "opaque Ark URI/VTXO handoff requires protocol validation".into(),
+            ))
+        }
+    }
     let payload = match pointer {
         ArkadePointer::ServerPubkey { server, pubkey } => {
             let mut enc = form_urlencoded::Serializer::new(String::new());
@@ -469,21 +489,21 @@ mod tests {
     }
 
     #[test]
-    fn build_arkade_qr_opaque_prefixes_ark_scheme() {
+    /// Verify that build arkade qr rejects unvalidated opaque address.
+    fn build_arkade_qr_rejects_unvalidated_opaque_address() {
         let pointer = ArkadePointer::OpaqueUri {
             uri: "ark1qexampleaddress".into(),
         };
-        let qr = build_arkade_qr(&pointer, 21_000).unwrap();
-        assert_eq!(qr, "ark:ark1qexampleaddress");
+        assert!(build_arkade_qr(&pointer, 21_000).is_err());
     }
 
     #[test]
-    fn build_arkade_qr_opaque_preserves_existing_ark_scheme() {
+    /// Verify that build arkade qr rejects unvalidated opaque uri.
+    fn build_arkade_qr_rejects_unvalidated_opaque_uri() {
         let pointer = ArkadePointer::OpaqueUri {
             uri: "ark:ark1qexampleaddress".into(),
         };
-        let qr = build_arkade_qr(&pointer, 21_000).unwrap();
-        assert_eq!(qr, "ark:ark1qexampleaddress");
+        assert!(build_arkade_qr(&pointer, 21_000).is_err());
     }
 
     #[test]
@@ -501,15 +521,13 @@ mod tests {
     }
 
     #[test]
-    fn build_arkade_qr_vtxo_pointer_returns_ark_uri() {
+    /// Verify that build arkade qr rejects unvalidated vtxo.
+    fn build_arkade_qr_rejects_unvalidated_vtxo() {
         let pointer = ArkadePointer::VtxoPointer {
             server: "https://ark.example.com".into(),
             vtxo_pointer: "vtxo:abc123".into(),
         };
-        let qr = build_arkade_qr(&pointer, 1_000).unwrap();
-        assert!(qr.starts_with("ark:vtxo:abc123?"));
-        assert!(qr.contains("server="));
-        assert!(qr.contains("amount=1000"));
+        assert!(build_arkade_qr(&pointer, 1_000).is_err());
     }
 
     #[test]
