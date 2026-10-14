@@ -173,6 +173,8 @@ pub fn encode_tlv_stream(records: &[TlvRecord]) -> Vec<u8> {
 // Blinded Path Types (Privacy-Preserving Routing)
 // ============================================================================
 
+const MAX_BLINDED_PATH_HOPS: usize = 100;
+
 /// Blinded hop in a blinded path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlindedHop {
@@ -195,6 +197,10 @@ impl BlindedPath {
     }
 
     pub fn encode_bytes(&self) -> Result<Vec<u8>> {
+        let num_hops = self.blinded_hops.len();
+        if num_hops > MAX_BLINDED_PATH_HOPS {
+            anyhow::bail!("excessive num_hops: {num_hops} exceeds maximum {MAX_BLINDED_PATH_HOPS}");
+        }
         let mut buf = Vec::new();
         let intro_bytes = hex::decode(&self.introduction_node_id)
             .context("invalid hex for introduction_node_id")?;
@@ -208,7 +214,7 @@ impl BlindedPath {
             buf.extend_from_slice(&[0u8; 33]);
         }
 
-        write_bigsize(self.blinded_hops.len() as u64, &mut buf);
+        write_bigsize(num_hops as u64, &mut buf);
         for hop in &self.blinded_hops {
             let hop_node_bytes =
                 hex::decode(&hop.blinded_node_id).context("invalid hex for blinded_node_id")?;
@@ -241,8 +247,10 @@ impl BlindedPath {
             .context("reading blinding point")?;
 
         let num_hops_raw = read_bigsize(&mut cursor)?;
-        if num_hops_raw > 100 {
-            anyhow::bail!("excessive num_hops: {num_hops_raw} exceeds maximum 100");
+        if num_hops_raw > MAX_BLINDED_PATH_HOPS as u64 {
+            anyhow::bail!(
+                "excessive num_hops: {num_hops_raw} exceeds maximum {MAX_BLINDED_PATH_HOPS}"
+            );
         }
         let num_hops = usize::try_from(num_hops_raw).context("num_hops does not fit in usize")?;
         let remaining = bytes.len().saturating_sub(cursor.position() as usize);
@@ -759,9 +767,10 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
                 }
             }
             TLV_OFFER_PATHS => {
-                if let Ok(bp) = BlindedPath::decode_bytes(&r.value) {
-                    blinded_paths.push(bp);
-                }
+                blinded_paths.push(
+                    BlindedPath::decode_bytes(&r.value)
+                        .context("invalid BOLT12 offer blinded path")?,
+                );
             }
             TLV_OFFER_ISSUER => {
                 if let Ok(iss) = String::from_utf8(r.value) {
@@ -1446,6 +1455,64 @@ mod tests {
         assert_eq!(decoded.blinded_hops.len(), 1);
         assert_eq!(decoded.blinded_hops[0].blinded_node_id, hop_node);
         assert_eq!(decoded.blinded_hops[0].encrypted_payload, enc_payload);
+    }
+
+    #[test]
+    fn test_blinded_path_encoding_hop_limit() {
+        let hop = BlindedHop {
+            blinded_node_id: "02".to_string() + &"33".repeat(32),
+            encrypted_payload: "deadbeef".to_string(),
+        };
+        let mut path = BlindedPath {
+            introduction_node_id: "02".to_string() + &"11".repeat(32),
+            blinding_point: Some("03".to_string() + &"22".repeat(32)),
+            blinded_hops: vec![hop.clone(); 100],
+        };
+
+        let bytes = path.encode_bytes().unwrap();
+        assert_eq!(BlindedPath::decode_bytes(&bytes).unwrap(), path);
+
+        let raw = encode_tlv_stream(&[TlvRecord {
+            tag: TLV_OFFER_PATHS,
+            value: bytes,
+        }]);
+        let offer = bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+        assert_eq!(
+            parse_bolt12_offer(&offer).unwrap().blinded_paths,
+            Some(vec![path.clone()])
+        );
+
+        path.blinded_hops.push(hop);
+        let err = path.encode_bytes().unwrap_err();
+        assert!(err.to_string().contains("excessive num_hops"));
+    }
+
+    #[test]
+    fn test_parse_bolt12_offer_rejects_invalid_blinded_paths() {
+        let mut excessive_hops = vec![0x02; 66];
+        write_bigsize(101, &mut excessive_hops);
+
+        let mut truncated_hop = vec![0x02; 66];
+        write_bigsize(1, &mut truncated_hop);
+
+        let mut truncated_payload = truncated_hop.clone();
+        truncated_payload.extend_from_slice(&[0x02; 33]);
+        write_bigsize(1, &mut truncated_payload);
+
+        for (path_bytes, expected_error) in [
+            (vec![], "reading introduction node ID"),
+            (excessive_hops, "excessive num_hops"),
+            (truncated_hop, "invalid num_hops"),
+            (truncated_payload, "encrypted payload length"),
+        ] {
+            let raw = encode_tlv_stream(&[TlvRecord {
+                tag: TLV_OFFER_PATHS,
+                value: path_bytes,
+            }]);
+            let offer = bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+            let err = parse_bolt12_offer(&offer).unwrap_err();
+            assert!(format!("{err:#}").contains(expected_error));
+        }
     }
 
     #[test]
