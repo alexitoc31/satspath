@@ -425,7 +425,7 @@ proptest! {
         }
     }
 
-    /// An unavailable first offer must not hide a usable later method.
+    /// Below the offer minimum, select a later usable method; at the minimum, select the offer.
     #[test]
     fn test_select_route_bolt12_minimum_amount_boundary(minimum in 1_001u64..100_000u64) {
         let offer = valid_unblinded_bolt12_offer();

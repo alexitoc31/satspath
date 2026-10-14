@@ -1,10 +1,12 @@
 use async_trait::async_trait;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::crypto::{check_profile_expiry, verify_signed_profile};
 use crate::resolver::ProfileResolver;
-use crate::ssrf::validate_url;
+use crate::ssrf::{is_private_or_reserved_ip, validate_url};
 use crate::{Result, SatsPathError, SignedPaymentProfile};
 
 /// Resolves a profile by making an HTTP GET request to the domain of the alias.
@@ -23,15 +25,60 @@ pub struct HttpResolver {
     client: Client,
 }
 
+struct SystemDnsResolver;
+
+impl Resolve for SystemDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let addrs: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// Validate the exact DNS answers passed to the HTTP connector, without a second lookup.
+struct ValidatingDnsResolver(Arc<dyn Resolve>);
+
+impl Resolve for ValidatingDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        // Match resolve_from_url's explicit localhost exemption for mock servers.
+        let allow_loopback =
+            cfg!(any(test, feature = "test-utils")) && name.as_str() == "localhost";
+        let resolving = self.0.resolve(name);
+        Box::pin(async move {
+            let addrs: Vec<_> = resolving.await?.collect();
+            for addr in &addrs {
+                if is_private_or_reserved_ip(addr.ip())
+                    && !(allow_loopback && addr.ip().is_loopback())
+                {
+                    return Err(SatsPathError::ValidationError(format!(
+                        "Blocked IP: {} (private/reserved DNS answer)",
+                        addr.ip()
+                    ))
+                    .into());
+                }
+            }
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
 impl HttpResolver {
     pub fn new() -> Self {
+        Self::with_dns_resolver(Arc::new(SystemDnsResolver))
+    }
+
+    fn with_dns_resolver<R: Resolve + 'static>(resolver: Arc<R>) -> Self {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
                 // Disallow redirects to prevent open redirect → SSRF chains
                 .redirect(reqwest::redirect::Policy::none())
+                // Proxies can resolve destinations without using our resolver.
+                .no_proxy()
+                .dns_resolver(Arc::new(ValidatingDnsResolver(resolver)))
                 .build()
-                .unwrap_or_default(),
+                .expect("failed to build SSRF-protected HTTP client"),
         }
     }
 
@@ -155,6 +202,93 @@ mod tests {
     use crate::crypto::{generate_identity_keypair, sign_profile};
     use crate::profile::{PaymentMethod, PaymentProfile};
     use mockito::Server;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StubResolver {
+        addrs: Vec<std::net::SocketAddr>,
+        calls: AtomicUsize,
+    }
+
+    impl StubResolver {
+        fn new(addrs: Vec<std::net::SocketAddr>) -> Self {
+            Self {
+                addrs,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Resolve for StubResolver {
+        fn resolve(&self, name: Name) -> Resolving {
+            assert_eq!(name.as_str(), "profile.example");
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let addrs = self.addrs.clone();
+            Box::pin(async move { Ok(Box::new(addrs.into_iter()) as Addrs) })
+        }
+    }
+
+    #[tokio::test]
+    async fn hostname_resolving_to_private_ip_is_rejected_before_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stub = Arc::new(StubResolver::new(vec![listener.local_addr().unwrap()]));
+        let resolver = HttpResolver::with_dns_resolver(stub.clone());
+        let url = "https://profile.example/profile";
+        assert!(validate_url(url, false).is_ok());
+
+        let result = resolver.resolve_from_url(url).await;
+
+        assert!(matches!(result, Err(SatsPathError::NetworkError(_))));
+        assert_eq!(stub.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the resolver must reject the DNS answer before opening a socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_resolver_rejects_disallowed_and_mixed_answers() {
+        let public = "8.8.8.8:0".parse().unwrap();
+        for blocked in [
+            "10.0.0.1:0",
+            "127.0.0.1:0",
+            "169.254.169.254:0",
+            "192.0.2.1:0",
+            "[::1]:0",
+            "[fc00::1]:0",
+            "[::ffff:192.168.1.1]:0",
+            "[64:ff9b::a00:1]:0",
+        ] {
+            let blocked = blocked.parse().unwrap();
+            for addrs in [vec![blocked], vec![public, blocked], vec![blocked, public]] {
+                let resolver = ValidatingDnsResolver(Arc::new(StubResolver::new(addrs)));
+                let error = resolver
+                    .resolve("profile.example".parse().unwrap())
+                    .await
+                    .err()
+                    .expect("a disallowed DNS answer must reject the entire result");
+                assert!(matches!(
+                    error.downcast_ref::<SatsPathError>(),
+                    Some(SatsPathError::ValidationError(message)) if message.starts_with("Blocked IP:")
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_resolver_preserves_public_answers() {
+        let addrs = vec![
+            "8.8.8.8:0".parse().unwrap(),
+            "[2606:4700:4700::1111]:0".parse().unwrap(),
+        ];
+        let resolver = ValidatingDnsResolver(Arc::new(StubResolver::new(addrs.clone())));
+        let resolved = resolver
+            .resolve("profile.example".parse().unwrap())
+            .await
+            .expect("public DNS answers must remain usable");
+        assert_eq!(resolved.collect::<Vec<_>>(), addrs);
+    }
 
     /// Build a valid signed profile.
     fn make_valid_signed(alias: &str, expires_at: Option<i64>) -> SignedPaymentProfile {
