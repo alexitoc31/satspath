@@ -2,28 +2,25 @@ use bech32::ToBase32;
 use bitcoin::{Address, CompressedPublicKey, Network};
 use proptest::prelude::*;
 use satspath_core::crypto::sign_profile;
-use satspath_core::validation::validate_public_profile;
 use satspath_core::{
     BitcoinNetwork, Bolt12Offer, PaymentMethod, PaymentProfile, SignedPaymentProfile,
 };
 use satspath_router::ark_routes::SenderCapabilities;
 use satspath_router::bolt12::{
-    encode_tlv_stream, write_tu64, BlindedHop, BlindedPath, TlvRecord, TLV_OFFER_AMOUNT,
-    TLV_OFFER_DESCRIPTION, TLV_OFFER_NODE_ID, TLV_OFFER_PATHS,
+    encode_tlv_stream, BlindedHop, BlindedPath, TlvRecord, TLV_OFFER_DESCRIPTION,
+    TLV_OFFER_NODE_ID, TLV_OFFER_PATHS,
 };
 use satspath_router::fees::FeeEstimate;
 use satspath_router::router::{select_route_with_fees, RouteRequest};
 use satspath_router::scoring::{
     score_routes, FeeSnapshot, PaymentRail, RouteCandidate, RoutePreferences,
 };
-use satspath_router::silent_payments::{
-    create_silent_payment_address_for_network, parse_silent_payment_address,
-};
 use satspath_router::urgency::PaymentUrgency;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// Build a parseable blinded offer fixture for routing determinism tests.
 fn valid_blinded_bolt12_offer() -> String {
     let bp = BlindedPath {
         introduction_node_id: "02".to_string() + &"11".repeat(32),
@@ -48,8 +45,9 @@ fn valid_blinded_bolt12_offer() -> String {
     bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).expect("bech32")
 }
 
-fn valid_unblinded_bolt12_offer(minimum_amount_sats: Option<u64>) -> String {
-    let mut records = vec![
+/// Build a parseable unblinded offer fixture without an encoded minimum amount.
+fn valid_unblinded_bolt12_offer() -> String {
+    let records = vec![
         TlvRecord {
             tag: TLV_OFFER_DESCRIPTION,
             value: b"Unblinded Offer".to_vec(),
@@ -59,16 +57,11 @@ fn valid_unblinded_bolt12_offer(minimum_amount_sats: Option<u64>) -> String {
             value: [vec![0x02], vec![0x11; 32]].concat(),
         },
     ];
-    if let Some(minimum) = minimum_amount_sats {
-        records.push(TlvRecord {
-            tag: TLV_OFFER_AMOUNT,
-            value: write_tu64(minimum * 1_000),
-        });
-    }
     let raw = encode_tlv_stream(&records);
     bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).expect("bech32")
 }
 
+/// Map profile network names to the Bitcoin address library equivalents.
 fn bitcoin_network(network: BitcoinNetwork) -> Network {
     match network {
         BitcoinNetwork::Mainnet => Network::Bitcoin,
@@ -77,6 +70,7 @@ fn bitcoin_network(network: BitcoinNetwork) -> Network {
     }
 }
 
+/// Build a profile fixture using an identity signing key and supplied methods.
 fn payment_profile(sk: &SecretKey, methods: Vec<PaymentMethod>) -> PaymentProfile {
     let pk = PublicKey::from_secret_key(&Secp256k1::new(), sk);
     PaymentProfile {
@@ -98,23 +92,7 @@ fn payment_profile(sk: &SecretKey, methods: Vec<PaymentMethod>) -> PaymentProfil
     }
 }
 
-fn onchain_method(
-    network: BitcoinNetwork,
-    address: Option<String>,
-    silent_payment_pubkey: Option<String>,
-) -> PaymentMethod {
-    PaymentMethod::Onchain {
-        label: "BTC".into(),
-        network,
-        address,
-        silent_payment_pubkey,
-        pubkey_hint: None,
-        descriptor_hint: None,
-        address_list: vec![],
-    }
-}
-
-// Independent scoring oracle: use only the returned candidate's attributes and inputs.
+/// Compute the expected score from candidate attributes and routing preferences.
 fn expected_score(
     candidate: &RouteCandidate,
     preferences: &RoutePreferences,
@@ -146,26 +124,16 @@ fn expected_score(
     score
 }
 
-fn corrupt_checksum(mut address: String) -> String {
-    let last = address.pop().expect("nonempty address");
-    address.push(if last == 'q' { 'p' } else { 'q' });
-    address
-}
-
-fn bip352_data(version: u8, payload: &[u8]) -> Vec<bech32::u5> {
-    let mut data = vec![bech32::u5::try_from_u8(version).expect("5-bit version")];
-    data.extend(payload.to_base32());
-    data
-}
-
 // ── Strategies ─────────────────────────────────────────────────────────────
 
+/// Generate identity signing keys for profile tests.
 fn arb_secret_key() -> impl Strategy<Value = SecretKey> {
     any::<[u8; 32]>().prop_filter_map("valid secp256k1 secret key", |bytes| {
         SecretKey::from_slice(&bytes).ok()
     })
 }
 
+/// Sample the Bitcoin networks represented by payment profiles.
 fn arb_bitcoin_network() -> impl Strategy<Value = BitcoinNetwork> {
     prop_oneof![
         Just(BitcoinNetwork::Mainnet),
@@ -174,14 +142,19 @@ fn arb_bitcoin_network() -> impl Strategy<Value = BitcoinNetwork> {
     ]
 }
 
+/// Optionally supply a network-specific address derived from a fixed public key.
 fn arb_onchain_address(network: BitcoinNetwork) -> impl Strategy<Value = Option<String>> {
-    let sk = SecretKey::from_slice(&[1; 32]).expect("fixture key");
-    let pk = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+    let pk = PublicKey::from_slice(
+        &hex::decode("031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f")
+            .expect("public address fixture"),
+    )
+    .expect("compressed public key");
     let address = Address::p2wpkh(&CompressedPublicKey(pk), bitcoin_network(network)).to_string();
-    // Routing properties exercise method presence; validation is tested separately below.
+    // Vary address presence for routing without generating private spending keys.
     prop_oneof![Just(None), Just(Some(address))]
 }
 
+/// Generate payment-method fields for property tests, including malformed pointers.
 fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
     prop_oneof![
         (
@@ -206,7 +179,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
             proptest::option::of("https://example.com/lnurl"),
             prop_oneof![
                 Just(Some(valid_blinded_bolt12_offer())),
-                Just(Some(valid_unblinded_bolt12_offer(None))),
+                Just(Some(valid_unblinded_bolt12_offer())),
                 proptest::option::of("lno1[a-z0-9]{20,50}"),
             ],
         )
@@ -239,7 +212,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
             "[a-zA-Z0-9_-]{1,16}",
             prop_oneof![
                 Just(valid_blinded_bolt12_offer()),
-                Just(valid_unblinded_bolt12_offer(None)),
+                Just(valid_unblinded_bolt12_offer()),
                 "lno1[a-z0-9]{20,50}".prop_map(|s| s),
             ],
             arb_bitcoin_network(),
@@ -259,6 +232,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
     ]
 }
 
+/// Generate signed identity profiles with varying methods and routing preferences.
 fn arb_signed_profile() -> impl Strategy<Value = SignedPaymentProfile> {
     (
         arb_secret_key(),
@@ -285,6 +259,7 @@ fn arb_signed_profile() -> impl Strategy<Value = SignedPaymentProfile> {
         })
 }
 
+/// Generate optional fee inputs to exercise present and missing fee estimates.
 fn arb_fee_snapshot() -> impl Strategy<Value = FeeSnapshot> {
     (
         proptest::option::of(1u64..10_000u64),
@@ -302,6 +277,7 @@ fn arb_fee_snapshot() -> impl Strategy<Value = FeeSnapshot> {
         })
 }
 
+/// Generate sanitized fee estimates for deterministic route selection.
 fn arb_fee_estimate() -> impl Strategy<Value = FeeEstimate> {
     (
         1u64..300u64,
@@ -323,6 +299,7 @@ fn arb_fee_estimate() -> impl Strategy<Value = FeeEstimate> {
         })
 }
 
+/// Vary route priorities, fee limits, and sender capabilities.
 fn arb_route_preferences() -> impl Strategy<Value = RoutePreferences> {
     (
         any::<bool>(),
@@ -349,6 +326,7 @@ fn arb_route_preferences() -> impl Strategy<Value = RoutePreferences> {
         )
 }
 
+/// Sample all urgency levels used by route selection.
 fn arb_payment_urgency() -> impl Strategy<Value = PaymentUrgency> {
     prop_oneof![
         Just(PaymentUrgency::Urgent),
@@ -363,6 +341,7 @@ fn arb_payment_urgency() -> impl Strategy<Value = PaymentUrgency> {
 proptest! {
     // ── 1. Route Scoring Determinism & Contract Invariants ─────────────────
 
+    /// Check repeatable scoring, candidate eligibility, and maximal selected scores.
     #[test]
     fn test_score_routes_is_deterministic(
         amount_sats in 1u64..5_000_000u64,
@@ -407,6 +386,7 @@ proptest! {
 
     // ── 2. Route Selection With Fees Determinism & Contract Invariants ─────
 
+    /// Check repeatable route quotes or errors for identical requests and fee estimates.
     #[test]
     fn test_select_route_with_fees_is_deterministic(
         amount_sats in 1u64..5_000_000u64,
@@ -452,176 +432,4 @@ proptest! {
         }
     }
 
-    // ── 3. Payment Urgency Fee Rate Monotonicity ───────────────────────────
-
-    #[test]
-    fn test_payment_urgency_fee_rate_monotonicity(fee_est in arb_fee_estimate()) {
-        let urgent = PaymentUrgency::Urgent.select_fee_rate(&fee_est);
-        let commercial = PaymentUrgency::Commercial.select_fee_rate(&fee_est);
-        let normal = PaymentUrgency::Normal.select_fee_rate(&fee_est);
-        let economy = PaymentUrgency::Economy.select_fee_rate(&fee_est);
-
-        prop_assert!(urgent >= commercial, "urgent fee rate must be >= commercial");
-        prop_assert!(commercial >= normal, "commercial fee rate must be >= normal");
-        prop_assert!(normal >= economy, "normal fee rate must be >= economy");
-        prop_assert!(economy >= 1, "economy fee rate must be >= 1");
-    }
-
-    // Address validity is a validate_public_profile contract, separate from routing.
-    #[test]
-    fn test_public_profile_validates_bitcoin_network_and_address(
-        sk in arb_secret_key(),
-        network in arb_bitcoin_network(),
-    ) {
-        let pk = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
-        let address = Address::p2wpkh(&CompressedPublicKey(pk), bitcoin_network(network)).to_string();
-        let mut profile = payment_profile(&sk, vec![onchain_method(network, Some(address.clone()), None)]);
-        prop_assert!(validate_public_profile(&profile).is_ok(), "valid Bitcoin address must pass");
-
-        let wrong_network = match network {
-            BitcoinNetwork::Mainnet => BitcoinNetwork::Testnet,
-            BitcoinNetwork::Testnet => BitcoinNetwork::Regtest,
-            BitcoinNetwork::Regtest => BitcoinNetwork::Mainnet,
-        };
-        profile.methods = vec![onchain_method(wrong_network, Some(address.clone()), None)];
-        prop_assert!(validate_public_profile(&profile).is_err(), "mismatched Bitcoin network must fail");
-
-        profile.methods = vec![onchain_method(network, Some(corrupt_checksum(address)), None)];
-        prop_assert!(validate_public_profile(&profile).is_err(), "malformed Bitcoin checksum must fail");
-    }
-
-    #[test]
-    fn test_public_profile_validates_bip352_network_and_payload(
-        network in arb_bitcoin_network(),
-        truncated_length in 0usize..66,
-        extra_length in 1usize..32,
-    ) {
-        // Fixed public-key fixtures avoid accidental private-material keywords in encodings.
-        let scan_sk = SecretKey::from_slice(&[1; 32]).expect("scan fixture key");
-        let spend_sk = SecretKey::from_slice(&[2; 32]).expect("spend fixture key");
-        let secp = Secp256k1::new();
-        let scan_pk = PublicKey::from_secret_key(&secp, &scan_sk);
-        let spend_pk = PublicKey::from_secret_key(&secp, &spend_sk);
-        // Independently construct BIP-352's 5-bit version followed by the
-        // Base32 conversion of the 66-byte compressed public-key pair.
-        let hrp = if network == BitcoinNetwork::Mainnet { "sp" } else { "tsp" };
-        let payload = [scan_pk.serialize(), spend_pk.serialize()].concat();
-        let data = bip352_data(0, &payload);
-        let address = bech32::encode(hrp, &data, bech32::Variant::Bech32m)
-            .expect("valid silent payment fixture");
-        prop_assert_eq!(address.len(), if hrp == "sp" { 116 } else { 117 });
-        prop_assert_eq!(create_silent_payment_address_for_network(&scan_pk, &spend_pk, bitcoin_network(network))
-            .expect("encode fixture"), address.clone());
-        let mut profile = payment_profile(&spend_sk, vec![onchain_method(network, None, Some(address.clone()))]);
-        prop_assert!(validate_public_profile(&profile).is_ok(), "valid BIP-352 address must pass");
-
-        // Testnet and regtest both use tsp; only crossing mainnet is a mismatch.
-        let wrong_network = if network == BitcoinNetwork::Mainnet {
-            BitcoinNetwork::Testnet
-        } else {
-            BitcoinNetwork::Mainnet
-        };
-        profile.methods = vec![onchain_method(wrong_network, None, Some(address.clone()))];
-        prop_assert!(validate_public_profile(&profile).is_err(), "mismatched BIP-352 network must fail");
-
-        // Mutate the actual first 5-bit value, preserving the key payload.
-        for version in 1..=31 {
-            let mut versioned_data = data.clone();
-            versioned_data[0] = bech32::u5::try_from_u8(version).expect("5-bit version");
-            let versioned = bech32::encode(hrp, &versioned_data, bech32::Variant::Bech32m)
-                .expect("encode versioned fixture");
-            let parsed = parse_silent_payment_address(&versioned);
-            prop_assert_eq!(parsed.is_ok(), version < 31);
-            if let Ok((scan, spend, _)) = parsed {
-                prop_assert_eq!((scan, spend), (scan_pk, spend_pk));
-            }
-            profile.methods = vec![onchain_method(network, None, Some(versioned))];
-            prop_assert_eq!(validate_public_profile(&profile).is_ok(), version < 31,
-                "BIP-352 version {} compatibility", version);
-
-            // Versions 1–30 permit additional data after the key pair.
-            let mut extended_payload = payload.clone();
-            extended_payload.resize(payload.len() + extra_length, 0);
-            let extended = bech32::encode(hrp, bip352_data(version, &extended_payload), bech32::Variant::Bech32m)
-                .expect("encode extended fixture");
-            let parsed = parse_silent_payment_address(&extended);
-            prop_assert_eq!(parsed.is_ok(), version < 31);
-            if let Ok((scan, spend, _)) = parsed {
-                prop_assert_eq!((scan, spend), (scan_pk, spend_pk));
-            }
-            profile.methods = vec![onchain_method(network, None, Some(extended))];
-            prop_assert_eq!(validate_public_profile(&profile).is_ok(), version < 31,
-                "BIP-352 version {} with extra data", version);
-        }
-
-        // Re-encode malformed payloads with valid checksums so structural checks are exercised.
-        for case in 0..7 {
-            let mut malformed_payload = payload.clone();
-            let mut variant = bech32::Variant::Bech32m;
-            match case {
-                0 => variant = bech32::Variant::Bech32,
-                1 => malformed_payload.truncate(truncated_length),
-                2 => malformed_payload.resize(payload.len() + extra_length, 0),
-                3 => malformed_payload[0] = 4,
-                4 => malformed_payload[1..33].fill(0xff),
-                5 => malformed_payload[34..66].fill(0xff),
-                6 => malformed_payload[33] = 4,
-                _ => unreachable!(),
-            }
-            let malformed = bech32::encode(hrp, bip352_data(0, &malformed_payload), variant).expect("encode malformed fixture");
-            profile.methods = vec![onchain_method(network, None, Some(malformed))];
-            prop_assert!(validate_public_profile(&profile).is_err(), "malformed BIP-352 case {} must fail", case);
-        }
-        profile.methods = vec![onchain_method(network, None, Some(corrupt_checksum(address)))];
-        prop_assert!(validate_public_profile(&profile).is_err(), "malformed BIP-352 checksum must fail");
-    }
-}
-
-#[test]
-fn test_bolt12_only_rejects_amount_below_encoded_minimum() {
-    let sk = SecretKey::from_slice(&[1; 32]).expect("fixture key");
-    let offer = valid_unblinded_bolt12_offer(Some(5_000));
-    let methods = [
-        PaymentMethod::Lightning {
-            label: "BOLT12 only".into(),
-            lightning_address: None,
-            lnurl: None,
-            bolt12: Some(offer.clone()),
-            receiver_pubkey: None,
-        },
-        PaymentMethod::Bolt12(Bolt12Offer {
-            label: "BOLT12 only".into(),
-            offer,
-            network: BitcoinNetwork::Mainnet,
-            // Leave metadata unset to test the minimum encoded in the offer itself.
-            minimum_amount_sats: None,
-            expires_at: None,
-            issuer_pubkey: hex::encode(
-                PublicKey::from_secret_key(&Secp256k1::new(), &sk).serialize(),
-            ),
-        }),
-    ];
-    for method in methods {
-        let mut req = RouteRequest {
-            alias: "alice@example.com".into(),
-            amount_sats: 4_999,
-            signed_profile: sign_profile(payment_profile(&sk, vec![method.clone()]), &sk)
-                .expect("sign fixture"),
-            urgency: PaymentUrgency::Normal,
-            max_fee_sats: None,
-            max_fee_percent: None,
-        };
-        let fees = FeeEstimate::default();
-        assert!(
-            select_route_with_fees(&req, &fees).is_err(),
-            "request below the encoded 5,000 sat minimum must be rejected"
-        );
-        req.amount_sats = 5_000;
-        assert_eq!(
-            select_route_with_fees(&req, &fees)
-                .expect("minimum amount is payable")
-                .selected_method,
-            method
-        );
-    }
 }

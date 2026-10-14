@@ -11,12 +11,14 @@ use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
 // ── Strategies ─────────────────────────────────────────────────────────────
 
+/// Generate identity signing keys for profile tests.
 fn arb_secret_key() -> impl Strategy<Value = SecretKey> {
     any::<[u8; 32]>().prop_filter_map("valid secp256k1 secret key", |bytes| {
         SecretKey::from_slice(&bytes).ok()
     })
 }
 
+/// Sample the Bitcoin networks represented by payment profiles.
 fn arb_bitcoin_network() -> impl Strategy<Value = BitcoinNetwork> {
     prop_oneof![
         Just(BitcoinNetwork::Mainnet),
@@ -25,6 +27,7 @@ fn arb_bitcoin_network() -> impl Strategy<Value = BitcoinNetwork> {
     ]
 }
 
+/// Generate payment-method fields for property tests, including malformed pointers.
 fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
     prop_oneof![
         (
@@ -95,6 +98,7 @@ fn arb_payment_method() -> impl Strategy<Value = PaymentMethod> {
     ]
 }
 
+/// Generate a signable profile and its matching identity key; pointers need not be payable.
 fn arb_valid_profile_and_key() -> impl Strategy<Value = (SecretKey, PaymentProfile)> {
     (
         arb_secret_key(),
@@ -139,6 +143,7 @@ fn arb_valid_profile_and_key() -> impl Strategy<Value = (SecretKey, PaymentProfi
         )
 }
 
+/// Generate bounded nested JSON values with integer numbers for canonicalization.
 fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
     let leaf = prop_oneof![
         Just(serde_json::Value::Null),
@@ -160,6 +165,7 @@ fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
 }
 
 prop_compose! {
+    /// Generate a nonempty tree of leaf hashes and an index within that tree.
     fn arb_tree_and_index()(
         leaves in proptest::collection::vec(any::<[u8; 32]>(), 1..=64)
     )(
@@ -170,6 +176,7 @@ prop_compose! {
     }
 }
 
+/// Sample private and reserved IPv4 ranges rejected by the SSRF policy.
 fn arb_private_ipv4() -> impl Strategy<Value = Ipv4Addr> {
     prop_oneof![
         // 127.0.0.0/8 (Loopback)
@@ -196,6 +203,7 @@ fn arb_private_ipv4() -> impl Strategy<Value = Ipv4Addr> {
     ]
 }
 
+/// Sample blocked IPv6 ranges, including embedded private IPv4 addresses.
 fn arb_private_ipv6() -> impl Strategy<Value = Ipv6Addr> {
     prop_oneof![
         // Loopback & unspecified
@@ -242,11 +250,13 @@ fn arb_private_ipv6() -> impl Strategy<Value = Ipv6Addr> {
 proptest! {
     // ── 1. Canonicalize Identifier & JSON Invariants ───────────────────────
 
+    /// Check that arbitrary Unicode identifiers can be canonicalized without panicking.
     #[test]
     fn test_canonicalize_identifier_does_not_panic(s in "\\PC*") {
         let _ = canonicalize_identifier(&s);
     }
 
+    /// Check that canonicalizing an identifier twice leaves it unchanged.
     #[test]
     fn test_canonicalize_identifier_is_idempotent(s in "\\PC*") {
         let id1 = canonicalize_identifier(&s);
@@ -254,6 +264,7 @@ proptest! {
         prop_assert_eq!(id1, id2, "canonicalize_identifier must be idempotent");
     }
 
+    /// Check that parsing and canonicalizing canonical JSON preserves its bytes.
     #[test]
     fn test_canonical_json_idempotency_on_arbitrary_json(val in arb_json_value()) {
         let c1 = canonical_json::to_string(&val).expect("canonicalize generated JSON");
@@ -262,6 +273,7 @@ proptest! {
         prop_assert_eq!(c1, c2, "canonical_json(canonical_json(x)) == canonical_json(x)");
     }
 
+    /// Check that profile serialization agrees with canonicalization of the parsed JSON.
     #[test]
     fn test_canonical_profile_bytes_is_idempotent((_, profile) in arb_valid_profile_and_key()) {
         let bytes1 = canonical_profile_bytes(&profile).expect("serialize profile");
@@ -272,6 +284,7 @@ proptest! {
 
     // ── 2. Profile Signing & Verification Roundtrip ────────────────────────
 
+    /// Check that profiles signed with their matching identity key verify successfully.
     #[test]
     fn test_signed_profile_always_verifies_roundtrip((sk, profile) in arb_valid_profile_and_key()) {
         let signed = sign_profile(profile, &sk).expect("signing valid profile must succeed");
@@ -281,6 +294,7 @@ proptest! {
 
     // ── 3. Tampered Profile Fails Verification (No False Positives) ────────
 
+    /// Check that mutations to signed fields or signature bytes fail verification.
     #[test]
     fn test_tampered_profile_always_fails_verification(
         (sk, profile) in arb_valid_profile_and_key(),
@@ -351,6 +365,7 @@ proptest! {
 
     // ── 4. Merkle Inclusion Proof Roundtrip & Tamper Rejection ─────────────
 
+    /// Check inclusion proofs for generated leaf hashes at arbitrary valid positions.
     #[test]
     fn test_merkle_inclusion_proof_for_any_leaf_always_verifies(
         (leaves, index) in arb_tree_and_index()
@@ -360,6 +375,7 @@ proptest! {
         prop_assert!(verified, "inclusion proof for leaf {index} in tree of size {} must verify", leaves.len());
     }
 
+    /// Check that altered Merkle hashes, paths, sizes, or indices fail verification.
     #[test]
     fn test_tampered_merkle_inclusion_proof_fails_verification(
         (leaves, index) in arb_tree_and_index(),
@@ -414,6 +430,7 @@ proptest! {
 
     // ── 5. SSRF Validation Never Allows Private IPs Regardless of Encoding ──
 
+    /// Check that blocked IPv4 literals are rejected by both IP and URL validation.
     #[test]
     fn test_ssrf_rejects_private_ipv4(ip in arb_private_ipv4()) {
         prop_assert!(
@@ -427,6 +444,7 @@ proptest! {
         );
     }
 
+    /// Check that alternate numeric IPv4 URL encodings cannot bypass SSRF validation.
     #[test]
     fn test_ssrf_rejects_private_ipv4_alternate_encodings(ip in arb_private_ipv4()) {
         let n = u32::from(ip);
@@ -443,6 +461,7 @@ proptest! {
         }
     }
 
+    /// Check that blocked IPv6 literals are rejected by both IP and URL validation.
     #[test]
     fn test_ssrf_rejects_private_ipv6(ip in arb_private_ipv6()) {
         prop_assert!(
@@ -456,6 +475,7 @@ proptest! {
         );
     }
 
+    /// Check that localhost and metadata hostnames are rejected before fetching.
     #[test]
     fn test_ssrf_rejects_blocked_hostnames(
         host in prop_oneof![
@@ -476,6 +496,7 @@ proptest! {
         );
     }
 
+    /// Check rejection of unsafe URL scheme and port combinations.
     #[test]
     fn test_ssrf_rejects_forbidden_schemes_and_ports(
         scheme in prop_oneof![Just("https"), Just("http"), Just("ftp"), Just("file"), Just("gopher")],
