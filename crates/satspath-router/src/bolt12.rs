@@ -232,7 +232,7 @@ impl BlindedPath {
     ///
     /// # Errors
     /// Returns an error for truncated fields, lengths that do not fit in
-    /// `usize`, more than 100 hops, or hop and payload lengths that exceed the remaining
+    /// `usize`, zero or more than 100 hops, or hop and payload lengths that exceed the remaining
     /// bytes. Length checks precede hop and payload allocations.
     pub fn decode_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
@@ -247,6 +247,9 @@ impl BlindedPath {
             .context("reading blinding point")?;
 
         let num_hops_raw = read_bigsize(&mut cursor)?;
+        if num_hops_raw == 0 {
+            anyhow::bail!("num_hops must be at least 1");
+        }
         if num_hops_raw > MAX_BLINDED_PATH_HOPS as u64 {
             anyhow::bail!(
                 "excessive num_hops: {num_hops_raw} exceeds maximum {MAX_BLINDED_PATH_HOPS}"
@@ -1437,6 +1440,12 @@ mod tests {
 
     #[test]
     fn test_parse_bolt12_offer_rejects_invalid_blinded_paths() {
+        let mut zero_hops =
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap()
+                .repeat(2);
+        write_bigsize(0, &mut zero_hops);
+
         let mut excessive_hops = vec![0x02; 66];
         write_bigsize(101, &mut excessive_hops);
 
@@ -1449,6 +1458,7 @@ mod tests {
 
         for (path_bytes, expected_error) in [
             (vec![], "reading introduction node ID"),
+            (zero_hops, "num_hops must be at least 1"),
             (excessive_hops, "excessive num_hops"),
             (truncated_hop, "invalid num_hops"),
             (truncated_payload, "encrypted payload length"),
