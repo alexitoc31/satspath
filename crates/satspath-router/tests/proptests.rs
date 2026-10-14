@@ -11,7 +11,7 @@ use satspath_router::bolt12::{
     TLV_OFFER_NODE_ID, TLV_OFFER_PATHS,
 };
 use satspath_router::fees::FeeEstimate;
-use satspath_router::router::{select_route_with_fees, RouteRequest};
+use satspath_router::router::{select_route_with_fees, RouteRequest, SwapDirective};
 use satspath_router::scoring::{
     score_routes, FeeSnapshot, PaymentRail, RouteCandidate, RoutePreferences,
 };
@@ -421,6 +421,27 @@ proptest! {
                         matches!(q1.selected_method, PaymentMethod::Lightning { .. } | PaymentMethod::Bolt12(_)),
                         "Amount < 100,000 sats with available Lightning must choose Lightning/Bolt12"
                     );
+                }
+
+                let selected_offer = match &q1.selected_method {
+                    PaymentMethod::Bolt12(offer) => Some(&offer.offer),
+                    PaymentMethod::Lightning { bolt12, .. } => bolt12.as_ref(),
+                    _ => None,
+                };
+                if let Some(offer) = selected_offer {
+                    let expected_blinded = if *offer == valid_blinded_bolt12_offer() {
+                        Some(true)
+                    } else if *offer == valid_unblinded_bolt12_offer() {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    if let Some(expected) = expected_blinded {
+                        prop_assert!(
+                            matches!(&q1.swap_directive, SwapDirective::Bolt12Payment { has_blinded_paths, .. } if *has_blinded_paths == expected),
+                            "selected BOLT12 quote must reflect the fixture's blinded paths"
+                        );
+                    }
                 }
             }
             (Err(e1), Err(e2)) => {
