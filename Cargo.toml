@@ -9,6 +9,7 @@ members = [
     "crates/satspath-pqc",
     "crates/satspath-witness",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

@@ -130,12 +130,25 @@ pub fn write_tu64(mut val: u64) -> Vec<u8> {
     bytes
 }
 
+/// Decode consecutive bigsize type-length-value records from a byte stream.
+///
+/// # Errors
+/// Returns an error for truncated bigsize fields, lengths that do
+/// not fit in `usize`, or values longer than the remaining stream. Value lengths
+/// are checked before allocating their buffers.
 pub fn decode_tlv_stream(bytes: &[u8]) -> Result<Vec<TlvRecord>> {
     let mut cursor = Cursor::new(bytes);
     let mut records = Vec::new();
     while (cursor.position() as usize) < bytes.len() {
         let tag = read_bigsize(&mut cursor)?;
-        let len = read_bigsize(&mut cursor)? as usize;
+        let len_raw = read_bigsize(&mut cursor)?;
+        let len = usize::try_from(len_raw).context("TLV record length does not fit in usize")?;
+        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
+        if len > remaining {
+            anyhow::bail!(
+                "TLV record value length ({len} bytes) exceeds remaining stream bytes ({remaining} bytes)"
+            );
+        }
         let mut val = vec![0u8; len];
         cursor.read_exact(&mut val).context("reading TLV value")?;
         records.push(TlvRecord { tag, value: val });
@@ -160,6 +173,8 @@ pub fn encode_tlv_stream(records: &[TlvRecord]) -> Vec<u8> {
 // Blinded Path Types (Privacy-Preserving Routing)
 // ============================================================================
 
+pub const MAX_BLINDED_PATH_HOPS: usize = 100;
+
 /// Blinded hop in a blinded path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlindedHop {
@@ -182,6 +197,10 @@ impl BlindedPath {
     }
 
     pub fn encode_bytes(&self) -> Result<Vec<u8>> {
+        let num_hops = self.blinded_hops.len();
+        if num_hops > MAX_BLINDED_PATH_HOPS {
+            anyhow::bail!("excessive num_hops: {num_hops} exceeds maximum {MAX_BLINDED_PATH_HOPS}");
+        }
         let mut buf = Vec::new();
         let intro_bytes = hex::decode(&self.introduction_node_id)
             .context("invalid hex for introduction_node_id")?;
@@ -195,7 +214,7 @@ impl BlindedPath {
             buf.extend_from_slice(&[0u8; 33]);
         }
 
-        write_bigsize(self.blinded_hops.len() as u64, &mut buf);
+        write_bigsize(num_hops as u64, &mut buf);
         for hop in &self.blinded_hops {
             let hop_node_bytes =
                 hex::decode(&hop.blinded_node_id).context("invalid hex for blinded_node_id")?;
@@ -209,6 +228,12 @@ impl BlindedPath {
         Ok(buf)
     }
 
+    /// Decode a blinded path containing node IDs, a blinding point, and hops.
+    ///
+    /// # Errors
+    /// Returns an error for truncated fields, lengths that do not fit in
+    /// `usize`, zero or more than 100 hops, or hop and payload lengths that exceed the remaining
+    /// bytes. Length checks precede hop and payload allocations.
     pub fn decode_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let mut intro = [0u8; 33];
@@ -221,7 +246,22 @@ impl BlindedPath {
             .read_exact(&mut bp)
             .context("reading blinding point")?;
 
-        let num_hops = read_bigsize(&mut cursor)? as usize;
+        let num_hops_raw = read_bigsize(&mut cursor)?;
+        if num_hops_raw == 0 {
+            anyhow::bail!("num_hops must be at least 1");
+        }
+        if num_hops_raw > MAX_BLINDED_PATH_HOPS as u64 {
+            anyhow::bail!(
+                "excessive num_hops: {num_hops_raw} exceeds maximum {MAX_BLINDED_PATH_HOPS}"
+            );
+        }
+        let num_hops = usize::try_from(num_hops_raw).context("num_hops does not fit in usize")?;
+        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
+        if num_hops > remaining / 34 {
+            anyhow::bail!(
+                "invalid num_hops: {num_hops} requires more bytes than remaining ({remaining})"
+            );
+        }
         let mut hops = Vec::with_capacity(num_hops);
 
         for _ in 0..num_hops {
@@ -229,7 +269,15 @@ impl BlindedPath {
             cursor
                 .read_exact(&mut hop_node)
                 .context("reading blinded node ID")?;
-            let enc_len = read_bigsize(&mut cursor)? as usize;
+            let enc_len_raw = read_bigsize(&mut cursor)?;
+            let enc_len = usize::try_from(enc_len_raw)
+                .context("encrypted payload length does not fit in usize")?;
+            let remaining_enc = bytes.len().saturating_sub(cursor.position() as usize);
+            if enc_len > remaining_enc {
+                anyhow::bail!(
+                    "encrypted payload length ({enc_len} bytes) exceeds remaining bytes ({remaining_enc} bytes)"
+                );
+            }
             let mut enc_payload = vec![0u8; enc_len];
             cursor
                 .read_exact(&mut enc_payload)
@@ -622,72 +670,12 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
         ));
     }
 
-    let (hrp, data, _) = match bech32::decode(trimmed) {
-        Ok(res) => res,
-        Err(_) => {
-            // Fallback for short mock strings in simple tests (e.g. "lno1pq...")
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
-
-    let raw = match Vec::<u8>::from_base32(&data) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
-
-    let records = match decode_tlv_stream(&raw) {
-        Ok(recs) => recs,
-        Err(_) => {
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
+    let (hrp, data, _) = bech32::decode(trimmed).context("invalid BOLT12 offer bech32")?;
+    if !matches!(hrp.as_str(), "lno" | "lnot" | "lnob" | "lnos") {
+        anyhow::bail!("invalid BOLT12 offer HRP: {hrp}");
+    }
+    let raw = Vec::<u8>::from_base32(&data).context("invalid BOLT12 offer base32")?;
+    let records = decode_tlv_stream(&raw).context("invalid BOLT12 offer TLV stream")?;
 
     let mut description = None;
     let mut amount_msats = None;
@@ -722,9 +710,10 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
                 }
             }
             TLV_OFFER_PATHS => {
-                if let Ok(bp) = BlindedPath::decode_bytes(&r.value) {
-                    blinded_paths.push(bp);
-                }
+                blinded_paths.push(
+                    BlindedPath::decode_bytes(&r.value)
+                        .context("invalid BOLT12 offer blinded path")?,
+                );
             }
             TLV_OFFER_ISSUER => {
                 if let Ok(iss) = String::from_utf8(r.value) {
@@ -744,6 +733,10 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
             }
             _ => {}
         }
+    }
+
+    if node_id.is_none() && blinded_paths.is_empty() {
+        anyhow::bail!("BOLT12 offer missing invoice-request destination: offer_issuer_id or offer_paths required");
     }
 
     let b_paths = if blinded_paths.is_empty() {
@@ -1302,10 +1295,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_bolt12_offer_valid() {
-        let offer = "lno1pq...";
-        let result = parse_bolt12_offer(offer);
-        assert!(result.is_ok());
+    fn test_parse_bolt12_offer_hrps() {
+        let raw = encode_tlv_stream(&[TlvRecord {
+            tag: TLV_OFFER_NODE_ID,
+            value: hex::decode(
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            )
+            .unwrap(),
+        }]);
+        for hrp in ["lno", "lnot", "lnob", "lnos"] {
+            let offer = bech32::encode(hrp, raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+            assert!(parse_bolt12_offer(&offer).is_ok(), "HRP: {hrp}");
+
+            let invalid_hrp = format!("{hrp}1other");
+            let offer =
+                bech32::encode(&invalid_hrp, raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+            let err = parse_bolt12_offer(&offer).unwrap_err();
+            assert!(err.to_string().contains("invalid BOLT12 offer HRP"));
+        }
     }
 
     #[test]
@@ -1412,6 +1419,71 @@ mod tests {
     }
 
     #[test]
+    fn test_blinded_path_encoding_hop_limit() {
+        let hop = BlindedHop {
+            blinded_node_id: "02".to_string() + &"33".repeat(32),
+            encrypted_payload: "deadbeef".to_string(),
+        };
+        let mut path = BlindedPath {
+            introduction_node_id: "02".to_string() + &"11".repeat(32),
+            blinding_point: Some("03".to_string() + &"22".repeat(32)),
+            blinded_hops: vec![hop.clone(); 100],
+        };
+
+        let bytes = path.encode_bytes().unwrap();
+        assert_eq!(BlindedPath::decode_bytes(&bytes).unwrap(), path);
+
+        let raw = encode_tlv_stream(&[TlvRecord {
+            tag: TLV_OFFER_PATHS,
+            value: bytes,
+        }]);
+        let offer = bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+        assert_eq!(
+            parse_bolt12_offer(&offer).unwrap().blinded_paths,
+            Some(vec![path.clone()])
+        );
+
+        path.blinded_hops.push(hop);
+        let err = path.encode_bytes().unwrap_err();
+        assert!(err.to_string().contains("excessive num_hops"));
+    }
+
+    #[test]
+    fn test_parse_bolt12_offer_rejects_invalid_blinded_paths() {
+        let mut zero_hops =
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap()
+                .repeat(2);
+        write_bigsize(0, &mut zero_hops);
+
+        let mut excessive_hops = vec![0x02; 66];
+        write_bigsize(101, &mut excessive_hops);
+
+        let mut truncated_hop = vec![0x02; 66];
+        write_bigsize(1, &mut truncated_hop);
+
+        let mut truncated_payload = truncated_hop.clone();
+        truncated_payload.extend_from_slice(&[0x02; 33]);
+        write_bigsize(1, &mut truncated_payload);
+
+        for (path_bytes, expected_error) in [
+            (vec![], "reading introduction node ID"),
+            (zero_hops, "num_hops must be at least 1"),
+            (excessive_hops, "excessive num_hops"),
+            (truncated_hop, "invalid num_hops"),
+            (truncated_payload, "encrypted payload length"),
+        ] {
+            let raw = encode_tlv_stream(&[TlvRecord {
+                tag: TLV_OFFER_PATHS,
+                value: path_bytes,
+            }]);
+            let offer = bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+            let err = parse_bolt12_offer(&offer).unwrap_err();
+            assert!(format!("{err:#}").contains(expected_error));
+        }
+    }
+
+    #[test]
     fn test_create_and_encode_signed_invoice_request() {
         use secp256k1::rand::RngCore;
         let mut key_bytes = [0u8; 32];
@@ -1492,5 +1564,24 @@ mod tests {
         assert!(val_res.is_ok());
 
         std::env::remove_var("SATSPATH_MOCK_BOLT12");
+    }
+
+    /// Reject a TLV value length that exceeds the available payload bytes.
+    #[test]
+    fn test_decode_tlv_stream_bounds() {
+        // Tag 1 (0x01), length 1000 (0xfd, 0x03, 0xe8), but stream only has 2 bytes payload
+        let truncated_tlv = vec![0x01, 0xfd, 0x03, 0xe8, 0xaa, 0xbb];
+        let err = decode_tlv_stream(&truncated_tlv).unwrap_err();
+        assert!(err.to_string().contains("exceeds remaining stream bytes"));
+    }
+
+    /// Reject a blinded path declaring more than the maximum 100 hops.
+    #[test]
+    fn test_blinded_path_bounds() {
+        // Introduction node (33 bytes) + blinding point (33 bytes) = 66 bytes, then num_hops = 200 (excessive)
+        let mut malformed_path = vec![0x02; 66];
+        malformed_path.push(200); // num_hops > 100
+        let err = BlindedPath::decode_bytes(&malformed_path).unwrap_err();
+        assert!(err.to_string().contains("excessive num_hops"));
     }
 }

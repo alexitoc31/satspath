@@ -1,0 +1,6 @@
+{
+  "proof": "MessageSignature",
+  "message": "SatsPath Ownership Proof v1\nidentity=03efcc8c5f74bb7352713b9bf51a5cc77a189cd971d3eac05b920bf567944cfcf1\nmethod=onchain:mainnet:bc1qucuxtkdupll6et4gfx8gslktmysxx3czlzg76g\nissued_at=1700000000",
+  "signature": "b1e531e62f34675b99f58ec672f224ed90cacbac20024f919c63017d16744d37d50642ac8fd147caa745a9d0bd50b2251dd81b80c5cef5c13b92a28b4d992afd",
+  "pubkey": "025bf3a7e06cfcd05ef9c429d93181cb2b32d95034a004d00882864aa136f4140e"
+}
