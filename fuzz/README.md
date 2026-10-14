@@ -1,5 +1,19 @@
 # Fuzzing
 
+## BIP321 URI length boundary
+
+```sh
+cargo +nightly fuzz run fuzz_bip321 fuzz/corpus/fuzz_bip321 -- -max_len=65537
+```
+
+The tracked `seed-uri-65536` and `seed-uri-65537` inputs are ASCII
+`bitcoin:?message=` URIs padded with `x` to exactly 65,536 and 65,537 bytes,
+without trailing newlines. They exercise acceptance at the URI length limit
+and rejection one byte above it. CI sets `-max_len=65537` to retain both seeds
+and allow mutations across the boundary.
+
+## BOLT12
+
 Run the BOLT12 target with its tracked corpus from the repository root:
 
 ```sh

@@ -1,5 +1,8 @@
 target
 corpus/*
+!corpus/fuzz_bip321/
+corpus/fuzz_bip321/*
+!corpus/fuzz_bip321/seed-*
 !corpus/fuzz_bolt12/
 corpus/fuzz_bolt12/*
 !corpus/fuzz_bolt12/seed-*

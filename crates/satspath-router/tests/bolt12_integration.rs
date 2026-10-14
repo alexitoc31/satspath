@@ -350,6 +350,60 @@ async fn test_bolt12_amount_availability_and_route_selection() {
     }
 }
 
+#[tokio::test]
+async fn test_bolt12_amount_availability_overflow() {
+    let amountless = encode_offer(&[issuer_id_record()]);
+    let fixed_amount = encode_offer(&[
+        TlvRecord {
+            tag: TLV_OFFER_AMOUNT,
+            value: write_tu64(5_000_000),
+        },
+        issuer_id_record(),
+    ]);
+    let max_sats = u64::MAX / 1_000;
+
+    for (offer, amount_sats, expected) in [
+        (&amountless, 0, true),
+        (&amountless, max_sats, true),
+        (&amountless, max_sats + 1, false),
+        (&amountless, u64::MAX, false),
+        (&fixed_amount, 4_999, false),
+        (&fixed_amount, 5_000, true),
+        (&fixed_amount, max_sats, true),
+        (&fixed_amount, max_sats + 1, false),
+        (&fixed_amount, u64::MAX, false),
+    ] {
+        for method in [
+            PaymentMethod::Lightning {
+                label: "BOLT12".into(),
+                lightning_address: None,
+                lnurl: None,
+                bolt12: Some(offer.clone()),
+                receiver_pubkey: None,
+            },
+            PaymentMethod::Bolt12(CoreBolt12Offer {
+                label: "BOLT12".into(),
+                offer: offer.clone(),
+                network: BitcoinNetwork::Mainnet,
+                minimum_amount_sats: None,
+                expires_at: None,
+                issuer_pubkey: hex::encode(issuer_id_record().value),
+            }),
+        ] {
+            assert_eq!(
+                is_lightning_available_for_amount_sync(&method, amount_sats),
+                expected,
+                "sync: {method:?}, {amount_sats} sats"
+            );
+            assert_eq!(
+                is_lightning_available_for_amount(&method, amount_sats).await,
+                expected,
+                "async: {method:?}, {amount_sats} sats"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_bolt12_scoring_blinded_path_privacy_bonus() {
     let intro_node = "02".to_string() + &"aa".repeat(32);

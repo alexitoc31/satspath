@@ -74,6 +74,8 @@ jobs:
           fi
           if [ "$FUZZ_TARGET" = "fuzz_bolt12" ]; then
             cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
+          elif [ "$FUZZ_TARGET" = "fuzz_bip321" ]; then
+            cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME" -max_len=65537
           else
             cargo fuzz run "$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
           fi

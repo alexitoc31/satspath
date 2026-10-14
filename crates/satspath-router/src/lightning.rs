@@ -47,7 +47,11 @@ pub async fn is_lightning_available_for_amount(method: &PaymentMethod, amount_sa
             bolt12: Some(offer_str),
             ..
         } => crate::bolt12::parse_bolt12_offer(offer_str)
-            .map(|offer| offer.is_amount_valid(amount_sats * 1_000))
+            .map(|offer| {
+                amount_sats
+                    .checked_mul(1_000)
+                    .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
+            })
             .unwrap_or(false),
         PaymentMethod::Bolt12(offer_data) => {
             if let Some(min_sats) = offer_data.minimum_amount_sats {
@@ -56,7 +60,11 @@ pub async fn is_lightning_available_for_amount(method: &PaymentMethod, amount_sa
                 }
             }
             crate::bolt12::parse_bolt12_offer(&offer_data.offer)
-                .map(|offer| offer.is_amount_valid(amount_sats * 1_000))
+                .map(|offer| {
+                    amount_sats
+                        .checked_mul(1_000)
+                        .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
+                })
                 .unwrap_or(false)
         }
         _ => false,
@@ -93,7 +101,11 @@ pub fn is_lightning_available_for_amount_sync(method: &PaymentMethod, amount_sat
             bolt12: Some(offer_str),
             ..
         } => crate::bolt12::parse_bolt12_offer(offer_str)
-            .map(|offer| offer.is_amount_valid(amount_sats * 1_000))
+            .map(|offer| {
+                amount_sats
+                    .checked_mul(1_000)
+                    .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
+            })
             .unwrap_or(false),
         PaymentMethod::Bolt12(offer_data) => {
             if let Some(min_sats) = offer_data.minimum_amount_sats {
@@ -102,7 +114,11 @@ pub fn is_lightning_available_for_amount_sync(method: &PaymentMethod, amount_sat
                 }
             }
             crate::bolt12::parse_bolt12_offer(&offer_data.offer)
-                .map(|offer| offer.is_amount_valid(amount_sats * 1_000))
+                .map(|offer| {
+                    amount_sats
+                        .checked_mul(1_000)
+                        .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
+                })
                 .unwrap_or(false)
         }
         _ => false,
