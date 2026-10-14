@@ -1,14 +1,20 @@
+use bech32::ToBase32;
 use satspath_core::{
     BitcoinNetwork, Bolt12Offer as CoreBolt12Offer, PaymentMethod, PaymentProfile,
     SignedPaymentProfile,
 };
 use satspath_router::bolt12::{
-    create_invoice_from_request, create_signed_invoice_request, parse_bolt12_invoice,
-    parse_bolt12_invoice_request, validate_bolt12_invoice_against_offer, BlindedHop, BlindedPath,
-    Bolt12Offer,
+    create_invoice_from_request, create_signed_invoice_request, encode_tlv_stream,
+    parse_bolt12_invoice, parse_bolt12_invoice_request, parse_bolt12_offer,
+    validate_bolt12_invoice_against_offer, write_tu64, BlindedHop, BlindedPath, Bolt12Offer,
+    TlvRecord, TLV_OFFER_AMOUNT, TLV_OFFER_PATHS,
 };
+use satspath_router::lightning::is_lightning_available_for_amount;
 use satspath_router::scoring::{score_routes, FeeSnapshot, PaymentRail, RoutePreferences};
-use satspath_router::{select_route, PaymentUrgency, RouteRequest, SwapDirective};
+use satspath_router::{
+    is_lightning_available_for_amount_sync, select_route, select_route_with_fees, FeeEstimate,
+    PaymentUrgency, RouteRequest, SwapDirective,
+};
 use secp256k1::rand::RngCore;
 
 fn generate_key() -> secp256k1::SecretKey {
@@ -17,12 +23,12 @@ fn generate_key() -> secp256k1::SecretKey {
     secp256k1::SecretKey::from_slice(&bytes).unwrap()
 }
 
-fn dummy_signed_profile(alias: &str, method: PaymentMethod) -> SignedPaymentProfile {
+fn dummy_signed_profile(alias: &str, methods: Vec<PaymentMethod>) -> SignedPaymentProfile {
     let key = satspath_core::crypto::generate_identity_keypair();
     let profile = PaymentProfile {
         alias: alias.to_string(),
         identity_pubkey: hex::encode(key.public_key.serialize()),
-        methods: vec![method],
+        methods,
         updated_at: 1_700_000_000,
         expires_at: None,
         sequence: Some(0),
@@ -161,7 +167,7 @@ async fn test_bolt12_routing_selection_and_directive() {
         issuer_pubkey: "02".to_string() + &"11".repeat(32),
     });
 
-    let profile = dummy_signed_profile("alice@satspath.com", method.clone());
+    let profile = dummy_signed_profile("alice@satspath.com", vec![method.clone()]);
     let req = RouteRequest {
         alias: "alice@satspath.com".to_string(),
         amount_sats: 50_000,
@@ -180,6 +186,101 @@ async fn test_bolt12_routing_selection_and_directive() {
             ..
         } if offer == offer_str
     ));
+}
+
+#[tokio::test]
+async fn test_bolt12_amount_availability_and_route_selection() {
+    let encode_offer = |records: &[TlvRecord]| {
+        bech32::encode(
+            "lno",
+            encode_tlv_stream(records).to_base32(),
+            bech32::Variant::Bech32m,
+        )
+        .unwrap()
+    };
+    let malformed = encode_offer(&[TlvRecord {
+        tag: TLV_OFFER_PATHS,
+        value: vec![],
+    }]);
+    assert!(parse_bolt12_offer(&malformed).is_err());
+    let amountless = encode_offer(&[]);
+    let fixed_amount = encode_offer(&[TlvRecord {
+        tag: TLV_OFFER_AMOUNT,
+        value: write_tu64(5_000_000),
+    }]);
+    let fallback = PaymentMethod::Lightning {
+        label: "Fallback LNURL".into(),
+        lightning_address: None,
+        lnurl: Some("https://example.com/lnurl".into()),
+        bolt12: None,
+        receiver_pubkey: None,
+    };
+    let fees = FeeEstimate {
+        fastest_fee: 1,
+        half_hour_fee: 1,
+        hour_fee: 1,
+        economy_fee: 1,
+        minimum_fee: 1,
+    };
+
+    for (offer, amount_sats, expected) in [
+        ("invalid", 5_000, false),
+        (malformed.as_str(), 5_000, false),
+        (amountless.as_str(), 499, true),
+        (amountless.as_str(), 500, true),
+        (fixed_amount.as_str(), 4_999, false),
+        (fixed_amount.as_str(), 5_000, true),
+        (fixed_amount.as_str(), 5_001, true),
+    ] {
+        for (method, expected) in [
+            (
+                PaymentMethod::Lightning {
+                    label: "BOLT12".into(),
+                    lightning_address: None,
+                    lnurl: None,
+                    bolt12: Some(offer.into()),
+                    receiver_pubkey: None,
+                },
+                expected,
+            ),
+            (
+                PaymentMethod::Bolt12(CoreBolt12Offer {
+                    label: "BOLT12".into(),
+                    offer: offer.into(),
+                    network: BitcoinNetwork::Mainnet,
+                    minimum_amount_sats: Some(500),
+                    expires_at: None,
+                    issuer_pubkey: "02".to_string() + &"11".repeat(32),
+                }),
+                expected && amount_sats >= 500,
+            ),
+        ] {
+            assert_eq!(
+                is_lightning_available_for_amount_sync(&method, amount_sats),
+                expected
+            );
+            assert_eq!(
+                is_lightning_available_for_amount(&method, amount_sats).await,
+                expected
+            );
+            let profile =
+                dummy_signed_profile("alice@example.com", vec![method.clone(), fallback.clone()]);
+            let req = RouteRequest {
+                alias: "alice@example.com".into(),
+                amount_sats,
+                signed_profile: profile,
+                urgency: PaymentUrgency::Normal,
+                max_fee_sats: None,
+                max_fee_percent: None,
+            };
+            let selected = if expected { &method } else { &fallback };
+            assert_eq!(
+                &select_route_with_fees(&req, &fees).unwrap().selected_method,
+                selected
+            );
+            assert_eq!(&select_route(&req).await.unwrap().selected_method, selected);
+        }
+    }
 }
 
 #[test]
@@ -223,7 +324,7 @@ fn test_bolt12_scoring_blinded_path_privacy_bonus() {
         receiver_pubkey: None,
     };
 
-    let profile = dummy_signed_profile("merchant@satspath.com", method);
+    let profile = dummy_signed_profile("merchant@satspath.com", vec![method]);
     let fee_snap = FeeSnapshot::default();
     let prefs = RoutePreferences::default();
 
