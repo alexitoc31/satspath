@@ -173,7 +173,7 @@ pub fn encode_tlv_stream(records: &[TlvRecord]) -> Vec<u8> {
 // Blinded Path Types (Privacy-Preserving Routing)
 // ============================================================================
 
-const MAX_BLINDED_PATH_HOPS: usize = 100;
+pub const MAX_BLINDED_PATH_HOPS: usize = 100;
 
 /// Blinded hop in a blinded path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -6,7 +6,9 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(s) = std::str::from_utf8(data) {
         if let Ok(parsed) = satspath_core::bip321::parse_bip321(s) {
             let _ = serde_json::to_string(&parsed);
-            assert_eq!(parsed.raw, s);
+            let reparsed = satspath_core::bip321::parse_bip321(&parsed.raw)
+                .expect("re-parsing parsed.raw must succeed");
+            assert_eq!(reparsed.instructions, parsed.instructions);
             assert!(parsed.instructions.iter().all(|instruction| {
                 !matches!(
                     instruction,

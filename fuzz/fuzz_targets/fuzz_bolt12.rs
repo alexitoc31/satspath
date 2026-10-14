@@ -6,7 +6,7 @@ fuzz_target!(|data: &[u8]| {
     // 1. Direct byte-level TLV and BlindedPath decoding
     let _ = satspath_router::bolt12::decode_tlv_stream(data);
     if let Ok(path) = satspath_router::bolt12::BlindedPath::decode_bytes(data) {
-        assert!(path.blinded_hops.len() <= 100);
+        assert!(path.blinded_hops.len() <= satspath_router::bolt12::MAX_BLINDED_PATH_HOPS);
     }
 
     // 2. String-level offer and invoice parsing

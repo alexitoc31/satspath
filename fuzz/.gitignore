@@ -6,5 +6,11 @@ corpus/fuzz_bip321/*
 !corpus/fuzz_bolt12/
 corpus/fuzz_bolt12/*
 !corpus/fuzz_bolt12/seed-*
+!corpus/fuzz_ownership_proof/
+corpus/fuzz_ownership_proof/*
+!corpus/fuzz_ownership_proof/seed-*
+!corpus/fuzz_profile_deser/
+corpus/fuzz_profile_deser/*
+!corpus/fuzz_profile_deser/seed-*
 artifacts
 coverage

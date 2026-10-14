@@ -49,10 +49,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             fuzz/target
-          key: ${{ runner.os }}-fuzz-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.lock') }}
+            fuzz/corpus
+          key: ${{ runner.os }}-fuzz-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-fuzz-${{ matrix.target }}-
-            ${{ runner.os }}-fuzz-
 
       - name: Install cargo-fuzz
         run: which cargo-fuzz || cargo install cargo-fuzz --version 0.13.2 --locked
@@ -66,15 +66,20 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           FUZZ_TARGET: ${{ matrix.target }}
         run: |
-          # 60s for PR checks, 15m (900s) for scheduled nightly runs
+          # Fuzz execution times:
+          # - PR checks: 60s per target for fast regression smoke testing.
+          # - Scheduled nightly runs: 900s (15 min) per target for ongoing regression coverage.
+          # Note: Initial deep fuzzing campaigns (24-48 hours per target) are conducted
+          # separately out-of-band to establish seed corpora and deep reach, rather than
+          # within nightly CI jobs which are bounded by GitHub Actions runner limits.
           MAX_TIME=60
           if [ "$EVENT_NAME" = "schedule" ]; then
             MAX_TIME=900
           fi
-          if [ "$FUZZ_TARGET" = "fuzz_bolt12" ]; then
-            cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
-          elif [ "$FUZZ_TARGET" = "fuzz_bip321" ]; then
+          if [ "$FUZZ_TARGET" = "fuzz_bip321" ]; then
             cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME" -max_len=65537
+          elif [ "$FUZZ_TARGET" = "fuzz_bolt12" ] || [ "$FUZZ_TARGET" = "fuzz_ownership_proof" ] || [ "$FUZZ_TARGET" = "fuzz_profile_deser" ]; then
+            cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
           else
             cargo fuzz run "$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
           fi
