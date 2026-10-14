@@ -1,13 +1,13 @@
-use bech32::ToBase32;
+use bech32::{FromBase32, ToBase32};
 use satspath_core::{
     BitcoinNetwork, Bolt12Offer as CoreBolt12Offer, PaymentMethod, PaymentProfile,
     SignedPaymentProfile,
 };
 use satspath_router::bolt12::{
-    create_invoice_from_request, create_signed_invoice_request, encode_tlv_stream,
-    parse_bolt12_invoice, parse_bolt12_invoice_request, parse_bolt12_offer,
+    create_invoice_from_request, create_signed_invoice_request, decode_tlv_stream,
+    encode_tlv_stream, parse_bolt12_invoice, parse_bolt12_invoice_request, parse_bolt12_offer,
     validate_bolt12_invoice_against_offer, write_tu64, BlindedHop, BlindedPath, Bolt12Offer,
-    TlvRecord, TLV_OFFER_AMOUNT, TLV_OFFER_PATHS,
+    TlvRecord, TLV_OFFER_AMOUNT, TLV_OFFER_NODE_ID, TLV_OFFER_PATHS,
 };
 use satspath_router::lightning::is_lightning_available_for_amount;
 use satspath_router::scoring::{score_routes, FeeSnapshot, PaymentRail, RoutePreferences};
@@ -16,6 +16,24 @@ use satspath_router::{
     PaymentUrgency, RouteRequest, SwapDirective,
 };
 use secp256k1::rand::RngCore;
+
+fn encode_offer(records: &[TlvRecord]) -> String {
+    bech32::encode(
+        "lno",
+        encode_tlv_stream(records).to_base32(),
+        bech32::Variant::Bech32m,
+    )
+    .unwrap()
+}
+
+fn issuer_id_record() -> TlvRecord {
+    TlvRecord {
+        // Type 22 is offer_issuer_id (called offer_node_id in this prototype).
+        tag: TLV_OFFER_NODE_ID,
+        value: hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .unwrap(),
+    }
+}
 
 fn generate_key() -> secp256k1::SecretKey {
     let mut bytes = [0u8; 32];
@@ -157,10 +175,10 @@ fn test_bolt12_offer_to_invoice_request_to_invoice_roundtrip() {
 
 #[tokio::test]
 async fn test_bolt12_routing_selection_and_directive() {
-    let offer_str = "lno1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+    let offer_str = encode_offer(&[issuer_id_record()]);
     let method = PaymentMethod::Bolt12(CoreBolt12Offer {
         label: "Primary BOLT12".to_string(),
-        offer: offer_str.to_string(),
+        offer: offer_str.clone(),
         network: BitcoinNetwork::Mainnet,
         minimum_amount_sats: Some(1_000),
         expires_at: None,
@@ -184,30 +202,73 @@ async fn test_bolt12_routing_selection_and_directive() {
         SwapDirective::Bolt12Payment {
             ref offer,
             ..
-        } if offer == offer_str
+        } if offer == &offer_str
     ));
 }
 
 #[tokio::test]
 async fn test_bolt12_amount_availability_and_route_selection() {
-    let encode_offer = |records: &[TlvRecord]| {
-        bech32::encode(
-            "lno",
-            encode_tlv_stream(records).to_base32(),
-            bech32::Variant::Bech32m,
-        )
-        .unwrap()
-    };
+    let invalid_bech32 = "lno1pq...";
+    assert!(bech32::decode(invalid_bech32).is_err());
+    let invalid_base32 = bech32::encode(
+        "lno",
+        vec![bech32::u5::try_from_u8(1).unwrap()],
+        bech32::Variant::Bech32m,
+    )
+    .unwrap();
+    let (_, data, _) = bech32::decode(&invalid_base32).unwrap();
+    assert!(Vec::<u8>::from_base32(&data).is_err());
+    let invalid_tlv = bech32::encode(
+        "lno",
+        [8, 2, 1].to_base32(), // Amount value claims two bytes but contains only one.
+        bech32::Variant::Bech32m,
+    )
+    .unwrap();
+    let (_, data, _) = bech32::decode(&invalid_tlv).unwrap();
+    let raw = Vec::<u8>::from_base32(&data).unwrap();
+    assert!(decode_tlv_stream(&raw).is_err());
+    for offer in [invalid_bech32, &invalid_base32, &invalid_tlv] {
+        assert!(parse_bolt12_offer(offer).is_err());
+    }
     let malformed = encode_offer(&[TlvRecord {
         tag: TLV_OFFER_PATHS,
         value: vec![],
     }]);
     assert!(parse_bolt12_offer(&malformed).is_err());
-    let amountless = encode_offer(&[]);
-    let fixed_amount = encode_offer(&[TlvRecord {
+    let missing_destination = encode_offer(&[]);
+    let amount_without_destination = encode_offer(&[TlvRecord {
         tag: TLV_OFFER_AMOUNT,
         value: write_tu64(5_000_000),
     }]);
+    for offer in [&missing_destination, &amount_without_destination] {
+        let err = parse_bolt12_offer(offer).unwrap_err();
+        assert!(err.to_string().contains("invoice-request destination"));
+    }
+    let amountless = encode_offer(&[issuer_id_record()]);
+    let fixed_amount = encode_offer(&[
+        TlvRecord {
+            tag: TLV_OFFER_AMOUNT,
+            value: write_tu64(5_000_000),
+        },
+        issuer_id_record(),
+    ]);
+    let node_id = hex::encode(issuer_id_record().value);
+    let path_only = encode_offer(&[TlvRecord {
+        tag: TLV_OFFER_PATHS,
+        value: BlindedPath {
+            introduction_node_id: node_id.clone(),
+            blinding_point: Some(node_id.clone()),
+            blinded_hops: vec![BlindedHop {
+                blinded_node_id: node_id,
+                encrypted_payload: "00".into(),
+            }],
+        }
+        .encode_bytes()
+        .unwrap(),
+    }]);
+    for offer in [&amountless, &fixed_amount, &path_only] {
+        assert!(parse_bolt12_offer(offer).is_ok());
+    }
     let fallback = PaymentMethod::Lightning {
         label: "Fallback LNURL".into(),
         lightning_address: None,
@@ -225,7 +286,13 @@ async fn test_bolt12_amount_availability_and_route_selection() {
 
     for (offer, amount_sats, expected) in [
         ("invalid", 5_000, false),
+        (invalid_bech32, 5_000, false),
+        (invalid_base32.as_str(), 5_000, false),
+        (invalid_tlv.as_str(), 5_000, false),
         (malformed.as_str(), 5_000, false),
+        (missing_destination.as_str(), 5_000, false),
+        (amount_without_destination.as_str(), 5_000, false),
+        (path_only.as_str(), 500, true),
         (amountless.as_str(), 499, true),
         (amountless.as_str(), 500, true),
         (fixed_amount.as_str(), 4_999, false),
@@ -320,7 +387,14 @@ fn test_bolt12_scoring_blinded_path_privacy_bonus() {
         label: "Private LN".to_string(),
         lightning_address: None,
         lnurl: None,
-        bolt12: Some(offer.offer.clone()),
+        bolt12: Some(encode_offer(&[TlvRecord {
+            tag: TLV_OFFER_PATHS,
+            value: offer
+                .primary_blinded_path()
+                .unwrap()
+                .encode_bytes()
+                .unwrap(),
+        }])),
         receiver_pubkey: None,
     };
 

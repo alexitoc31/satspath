@@ -667,72 +667,9 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
         ));
     }
 
-    let (hrp, data, _) = match bech32::decode(trimmed) {
-        Ok(res) => res,
-        Err(_) => {
-            // Fallback for short mock strings in simple tests (e.g. "lno1pq...")
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
-
-    let raw = match Vec::<u8>::from_base32(&data) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
-
-    let records = match decode_tlv_stream(&raw) {
-        Ok(recs) => recs,
-        Err(_) => {
-            return Ok(Bolt12Offer {
-                offer: trimmed.to_string(),
-                description: None,
-                amount_msats: None,
-                currency: Some("btc".to_string()),
-                min_amount_msats: None,
-                max_amount_msats: None,
-                quantity: None,
-                absolute_expiry: None,
-                relative_expiry: None,
-                paths: None,
-                blinded_paths: None,
-                issuer: None,
-                node_id: None,
-                signature: None,
-            });
-        }
-    };
+    let (hrp, data, _) = bech32::decode(trimmed).context("invalid BOLT12 offer bech32")?;
+    let raw = Vec::<u8>::from_base32(&data).context("invalid BOLT12 offer base32")?;
+    let records = decode_tlv_stream(&raw).context("invalid BOLT12 offer TLV stream")?;
 
     let mut description = None;
     let mut amount_msats = None;
@@ -790,6 +727,10 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
             }
             _ => {}
         }
+    }
+
+    if node_id.is_none() && blinded_paths.is_empty() {
+        anyhow::bail!("BOLT12 offer missing invoice-request destination: offer_issuer_id or offer_paths required");
     }
 
     let b_paths = if blinded_paths.is_empty() {
@@ -1349,8 +1290,15 @@ mod tests {
 
     #[test]
     fn test_parse_bolt12_offer_valid() {
-        let offer = "lno1pq...";
-        let result = parse_bolt12_offer(offer);
+        let raw = encode_tlv_stream(&[TlvRecord {
+            tag: TLV_OFFER_NODE_ID,
+            value: hex::decode(
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            )
+            .unwrap(),
+        }]);
+        let offer = bech32::encode("lno", raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+        let result = parse_bolt12_offer(&offer);
         assert!(result.is_ok());
     }
 
