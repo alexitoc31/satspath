@@ -1,0 +1,5563 @@
+# satspathd OpenAPI 3.0.3 specification.
+# Maintained by hand from crates/satspathd/src/router.rs and handlers; see docs/API_REFERENCE.md.
+openapi: 3.0.3
+info:
+  title: satspathd HTTP API
+  version: 0.1.0
+  description: |
+    HTTP API of **satspathd**, the SatsPath receiver-profile and authoritative-server daemon.
+
+    SatsPath is a non-custodial discovery and verification layer: the daemon **never** moves funds, signs
+    Bitcoin transactions, broadcasts payments or stores seeds/spending keys. `POST /v1/pay` returns a
+    wallet-handoff payload only.
+
+    **Authentication.** Every non-`GET` request except a small public allow-list requires
+    `Authorization: Bearer <token>`, where the token is the 64-hex content of `<home>/admin.macaroon`
+    (or `SATSPATHD_AUTH_TOKEN`). `GET` routes are not authenticated.
+
+    **Pipeline order.** Host allow-list (400) → body size (413) → per-IP rate limit (429) → auth (401) → route (404).
+
+    **Errors.** Failures are `{"error": "..."}`. Some read endpoints return that body with **HTTP 200**
+    (documented per operation as `oneOf [Success, Error]`).
+
+    **Maturity.** BIP-353 is PREVIEW; BOLT12, Silent Payments, P2P and invites are EXPERIMENTAL; PQC fields are
+    RESEARCH. No independent security audit has been completed.
+
+    Illustrative example values (hashes, signatures) are synthetic and are not cryptographically valid.
+    Full prose reference: `docs/API_REFERENCE.md`.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+- url: http://127.0.0.1:9737
+  description: Local daemon (default bind)
+- url: https://{host}
+  description: TLS or reverse-proxy deployment
+  variables:
+    host:
+      default: node.example.com
+      description: Must match SATSPATH_AUTHORITY_DOMAIN or SATSPATH_AUTHORITY_URL.
+tags:
+- name: UI
+  description: Embedded dashboard assets.
+- name: Health & Diagnostics
+  description: Liveness, readiness, metrics and rate-limit state.
+- name: Node
+  description: Local daemon identity and status.
+- name: Profile
+  description: Local profile management (mostly Bearer-protected).
+- name: Resolution & Routing
+  description: Resolve, quote, preview, pay (wallet handoff), send and receive.
+- name: S2S v2
+  description: Authoritative proof-carrying server API.
+- name: Transparency
+  description: Append-only log, checkpoints, proofs and Bitcoin anchors.
+- name: Invites
+  description: Invite and claim flow for unregistered recipients.
+security: []
+paths:
+  /:
+    get:
+      tags:
+      - UI
+      summary: Dashboard (wallet UI)
+      description: 'Single-page local dashboard. Served with a restrictive CSP and `X-Frame-Options: DENY`.'
+      operationId: getDashboard
+      security: []
+      responses:
+        '200':
+          description: HTML page.
+          content:
+            text/html:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /claim:
+    get:
+      tags:
+      - UI
+      summary: Dashboard (claim view)
+      description: Same page as `/`; used by invite claim links.
+      operationId: getClaimPage
+      security: []
+      responses:
+        '200':
+          description: HTML page.
+          content:
+            text/html:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /dashboard-auth.mjs:
+    get:
+      tags:
+      - UI
+      summary: Dashboard auth helper script
+      description: 'ES module that centralises authenticated dashboard requests. `Cache-Control: no-store`.'
+      operationId: getDashboardAuthScript
+      security: []
+      responses:
+        '200':
+          description: JavaScript module.
+          content:
+            text/javascript:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /health:
+    get:
+      tags:
+      - Health & Diagnostics
+      summary: Liveness probe
+      description: Cheap liveness check. Always `healthy` when the process answers.
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthSimple'
+              example:
+                ok: true
+                status: healthy
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/health:
+    get:
+      tags:
+      - Health & Diagnostics
+      summary: Deep health check
+      description: Checks SQLite, fee API and the transparency log. Result is cached for 5 s. HTTP 200
+        for `healthy`/`degraded`, **503 for `unhealthy`**.
+      operationId: getDeepHealth
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeepHealthResponse'
+              example:
+                ok: true
+                status: healthy
+                version: 0.1.0
+                uptime_seconds: 3600
+                timestamp: 1782810000
+                dependencies:
+                  sqlite:
+                    status: healthy
+                    latency_ms: 0.4
+                    writable: true
+                    log_id: satspath:localhost
+                  fee_api:
+                    status: healthy
+                    latency_ms: 0.1
+                    reachable: true
+                    cached: true
+                  transparency_log:
+                    status: healthy
+                    latency_ms: 1.2
+                    checkpoint_count: 1
+                    latest_checkpoint_age_secs: 30
+                    is_stale: false
+        '503':
+          description: '`unhealthy` (SQLite or transparency log failing).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeepHealthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v2/health:
+    get:
+      tags:
+      - Health & Diagnostics
+      summary: S2S v2 readiness
+      description: 'HTTP 200 when `healthy`, **503 when `degraded`** (note: stricter than `/v1/health`).'
+      operationId: getV2Health
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2HealthResponse'
+              example:
+                version: 2.0.0
+                status: healthy
+                checkpoint_age_secs: 30
+                witness_quorum_healthy: true
+                replica_count: 1
+        '503':
+          description: '`degraded`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2HealthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /metrics:
+    get:
+      tags:
+      - Health & Diagnostics
+      summary: Prometheus metrics
+      description: 'Prometheus text exposition format. Scrapers inside the compose network may send `Host:
+        satspathd`, which is exempt from the Host allow-list for this route only.'
+      operationId: getMetrics
+      security: []
+      responses:
+        '200':
+          description: Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP satspathd_http_requests_total ...
+        '500':
+          description: Metrics could not be gathered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/diagnostics/rate_limit:
+    get:
+      tags:
+      - Health & Diagnostics
+      summary: Rate-limiter statistics
+      description: Operational state of the per-IP token-bucket limiter.
+      operationId: getRateLimitDiagnostics
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateLimiterStats'
+              example:
+                tracked_ips: 1
+                total_allowed: 42
+                total_blocked: 0
+                total_payload_too_large: 0
+                burst_capacity: 60
+                refill_rate_per_sec: 10.0
+                trust_proxy_headers: false
+                max_body_bytes: 65536
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/status:
+    get:
+      tags:
+      - Node
+      summary: Daemon status
+      description: Version, network, bind address, wallet/alias state, safety flags and rate-limiter stats.
+        Exposes the daemon home path; deploy behind a trusted network or proxy.
+      operationId: getStatus
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/StatusResponse'
+                - $ref: '#/components/schemas/Error'
+              example:
+                daemon: satspathd
+                version: 0.1.0
+                bind: 127.0.0.1:9737
+                network: devnet
+                home: /home/user/.satspath
+                wallet_initialized: true
+                alias: alice@example.com
+                identity_fingerprint: a8fdac91
+                methods:
+                - Lightning
+                - Onchain
+                safety:
+                  moves_funds: false
+                  signs_bitcoin_transactions: false
+                  broadcasts_transactions: false
+                  stores_wallet_seeds_or_spending_keys: false
+                  manages_signed_profiles: true
+                rate_limit:
+                  tracked_ips: 1
+                  total_allowed: 42
+                  total_blocked: 0
+                  total_payload_too_large: 0
+                  burst_capacity: 60
+                  refill_rate_per_sec: 10.0
+                  trust_proxy_headers: false
+                  max_body_bytes: 65536
+                is_tls: false
+                behind_proxy: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/node:
+    get:
+      tags:
+      - Node
+      summary: Aggregate node state
+      description: '`status` plus the local `profile` in one call.'
+      operationId: getNode
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/NodeResponse'
+                - $ref: '#/components/schemas/Error'
+              example:
+                status:
+                  daemon: satspathd
+                  version: 0.1.0
+                  bind: 127.0.0.1:9737
+                  network: devnet
+                  home: /home/user/.satspath
+                  wallet_initialized: true
+                  alias: alice@example.com
+                  identity_fingerprint: a8fdac91
+                  methods:
+                  - Lightning
+                  - Onchain
+                  safety:
+                    moves_funds: false
+                    signs_bitcoin_transactions: false
+                    broadcasts_transactions: false
+                    stores_wallet_seeds_or_spending_keys: false
+                    manages_signed_profiles: true
+                  rate_limit:
+                    tracked_ips: 1
+                    total_allowed: 42
+                    total_blocked: 0
+                    total_payload_too_large: 0
+                    burst_capacity: 60
+                    refill_rate_per_sec: 10.0
+                    trust_proxy_headers: false
+                    max_body_bytes: 65536
+                  is_tls: false
+                  behind_proxy: false
+                profile:
+                  wallet:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    lightning_address: alice@getalby.com
+                    created_at: 1782810000
+                    updated_at: 1782810000
+                  signed_profile:
+                    profile:
+                      alias: alice@example.com
+                      identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                      methods:
+                      - type: Lightning
+                        label: Lightning Address
+                        lightning_address: alice@getalby.com
+                        lnurl: null
+                        bolt12: null
+                        receiver_pubkey: null
+                      - type: Onchain
+                        label: Bitcoin (Testnet)
+                        network: Testnet
+                        address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                        pubkey_hint: null
+                        descriptor_hint: null
+                      updated_at: 1782810000
+                      expires_at: 1785402000
+                      sequence: 0
+                      preferences:
+                      - lightning
+                      - ark
+                      - onchain
+                      nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                      pqc_required: false
+                      revoked: false
+                    signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                  signature_valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/control:
+    get:
+      tags:
+      - Node
+      summary: Node control summary (EXPERIMENTAL)
+      description: 'Read-only summary used by the dashboard Node Control view: fingerprint, trust booleans,
+        transport status. Does not initialise or write local state.'
+      operationId: getControl
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                identity:
+                  fingerprint: a8fdac91
+                  active_aliases: 1
+                  identifier_scope: self_asserted
+                  identifier_authority: unverified
+                  verification:
+                    profile_signature_verified: true
+                    identifier_verified: false
+                    key_continuity_verified: true
+                    transparency_inclusion_verified: true
+                    payment_methods_verified: false
+                  capabilities:
+                  - Lightning
+                  - Onchain
+                  privacy:
+                    plaintext_dht_aliases: false
+                    private_keys_transmitted: false
+                    spending_keys_transmitted: false
+                    peer_addresses_logged: false
+                  routing_policy: Existing transparency-verified routing only; P2P candidates do not grant
+                    authority
+                hyperswarm:
+                  state: disabled
+                  announcements: 0
+                  last_publish: null
+                  last_resolution: null
+                  active_peers: null
+                http: active
+                nostr: on_demand_resolver
+                experimental: true
+        '500':
+          description: Control status unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/profile:
+    get:
+      tags:
+      - Profile
+      summary: Get local profile
+      description: Wallet state plus the current signed profile (if any) and its signature check.
+      operationId: getProfile
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/ProfileResponse'
+                - $ref: '#/components/schemas/Error'
+              example:
+                wallet:
+                  alias: alice@example.com
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  lightning_address: alice@getalby.com
+                  created_at: 1782810000
+                  updated_at: 1782810000
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                signature_valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    put:
+      tags:
+      - Profile
+      summary: Create or update profile (PUT)
+      description: Creates or updates the local public profile and re-signs it (new sequence, 30-day expiry),
+        appending a name event and operator checkpoint to the transparency log. `alias` must already be
+        verified via challenge/verify.
+      operationId: putProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileUpdateRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResponse'
+              example:
+                wallet:
+                  alias: alice@example.com
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  lightning_address: alice@getalby.com
+                  created_at: 1782810000
+                  updated_at: 1782810000
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                signature_valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags:
+      - Profile
+      summary: Create or update profile (POST)
+      description: Creates or updates the local public profile and re-signs it (new sequence, 30-day expiry),
+        appending a name event and operator checkpoint to the transparency log. `alias` must already be
+        verified via challenge/verify.
+      operationId: postProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileUpdateRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResponse'
+              example:
+                wallet:
+                  alias: alice@example.com
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  lightning_address: alice@getalby.com
+                  created_at: 1782810000
+                  updated_at: 1782810000
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                signature_valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/profile/methods:
+    post:
+      tags:
+      - Profile
+      summary: Update receive methods
+      description: Like `PUT /v1/profile` but requires an alias already set and at least one field.
+      operationId: updateProfileMethods
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileUpdateRequest'
+            example:
+              lightning_address: alice@getalby.com
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResponse'
+              example:
+                wallet:
+                  alias: alice@example.com
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  lightning_address: alice@getalby.com
+                  created_at: 1782810000
+                  updated_at: 1782810000
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                signature_valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/profile/challenge:
+    post:
+      tags:
+      - Profile
+      summary: Start alias verification (MOCK)
+      description: Creates a mock email challenge. **Not a real identifier attestation**; the token is
+        the email itself.
+      operationId: createProfileChallenge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AliasRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChallengeResponse'
+              example:
+                challenge_id: a129ce04cf19aeb5d2fb0c7f61f11fe7
+                message: 'A mock verification code was sent. (MOCK: use the email address itself as the
+                  token)'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/profile/verify:
+    post:
+      tags:
+      - Profile
+      summary: Complete alias verification (MOCK)
+      description: Binds the alias to the local identity. Signs and stores the profile if methods already
+        exist.
+      operationId: verifyProfileChallenge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResponse'
+              example:
+                wallet:
+                  alias: alice@example.com
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  lightning_address: alice@getalby.com
+                  created_at: 1782810000
+                  updated_at: 1782810000
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                signature_valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/profile/rotate-key:
+    post:
+      tags:
+      - Profile
+      summary: Rotate identity key
+      description: Generates a new identity key and publishes a dual-signed rotation (old key authorises,
+        new key accepts). No body.
+      operationId: rotateProfileKey
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyRotationResponse'
+              example:
+                alias: alice@example.com
+                sequence: 1
+                previous_fingerprint: a8fdac91
+                new_fingerprint: 5b21c0de
+                event_hash: 83787c5fbb5b4f70617932764a4194669193f76fe90ed9476c559d68bbb3ce6b
+                checkpoint_hash: 8189db3b92380da30096bdf29a51902fb08eae7cc40e27ac90e22e0e1de12e9a
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/profile/recover:
+    post:
+      tags:
+      - Profile
+      summary: Recover identity key (guardian quorum)
+      description: '**Public** (the proof is the authorisation). Verifies a guardian-threshold `KeyRecoveryProof`
+        against the recovery policy committed in the existing profile. See `docs/key_recovery.md`.'
+      operationId: recoverProfileKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileRecoverRequest'
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyRecoveryResponse'
+              example:
+                alias: alice@example.com
+                sequence: 2
+                previous_fingerprint: a8fdac91
+                new_fingerprint: 5b21c0de
+                event_hash: 83787c5fbb5b4f70617932764a4194669193f76fe90ed9476c559d68bbb3ce6b
+                checkpoint_hash: 8189db3b92380da30096bdf29a51902fb08eae7cc40e27ac90e22e0e1de12e9a
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/broadcast:
+    post:
+      tags:
+      - Profile
+      summary: Save profile for publication
+      description: 'Ensures a signed profile exists. Does **not** announce anywhere: enabled transports
+        (e.g. `--p2p`) publish independently.'
+      operationId: broadcastProfile
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/BroadcastResponse'
+                - $ref: '#/components/schemas/Error'
+              example:
+                broadcasting: false
+                status: Profile saved. Enabled transports manage publication; saving is not proof of network
+                  availability.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/resolve:
+    post:
+      tags:
+      - Resolution & Routing
+      summary: Resolve a local profile with full transparency verification
+      description: Verifies signature, identifier history, key continuity, inclusion, checkpoint consistency
+        (pin) and payment-method ownership. **Requires Bearer.** Any failure (including a bad body) returns
+        **404**.
+      operationId: resolveProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AliasRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolvedTransparentProfile'
+              example:
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                latest_event:
+                  version: 1
+                  identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                  action: register
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  profile_hash: 9ad7422a044176a40ca4512f5a61b9e8b80edc918cc52738b3eb17f4beddf74d
+                  sequence: 0
+                  previous_event_hash: null
+                  created_at: 1782810000
+                  identifier_attestation_hash: null
+                  rotation: null
+                  owner_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                inclusion_proof:
+                  leaf_index: 0
+                  tree_size: 1
+                  leaf_hash: 4d5a9584d985e8fb44015a8affa9b76f1ff16f65e61df7156d8e8159e1448978
+                  audit_path: []
+                  root_hash: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                checkpoint:
+                  version: 1
+                  log_id: satspath:localhost
+                  log_size: 1
+                  log_root: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                  map_root: 2bbf282cf3c111e44597ee3466f17f7fdd68c52070e778666a7de427a50b4d0d
+                  previous_checkpoint_hash: null
+                  created_at: 1782810000
+                  operator_pubkey: 02e5f40f6b4a05a48eb12441c6c85033e3c219fe8e3f6bc2f377821fe3041ddc35
+                  operator_sequence: 0
+                  operator_rotation: null
+                  operator_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                  bitcoin_anchor: null
+                consistency_proof: null
+                identifier_attestation: null
+                resolver_source: local_registry
+                verification:
+                  profile_signature_verified: true
+                  identifier_verified: false
+                  key_continuity_verified: true
+                  transparency_inclusion_verified: true
+                  checkpoint_binding_verified: true
+                  checkpoint_consistency_verified: true
+                  operator_continuity_verified: true
+                  payment_methods_verified: false
+                  payment_method_states:
+                  - descriptor: ln-address:alice@getalby.com
+                    verified: false
+                    trust_tier: SelfAsserted
+                    reason: self-attestation is not independent ownership proof
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/quote:
+    post:
+      tags:
+      - Resolution & Routing
+      summary: Quote the best rail
+      description: Resolves transparently, keeps only methods with a valid ownership proof, then selects
+        a route. **Requires Bearer.** Protocol outcomes are `status` values in an HTTP 200 body.
+      operationId: quote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuoteResponse'
+              example:
+                status: ok
+                recipient:
+                  alias: alice@example.com
+                  verified: true
+                  profile_signature_verified: true
+                  identifier_verified: false
+                  identifier_verification: identifier-only; no inbox/domain ownership proof in this response
+                  fingerprint: a8fdac91
+                selected_method:
+                  type: Lightning
+                  label: Lightning Address
+                  lightning_address: alice@getalby.com
+                  lnurl: null
+                  bolt12: null
+                  receiver_pubkey: null
+                fee_sats: 1
+                eta: instant
+                reason: Amount is below Lightning threshold and Lightning is available.
+                qr: alice@getalby.com
+                execution: manual_wallet
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/preview:
+    post:
+      tags:
+      - Resolution & Routing
+      summary: Preview a quote with safety warnings
+      description: 'Same as `/v1/quote`, wrapped with `mode: preview_only` and non-custody warnings. **Requires
+        Bearer.**'
+      operationId: preview
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreviewResponse'
+              example:
+                mode: preview_only
+                warnings:
+                - satspathd does not move funds
+                - satspathd does not sign Bitcoin transactions
+                - satspathd does not broadcast transactions
+                - payment execution happens in an external wallet
+                quote:
+                  status: ok
+                  recipient:
+                    alias: alice@example.com
+                    verified: true
+                    profile_signature_verified: true
+                    identifier_verified: false
+                    identifier_verification: identifier-only; no inbox/domain ownership proof in this
+                      response
+                    fingerprint: a8fdac91
+                  selected_method:
+                    type: Lightning
+                    label: Lightning Address
+                    lightning_address: alice@getalby.com
+                    lnurl: null
+                    bolt12: null
+                    receiver_pubkey: null
+                  fee_sats: 1
+                  eta: instant
+                  reason: Amount is below Lightning threshold and Lightning is available.
+                  qr: alice@getalby.com
+                  execution: manual_wallet
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/pay:
+    post:
+      tags:
+      - Resolution & Routing
+      summary: Wallet handoff (never executes payment)
+      description: Returns a payment payload and QR for an external wallet. The daemon never moves funds.
+        **Requires Bearer.**
+      operationId: pay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayResponse'
+              example:
+                status: wallet_handoff
+                decision_protocol: satspathd.v1
+                recipient: alice@example.com
+                amount_sats: 21000
+                quote:
+                  status: ok
+                  recipient:
+                    alias: alice@example.com
+                    verified: true
+                    profile_signature_verified: true
+                    identifier_verified: false
+                    identifier_verification: identifier-only; no inbox/domain ownership proof in this
+                      response
+                    fingerprint: a8fdac91
+                  selected_method:
+                    type: Lightning
+                    label: Lightning Address
+                    lightning_address: alice@getalby.com
+                    lnurl: null
+                    bolt12: null
+                    receiver_pubkey: null
+                  fee_sats: 1
+                  eta: instant
+                  reason: Amount is below Lightning threshold and Lightning is available.
+                  qr: alice@getalby.com
+                  execution: manual_wallet
+                payment_payload: alice@getalby.com
+                qr_svg: <svg xmlns='http://www.w3.org/2000/svg'/>
+                handoff:
+                  mode: external_wallet
+                  instruction: Open or scan payment_payload with a wallet you control.
+                  opens_external_wallet: true
+                  daemon_executes_payment: false
+                safety:
+                  moves_funds: false
+                  signs_bitcoin_transactions: false
+                  broadcasts_transactions: false
+                  stores_wallet_seeds_or_spending_keys: false
+                  manages_signed_profiles: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/send:
+    post:
+      tags:
+      - Resolution & Routing
+      summary: Preview send via the legacy resolver chain
+      description: '**Public.** Resolves through registry, BIP-353, HTTPS and Nostr, picks a rail and
+        returns a payload and QR (`mode: preview_only`). If the recipient is unknown it creates a persisted
+        invite (EXPERIMENTAL). Unlike `/v1/quote` it does not apply transparency verification.'
+      operationId: send
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendRequest'
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendResponse'
+              example:
+                status: ok
+                mode: preview_only
+                rail: lightning
+                reason: Lightning preferred for small amounts
+                recipient: a***@example.com
+                profile_signature_verified: true
+                identifier_verified: false
+                identifier_verification: identifier-only; no inbox/domain ownership proof in this response
+                amount_sats: 21000
+                payload: alice@getalby.com
+                qr_svg: <svg xmlns='http://www.w3.org/2000/svg'/>
+                safety:
+                  moves_funds: false
+                  signs_bitcoin_transactions: false
+                  broadcasts_transactions: false
+                  stores_wallet_seeds_or_spending_keys: false
+                  manages_signed_profiles: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/receive:
+    post:
+      tags:
+      - Resolution & Routing
+      summary: Receive payload and QR for own profile
+      description: '**Public.** Builds a public receive pointer from the local wallet''s configured methods.
+        Errors return HTTP 200 with an `Error` body.'
+      operationId: receive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReceiveRequest'
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/ReceiveView'
+                - $ref: '#/components/schemas/Error'
+              example:
+                alias: a***@example.com
+                rail: Onchain
+                payload: bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx?amount=0.00025000
+                qr_svg: <svg xmlns='http://www.w3.org/2000/svg'/>
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/dns/resolve:
+    post:
+      tags:
+      - Resolution & Routing
+      summary: Resolve a BIP-353 name (PREVIEW)
+      description: '**Public.** DoH-based; Strict DNSSEC policy fails closed because the default backend
+        cannot validate the chain locally.'
+      operationId: resolveDns
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DnsResolveRequest'
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DnsResolveResponse'
+              example:
+                status: error
+                name: alice@example.com
+                error: DNSSEC validation required
+                strict_mode: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/p2p/resolve:
+    post:
+      tags:
+      - Resolution & Routing
+      summary: Resolve a P2P candidate (EXPERIMENTAL)
+      description: Fetches a signed profile candidate over Hyperswarm (needs `--p2p`). The result is never
+        routable and never persisted. **Requires Bearer.** Every failure is a generic HTTP 400.
+      operationId: resolveP2pCandidate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AliasRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/P2pCandidateResponse'
+              example:
+                source: hyperswarm
+                routing_eligible: false
+                profile_signature_verified: true
+                identifier_verified: false
+                key_continuity_verified: false
+                transparency_verified: false
+                identifier_scope: self_asserted
+                payment_method_states:
+                - descriptor: ln-address:alice@getalby.com
+                  verified: false
+                  trust_tier: SelfAsserted
+                  reason: self-attestation is not independent ownership proof
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                warning: Candidate only. Namespace authority and remote transparency are unverified. Not
+                  imported or usable for routing.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/dashboard/auth:
+    post:
+      tags:
+      - Node
+      summary: Validate Bearer token (dashboard sign-in)
+      description: Succeeds only when the Bearer guard passes. Changes no state; issues no token or cookie.
+      operationId: dashboardAuth
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardAuthResponse'
+              example:
+                authenticated: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /.well-known/satspath-authority:
+    get:
+      tags:
+      - S2S v2
+      summary: Namespace descriptor
+      description: Operator public key, log id, endpoints and witness policy for the hosted namespace.
+        `signature` is currently empty. Identical to the other path.
+      operationId: getWellKnownAuthority
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/NamespaceDescriptor'
+                - $ref: '#/components/schemas/Error'
+              example:
+                version: 2
+                domain: localhost
+                log_id: satspath:localhost
+                authority_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                endpoint_urls:
+                - http://127.0.0.1:9737/v2
+                witness_quorum: 1
+                witness_pubkeys: []
+                valid_from: 1782810000
+                expires_at: 1785402000
+                signature: ''
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v2/namespace:
+    get:
+      tags:
+      - S2S v2
+      summary: Namespace descriptor
+      description: Operator public key, log id, endpoints and witness policy for the hosted namespace.
+        `signature` is currently empty. Identical to the other path.
+      operationId: getNamespace
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/NamespaceDescriptor'
+                - $ref: '#/components/schemas/Error'
+              example:
+                version: 2
+                domain: localhost
+                log_id: satspath:localhost
+                authority_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                endpoint_urls:
+                - http://127.0.0.1:9737/v2
+                witness_quorum: 1
+                witness_pubkeys: []
+                valid_from: 1782810000
+                expires_at: 1785402000
+                signature: ''
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v2/resolve:
+    get:
+      tags:
+      - S2S v2
+      summary: Resolve identifier (query)
+      description: Public proof-carrying resolution. Prefer the POST form to keep identifiers out of URLs
+        and logs. 404 when the message contains "not found", otherwise 400.
+      operationId: resolveV2Get
+      parameters:
+      - name: identifier
+        in: query
+        required: true
+        description: Identifier to resolve.
+        schema:
+          type: string
+        example: alice@example.com
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolutionEnvelope'
+              example:
+                version: 2
+                identifier: alice@example.com
+                namespace_descriptor:
+                  version: 2
+                  domain: localhost
+                  log_id: satspath:localhost
+                  authority_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  endpoint_urls:
+                  - http://127.0.0.1:9737/v2
+                  witness_quorum: 1
+                  witness_pubkeys: []
+                  valid_from: 1782810000
+                  expires_at: 1785402000
+                  signature: ''
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                name_events:
+                - version: 1
+                  identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                  action: register
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  profile_hash: 9ad7422a044176a40ca4512f5a61b9e8b80edc918cc52738b3eb17f4beddf74d
+                  sequence: 0
+                  previous_event_hash: null
+                  created_at: 1782810000
+                  identifier_attestation_hash: null
+                  rotation: null
+                  owner_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                inclusion_proof:
+                  leaf_index: 0
+                  tree_size: 1
+                  leaf_hash: 4d5a9584d985e8fb44015a8affa9b76f1ff16f65e61df7156d8e8159e1448978
+                  audit_path: []
+                  root_hash: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                checkpoint:
+                  version: 1
+                  log_id: satspath:localhost
+                  log_size: 1
+                  log_root: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                  map_root: 2bbf282cf3c111e44597ee3466f17f7fdd68c52070e778666a7de427a50b4d0d
+                  previous_checkpoint_hash: null
+                  created_at: 1782810000
+                  operator_pubkey: 02e5f40f6b4a05a48eb12441c6c85033e3c219fe8e3f6bc2f377821fe3041ddc35
+                  operator_sequence: 0
+                  operator_rotation: null
+                  operator_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                  bitcoin_anchor: null
+                consistency_proof: null
+                current_state_proof:
+                  key_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                  value:
+                    latest_event_hash: 83787c5fbb5b4f70617932764a4194669193f76fe90ed9476c559d68bbb3ce6b
+                    sequence: 0
+                    status: Registered
+                  audit_path: []
+                witness_cosignatures: []
+                served_at: 1782810000
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags:
+      - S2S v2
+      summary: Resolve identifier (body)
+      description: Public proof-carrying resolution. Only `identifier` is honoured today.
+      operationId: resolveV2Post
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolutionRequest'
+            example:
+              identifier: alice@example.com
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolutionEnvelope'
+              example:
+                version: 2
+                identifier: alice@example.com
+                namespace_descriptor:
+                  version: 2
+                  domain: localhost
+                  log_id: satspath:localhost
+                  authority_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  endpoint_urls:
+                  - http://127.0.0.1:9737/v2
+                  witness_quorum: 1
+                  witness_pubkeys: []
+                  valid_from: 1782810000
+                  expires_at: 1785402000
+                  signature: ''
+                signed_profile:
+                  profile:
+                    alias: alice@example.com
+                    identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                    methods:
+                    - type: Lightning
+                      label: Lightning Address
+                      lightning_address: alice@getalby.com
+                      lnurl: null
+                      bolt12: null
+                      receiver_pubkey: null
+                    - type: Onchain
+                      label: Bitcoin (Testnet)
+                      network: Testnet
+                      address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                      pubkey_hint: null
+                      descriptor_hint: null
+                    updated_at: 1782810000
+                    expires_at: 1785402000
+                    sequence: 0
+                    preferences:
+                    - lightning
+                    - ark
+                    - onchain
+                    nonce: 648f8e193a06c30767e71fb32a4ab2ab
+                    pqc_required: false
+                    revoked: false
+                  signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                name_events:
+                - version: 1
+                  identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                  action: register
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  profile_hash: 9ad7422a044176a40ca4512f5a61b9e8b80edc918cc52738b3eb17f4beddf74d
+                  sequence: 0
+                  previous_event_hash: null
+                  created_at: 1782810000
+                  identifier_attestation_hash: null
+                  rotation: null
+                  owner_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                inclusion_proof:
+                  leaf_index: 0
+                  tree_size: 1
+                  leaf_hash: 4d5a9584d985e8fb44015a8affa9b76f1ff16f65e61df7156d8e8159e1448978
+                  audit_path: []
+                  root_hash: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                checkpoint:
+                  version: 1
+                  log_id: satspath:localhost
+                  log_size: 1
+                  log_root: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                  map_root: 2bbf282cf3c111e44597ee3466f17f7fdd68c52070e778666a7de427a50b4d0d
+                  previous_checkpoint_hash: null
+                  created_at: 1782810000
+                  operator_pubkey: 02e5f40f6b4a05a48eb12441c6c85033e3c219fe8e3f6bc2f377821fe3041ddc35
+                  operator_sequence: 0
+                  operator_rotation: null
+                  operator_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                  bitcoin_anchor: null
+                consistency_proof: null
+                current_state_proof:
+                  key_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                  value:
+                    latest_event_hash: 83787c5fbb5b4f70617932764a4194669193f76fe90ed9476c559d68bbb3ce6b
+                    sequence: 0
+                    status: Registered
+                  audit_path: []
+                witness_cosignatures: []
+                served_at: 1782810000
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/status:
+    get:
+      tags:
+      - Transparency
+      summary: Log status
+      description: Size, root, counters and consistency status of the append-only log.
+      operationId: getTransparencyStatus
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/TransparencyStatus'
+                - $ref: '#/components/schemas/Error'
+              example:
+                log_size: 1
+                log_root: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                latest_checkpoint_hash: 8189db3b92380da30096bdf29a51902fb08eae7cc40e27ac90e22e0e1de12e9a
+                registered_identifiers: 1
+                key_rotations: 0
+                key_recoveries: 0
+                revocations: 0
+                map_root: 2bbf282cf3c111e44597ee3466f17f7fdd68c52070e778666a7de427a50b4d0d
+                consistency_status: valid
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/checkpoints:
+    get:
+      tags:
+      - Transparency
+      summary: List checkpoints
+      description: Paginated operator-signed checkpoints.
+      operationId: listCheckpoints
+      parameters:
+      - name: offset
+        in: query
+        required: false
+        description: Items to skip.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+      - name: limit
+        in: query
+        required: false
+        description: Page size (clamped to 1-200).
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 200
+          default: 50
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/CheckpointPage'
+                - $ref: '#/components/schemas/Error'
+              example:
+                items:
+                - version: 1
+                  log_id: satspath:localhost
+                  log_size: 1
+                  log_root: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                  map_root: 2bbf282cf3c111e44597ee3466f17f7fdd68c52070e778666a7de427a50b4d0d
+                  previous_checkpoint_hash: null
+                  created_at: 1782810000
+                  operator_pubkey: 02e5f40f6b4a05a48eb12441c6c85033e3c219fe8e3f6bc2f377821fe3041ddc35
+                  operator_sequence: 0
+                  operator_rotation: null
+                  operator_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                  bitcoin_anchor: null
+                offset: 0
+                limit: 50
+                total: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/checkpoints/{hash}:
+    get:
+      tags:
+      - Transparency
+      summary: Get checkpoint by hash
+      description: Returns HTTP 200 with an `Error` body when the checkpoint is unknown.
+      operationId: getCheckpoint
+      parameters:
+      - name: hash
+        in: path
+        required: true
+        description: Checkpoint hash (hex).
+        schema:
+          type: string
+        example: 8189db3b92380da30096bdf29a51902fb08eae7cc40e27ac90e22e0e1de12e9a
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/TransparencyCheckpoint'
+                - $ref: '#/components/schemas/Error'
+              example:
+                version: 1
+                log_id: satspath:localhost
+                log_size: 1
+                log_root: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                map_root: 2bbf282cf3c111e44597ee3466f17f7fdd68c52070e778666a7de427a50b4d0d
+                previous_checkpoint_hash: null
+                created_at: 1782810000
+                operator_pubkey: 02e5f40f6b4a05a48eb12441c6c85033e3c219fe8e3f6bc2f377821fe3041ddc35
+                operator_sequence: 0
+                operator_rotation: null
+                operator_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                bitcoin_anchor: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/events:
+    get:
+      tags:
+      - Transparency
+      summary: List name events
+      description: Paginated name events.
+      operationId: listEvents
+      parameters:
+      - name: offset
+        in: query
+        required: false
+        description: Items to skip.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+      - name: limit
+        in: query
+        required: false
+        description: Page size (clamped to 1-200).
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 200
+          default: 50
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/EventPage'
+                - $ref: '#/components/schemas/Error'
+              example:
+                items:
+                - version: 1
+                  identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                  action: register
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  profile_hash: 9ad7422a044176a40ca4512f5a61b9e8b80edc918cc52738b3eb17f4beddf74d
+                  sequence: 0
+                  previous_event_hash: null
+                  created_at: 1782810000
+                  identifier_attestation_hash: null
+                  rotation: null
+                  owner_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                offset: 0
+                limit: 50
+                total: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/events/{hash}:
+    get:
+      tags:
+      - Transparency
+      summary: Get event by hash
+      description: Returns HTTP 200 with an `Error` body when the event is unknown.
+      operationId: getEvent
+      parameters:
+      - name: hash
+        in: path
+        required: true
+        description: Event hash (hex).
+        schema:
+          type: string
+        example: 83787c5fbb5b4f70617932764a4194669193f76fe90ed9476c559d68bbb3ce6b
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/NameEvent'
+                - $ref: '#/components/schemas/Error'
+              example:
+                version: 1
+                identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                action: register
+                identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                profile_hash: 9ad7422a044176a40ca4512f5a61b9e8b80edc918cc52738b3eb17f4beddf74d
+                sequence: 0
+                previous_event_hash: null
+                created_at: 1782810000
+                identifier_attestation_hash: null
+                rotation: null
+                owner_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/identifiers/{id}:
+    get:
+      tags:
+      - Transparency
+      summary: Identifier history
+      description: History of one identifier, keyed by `SHA256(canonical_identifier)` (not the plaintext
+        alias).
+      operationId: getIdentifierHistory
+      parameters:
+      - name: id
+        in: path
+        required: true
+        description: Identifier hash (hex).
+        schema:
+          type: string
+        example: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/IdentifierHistory'
+                - $ref: '#/components/schemas/Error'
+              example:
+                identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                latest:
+                  version: 1
+                  identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                  action: register
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  profile_hash: 9ad7422a044176a40ca4512f5a61b9e8b80edc918cc52738b3eb17f4beddf74d
+                  sequence: 0
+                  previous_event_hash: null
+                  created_at: 1782810000
+                  identifier_attestation_hash: null
+                  rotation: null
+                  owner_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                history:
+                - version: 1
+                  identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                  action: register
+                  identity_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                  profile_hash: 9ad7422a044176a40ca4512f5a61b9e8b80edc918cc52738b3eb17f4beddf74d
+                  sequence: 0
+                  previous_event_hash: null
+                  created_at: 1782810000
+                  identifier_attestation_hash: null
+                  rotation: null
+                  owner_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/inclusion/{hash}:
+    get:
+      tags:
+      - Transparency
+      summary: Inclusion proof for an event
+      description: RFC 6962-style audit path for the event hash against the current tree.
+      operationId: getInclusionProof
+      parameters:
+      - name: hash
+        in: path
+        required: true
+        description: Event hash (hex).
+        schema:
+          type: string
+        example: 83787c5fbb5b4f70617932764a4194669193f76fe90ed9476c559d68bbb3ce6b
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/MerkleInclusionProof'
+                - $ref: '#/components/schemas/Error'
+              example:
+                leaf_index: 0
+                tree_size: 1
+                leaf_hash: 4d5a9584d985e8fb44015a8affa9b76f1ff16f65e61df7156d8e8159e1448978
+                audit_path: []
+                root_hash: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/consistency:
+    get:
+      tags:
+      - Transparency
+      summary: Consistency proof between tree sizes
+      description: Proof that the tree of size `from` is a prefix of the tree of size `to`.
+      operationId: getConsistencyProof
+      parameters:
+      - name: from
+        in: query
+        required: true
+        description: Older tree size.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+        example: 1
+      - name: to
+        in: query
+        required: true
+        description: Newer tree size.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+        example: 3
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/MerkleConsistencyProof'
+                - $ref: '#/components/schemas/Error'
+              example:
+                version: 2
+                old_tree_size: 1
+                new_tree_size: 3
+                old_root: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                new_root: 27e641bc7b14206d64267832137b662f7d6d1c18fafc835b1e55820b79fc7849
+                audit_path:
+                - 796690d3d284ec098f0f30b58c66f95a70ac32e7c2ec38d39a504a29dc9f376b
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/anchors:
+    get:
+      tags:
+      - Transparency
+      summary: List Bitcoin anchors
+      description: Paginated checkpoint anchors.
+      operationId: listAnchors
+      parameters:
+      - name: offset
+        in: query
+        required: false
+        description: Items to skip.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+      - name: limit
+        in: query
+        required: false
+        description: Page size (clamped to 1-200).
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 200
+          default: 50
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/AnchorPage'
+                - $ref: '#/components/schemas/Error'
+              example:
+                items:
+                - network: Regtest
+                  txid: 523aa9f5adefdfbe9695ec5fe04e64f26ca3e374db0c46197b3b5f53ed9e7836
+                  block_hash: 3da2892d37823d9298e1d5011d7dcfaaf2d9d9a6d465e99be33af5be1d87c12b
+                  block_height: 102
+                  confirmations: 1
+                  commitment: dbb001d76c26603a289c5e3969241c36d1550ef22abb5ead42509599d1f7077f
+                  verified: true
+                  continuation_vout: 1
+                  chain_index: 0
+                offset: 0
+                limit: 50
+                total: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags:
+      - Transparency
+      summary: Anchor the latest checkpoint (regtest)
+      description: Broadcasts a Catena OP_RETURN anchor through Bitcoin Core RPC (`SATSPATH_BITCOIN_*`
+        env). Regtest only; fails otherwise. **Requires Bearer.** Errors are HTTP 400. This is node-side
+        anchoring of a public commitment, not a user payment.
+      operationId: anchorLatestCheckpoint
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BitcoinAnchor'
+              example:
+                network: Regtest
+                txid: 523aa9f5adefdfbe9695ec5fe04e64f26ca3e374db0c46197b3b5f53ed9e7836
+                block_hash: 3da2892d37823d9298e1d5011d7dcfaaf2d9d9a6d465e99be33af5be1d87c12b
+                block_height: 102
+                confirmations: 1
+                commitment: dbb001d76c26603a289c5e3969241c36d1550ef22abb5ead42509599d1f7077f
+                verified: true
+                continuation_vout: 1
+                chain_index: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/anchors/{txid}:
+    get:
+      tags:
+      - Transparency
+      summary: Get anchor by txid
+      description: Returns HTTP 200 with an `Error` body when unknown.
+      operationId: getAnchor
+      parameters:
+      - name: txid
+        in: path
+        required: true
+        description: Anchor transaction id.
+        schema:
+          type: string
+        example: 523aa9f5adefdfbe9695ec5fe04e64f26ca3e374db0c46197b3b5f53ed9e7836
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/BitcoinAnchor'
+                - $ref: '#/components/schemas/Error'
+              example:
+                network: Regtest
+                txid: 523aa9f5adefdfbe9695ec5fe04e64f26ca3e374db0c46197b3b5f53ed9e7836
+                block_hash: 3da2892d37823d9298e1d5011d7dcfaaf2d9d9a6d465e99be33af5be1d87c12b
+                block_height: 102
+                confirmations: 1
+                commitment: dbb001d76c26603a289c5e3969241c36d1550ef22abb5ead42509599d1f7077f
+                verified: true
+                continuation_vout: 1
+                chain_index: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/catena/chain:
+    get:
+      tags:
+      - Transparency
+      summary: Catena anchor chain
+      description: Chained anchors (each spends the previous continuation output).
+      operationId: getCatenaChain
+      parameters:
+      - name: offset
+        in: query
+        required: false
+        description: Items to skip.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+      - name: limit
+        in: query
+        required: false
+        description: Page size (clamped to 1-200).
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 200
+          default: 50
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/CatenaChain'
+                - $ref: '#/components/schemas/Error'
+              example:
+                chain_length: 1
+                genesis:
+                  network: Regtest
+                  txid: 523aa9f5adefdfbe9695ec5fe04e64f26ca3e374db0c46197b3b5f53ed9e7836
+                  block_hash: 3da2892d37823d9298e1d5011d7dcfaaf2d9d9a6d465e99be33af5be1d87c12b
+                  block_height: 102
+                  confirmations: 1
+                  commitment: dbb001d76c26603a289c5e3969241c36d1550ef22abb5ead42509599d1f7077f
+                  verified: true
+                  continuation_vout: 1
+                  chain_index: 0
+                latest:
+                  network: Regtest
+                  txid: 523aa9f5adefdfbe9695ec5fe04e64f26ca3e374db0c46197b3b5f53ed9e7836
+                  block_hash: 3da2892d37823d9298e1d5011d7dcfaaf2d9d9a6d465e99be33af5be1d87c12b
+                  block_height: 102
+                  confirmations: 1
+                  commitment: dbb001d76c26603a289c5e3969241c36d1550ef22abb5ead42509599d1f7077f
+                  verified: true
+                  continuation_vout: 1
+                  chain_index: 0
+                anchors:
+                  items:
+                  - network: Regtest
+                    txid: 523aa9f5adefdfbe9695ec5fe04e64f26ca3e374db0c46197b3b5f53ed9e7836
+                    block_hash: 3da2892d37823d9298e1d5011d7dcfaaf2d9d9a6d465e99be33af5be1d87c12b
+                    block_height: 102
+                    confirmations: 1
+                    commitment: dbb001d76c26603a289c5e3969241c36d1550ef22abb5ead42509599d1f7077f
+                    verified: true
+                    continuation_vout: 1
+                    chain_index: 0
+                  offset: 0
+                  limit: 50
+                  total: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/verify/inclusion:
+    post:
+      tags:
+      - Transparency
+      summary: Verify an inclusion proof
+      description: '**Public** stateless verification of event, proof and checkpoint.'
+      operationId: verifyInclusion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InclusionVerifyRequest'
+            example:
+              event_hash: 83787c5fbb5b4f70617932764a4194669193f76fe90ed9476c559d68bbb3ce6b
+              proof:
+                leaf_index: 0
+                tree_size: 1
+                leaf_hash: 4d5a9584d985e8fb44015a8affa9b76f1ff16f65e61df7156d8e8159e1448978
+                audit_path: []
+                root_hash: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+              checkpoint:
+                version: 1
+                log_id: satspath:localhost
+                log_size: 1
+                log_root: d0508cb8ac4296ebff9aafb902978f0ef167b6c03aa332bef035b521aabe6a18
+                map_root: 2bbf282cf3c111e44597ee3466f17f7fdd68c52070e778666a7de427a50b4d0d
+                previous_checkpoint_hash: null
+                created_at: 1782810000
+                operator_pubkey: 02e5f40f6b4a05a48eb12441c6c85033e3c219fe8e3f6bc2f377821fe3041ddc35
+                operator_sequence: 0
+                operator_rotation: null
+                operator_signature: f3f15a23e43f1388ece45c2f00ba41bfd2920b2279d403707655f6153c114205645761ef0cb669e4c9879bb2dbb64c5fdd8de10211f307fd0d0366b6b96ceee5
+                bitcoin_anchor: null
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidResult'
+              example:
+                valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/verify/consistency:
+    post:
+      tags:
+      - Transparency
+      summary: Verify a consistency proof
+      description: Stateless verification. **Requires Bearer** (only inclusion and catena verification
+        are public).
+      operationId: verifyConsistency
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsistencyVerifyRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidResult'
+              example:
+                valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/transparency/verify/catena:
+    post:
+      tags:
+      - Transparency
+      summary: Verify anchor-chain structure
+      description: '**Public.** In-memory structural check of supplied anchors (linkage, indices, optional
+        commitments). Does **not** query Bitcoin; clients must verify confirmations independently.'
+      operationId: verifyCatena
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatenaVerifyRequest'
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatenaVerifyResult'
+              example:
+                structurally_consistent: true
+                commitments_valid: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/claim:
+    get:
+      tags:
+      - Invites
+      summary: Inspect an invite (query)
+      description: Public. Returns claimability and sender-signature verification. Unknown invites return
+        HTTP 200 with an `Error` body; a missing id returns 400.
+      operationId: inspectInvite
+      parameters:
+      - name: invite_id
+        in: query
+        required: false
+        description: Invite UUID.
+        schema:
+          type: string
+        example: 6f1c2d3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/InspectInviteResponse'
+                - $ref: '#/components/schemas/Error'
+              example:
+                invite_id: 6f1c2d3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                display_hint: a***@example.com
+                amount_sats: 250
+                memo: null
+                status: waiting_for_claim
+                is_expired: false
+                is_claimable: true
+                created_at: 1782810000
+                expires_at: 1782896400
+                sender_verified: true
+                sender_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags:
+      - Invites
+      summary: Claim an invite and publish a profile
+      description: '**Public.** Validates sender signature, expiry and alias binding, publishes the receiver
+        profile to the transparency log and queues a sender notification. 404 unknown, 409 already claimed,
+        400 otherwise.'
+      operationId: claimInvite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimRequest'
+      security: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimResponse'
+              example:
+                status: claimed
+                invite_id: 6f1c2d3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                alias: alice@example.com
+                amount_sats: 250
+                profile_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                claimed_at: 1782810000
+                message: Invite successfully claimed and receiver profile published to transparency log
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Already claimed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: invite has already been claimed
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/claim/{id}:
+    get:
+      tags:
+      - Invites
+      summary: Inspect an invite (path)
+      description: Path form of `GET /v1/claim?invite_id=`.
+      operationId: inspectInviteByPath
+      parameters:
+      - name: id
+        in: path
+        required: true
+        description: Invite UUID.
+        schema:
+          type: string
+        example: 6f1c2d3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/InspectInviteResponse'
+                - $ref: '#/components/schemas/Error'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/invites:
+    get:
+      tags:
+      - Invites
+      summary: List invites
+      description: All locally stored invite records.
+      operationId: listInvites
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/InviteRecord'
+                - $ref: '#/components/schemas/Error'
+              example:
+              - invite_id: 6f1c2d3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                display_hint: a***@example.com
+                amount_sats: 250
+                memo: null
+                sender_fingerprint: local-sender
+                status: waiting_for_claim
+                created_at: 1782810000
+                expires_at: 1782896400
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/invites/notifications:
+    get:
+      tags:
+      - Invites
+      summary: List claim notifications
+      description: Notifications for claimed invites.
+      operationId: listNotifications
+      security: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/ClaimNotification'
+                - $ref: '#/components/schemas/Error'
+              example:
+              - notification_id: 820d5d8baf762ec66dcd56fed15c78bf
+                invite_id: 6f1c2d3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                identifier_hash: 0eb5e4b493c42a291a330ad6ecf97ebe17208e429153ac5b97f571223bde5bb9
+                display_hint: a***@example.com
+                amount_sats: 250
+                claimed_at: 1782810000
+                claimed_profile_pubkey: 03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b
+                read: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/invites/notifications/read-all:
+    post:
+      tags:
+      - Invites
+      summary: Mark all notifications read
+      description: No body. **Requires Bearer.**
+      operationId: markAllNotificationsRead
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/AllNotificationsReadResult'
+                - $ref: '#/components/schemas/Error'
+              example:
+                status: ok
+                all_read: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /v1/invites/notifications/{id}/read:
+    post:
+      tags:
+      - Invites
+      summary: Mark one notification read
+      description: No body. **Requires Bearer.** The trailing `/read` is optional on the server (`/v1/invites/notifications/{id}`
+        behaves identically).
+      operationId: markNotificationRead
+      parameters:
+      - name: id
+        in: path
+        required: true
+        description: Notification id.
+        schema:
+          type: string
+        example: n1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Success. **On failure the daemon also answers HTTP 200** with an `Error` body.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/NotificationReadResult'
+                - $ref: '#/components/schemas/Error'
+              example:
+                status: ok
+                notification_id: n1
+                read: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 64-hex admin token from `<SATSPATH_HOME>/admin.macaroon` or `SATSPATHD_AUTH_TOKEN`.
+        Never log or share it.
+  headers:
+    XRequestId:
+      description: Correlation id (echoed from the request or generated).
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: Malformed or invalid request, or an untrusted/missing/duplicate `Host` header.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: untrusted HTTP Host
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+    Unauthorized:
+      description: Missing or invalid Bearer token (fail-closed).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: 'Unauthorized: Invalid or missing Bearer token'
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+    PayloadTooLarge:
+      description: Request body exceeds 64 KiB (65,536 bytes) by default.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PayloadTooLargeError'
+    TooManyRequests:
+      description: Per-IP token bucket exhausted.
+      headers:
+        Retry-After:
+          description: Seconds to wait.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RateLimitError'
+    NotFound:
+      description: Resource or endpoint not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: endpoint not found
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+      required:
+      - error
+      description: 'Error body used by every non-success response. NOTE: several endpoints return this
+        body with HTTP 200 (see `docs/API_REFERENCE.md`, "Errors returned with HTTP 200").'
+      example:
+        error: endpoint not found
+    RateLimitError:
+      type: object
+      properties:
+        error:
+          type: string
+        retry_after:
+          type: integer
+          format: int64
+          description: Seconds until a token is available.
+      required:
+      - error
+      - retry_after
+      example:
+        error: 'Too Many Requests: rate limit exceeded'
+        retry_after: 2
+    PayloadTooLargeError:
+      type: object
+      properties:
+        error:
+          type: string
+        max_bytes:
+          type: integer
+          format: int64
+          description: Configured body limit.
+      required:
+      - error
+      - max_bytes
+      example:
+        error: 'Payload Too Large: request body exceeds limit of 65536 bytes'
+        max_bytes: 65536
+    BitcoinNetwork:
+      type: string
+      enum:
+      - Mainnet
+      - Testnet
+      - Regtest
+    ArkOwnershipProof:
+      type: object
+      properties:
+        message:
+          type: string
+        signature:
+          type: string
+        pubkey:
+          type: string
+      required:
+      - message
+      - signature
+      - pubkey
+    PaymentMethod:
+      oneOf:
+      - $ref: '#/components/schemas/OnchainMethod'
+      - $ref: '#/components/schemas/LightningMethod'
+      - $ref: '#/components/schemas/ArkMethod'
+      - $ref: '#/components/schemas/Bolt12Method'
+      discriminator:
+        propertyName: type
+        mapping:
+          Onchain: '#/components/schemas/OnchainMethod'
+          Lightning: '#/components/schemas/LightningMethod'
+          Ark: '#/components/schemas/ArkMethod'
+          Bolt12: '#/components/schemas/Bolt12Method'
+      description: A public receive pointer. Discriminated by `type`.
+    OnchainMethod:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+          - Onchain
+        label:
+          type: string
+        network:
+          $ref: '#/components/schemas/BitcoinNetwork'
+        address:
+          type: string
+          description: Static address (discouraged by the spec).
+        silent_payment_pubkey:
+          type: string
+          description: BIP-352 scan pubkey (`sp1q...`). EXPERIMENTAL.
+        pubkey_hint:
+          type: string
+          nullable: true
+        descriptor_hint:
+          type: string
+          nullable: true
+        address_list:
+          type: array
+          items:
+            type: string
+          description: Pre-derived addresses for wallets without BIP-352.
+      required:
+      - type
+      - label
+    LightningMethod:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+          - Lightning
+        label:
+          type: string
+        lightning_address:
+          type: string
+          nullable: true
+        lnurl:
+          type: string
+          nullable: true
+        bolt12:
+          type: string
+          nullable: true
+        receiver_pubkey:
+          type: string
+          nullable: true
+      required:
+      - type
+      - label
+      description: At least one of `lightning_address`, `lnurl` or `bolt12` must be set to be routable.
+    ArkMethod:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+          - Ark
+        label:
+          type: string
+        server:
+          type: string
+        pubkey:
+          type: string
+        vtxo_pointer:
+          type: string
+          nullable: true
+        proof:
+          anyOf:
+          - $ref: '#/components/schemas/ArkOwnershipProof'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        expires_at:
+          type: integer
+          format: int64
+          nullable: true
+        opaque_uri:
+          type: string
+          description: Opaque Arkade receive URI; `server`/`pubkey` are empty strings when set.
+      required:
+      - type
+      - label
+      - server
+      - pubkey
+    Bolt12Method:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+          - Bolt12
+        label:
+          type: string
+        offer:
+          type: string
+          description: '`lno1...` offer string. EXPERIMENTAL.'
+        network:
+          $ref: '#/components/schemas/BitcoinNetwork'
+        minimum_amount_sats:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        issuer_pubkey:
+          type: string
+      required:
+      - type
+      - label
+      - offer
+      - issuer_pubkey
+    KeyRotation:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        identifier_hash:
+          type: string
+          description: SHA-256 of the canonical identifier.
+          pattern: ^[0-9a-f]{64}$
+        previous_pubkey:
+          type: string
+        new_pubkey:
+          type: string
+        authorization_signature:
+          type: string
+          description: Schnorr signature by the previous key.
+        acceptance_signature:
+          type: string
+          description: Schnorr signature by the new key.
+        previous_event_hash:
+          type: string
+        sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        rotated_at:
+          type: integer
+          format: int64
+      required:
+      - previous_pubkey
+      - new_pubkey
+      - authorization_signature
+      - rotated_at
+    RecoveryPolicy:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+          default: 1
+        threshold:
+          type: integer
+          format: int32
+          description: Minimum guardian signatures (M).
+          minimum: 1
+        guardians:
+          type: array
+          items:
+            type: string
+          description: Distinct compressed secp256k1 pubkeys (N).
+      required:
+      - threshold
+      - guardians
+    GuardianSignature:
+      type: object
+      properties:
+        guardian_pubkey:
+          type: string
+        signature:
+          type: string
+      required:
+      - guardian_pubkey
+      - signature
+    KeyRecoveryProof:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        identifier_hash:
+          type: string
+        previous_pubkey:
+          type: string
+        new_pubkey:
+          type: string
+        previous_event_hash:
+          type: string
+        sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        guardian_signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/GuardianSignature'
+        acceptance_signature:
+          type: string
+        recovered_at:
+          type: integer
+          format: int64
+      required:
+      - identifier_hash
+      - previous_pubkey
+      - new_pubkey
+      - previous_event_hash
+      - sequence
+      - guardian_signatures
+      - acceptance_signature
+      - recovered_at
+    OwnershipProof:
+      oneOf:
+      - $ref: '#/components/schemas/MessageSignatureProof'
+      - $ref: '#/components/schemas/WellKnownChallengeProof'
+      discriminator:
+        propertyName: proof
+        mapping:
+          MessageSignature: '#/components/schemas/MessageSignatureProof'
+          WellKnownChallenge: '#/components/schemas/WellKnownChallengeProof'
+    MessageSignatureProof:
+      type: object
+      properties:
+        proof:
+          type: string
+          enum:
+          - MessageSignature
+        message:
+          type: string
+        signature:
+          type: string
+        pubkey:
+          type: string
+          nullable: true
+      required:
+      - proof
+      - message
+      - signature
+    WellKnownChallengeProof:
+      type: object
+      properties:
+        proof:
+          type: string
+          enum:
+          - WellKnownChallenge
+        url:
+          type: string
+        nonce:
+          type: string
+        expected_body_hash:
+          type: string
+      required:
+      - proof
+      - url
+      - nonce
+      - expected_body_hash
+    ProofType:
+      type: string
+      enum:
+      - DomainWellKnown
+      - LightningAddressChallenge
+      - OnchainAddressSignature
+      - ArkPubkeySignature
+      - ManualAttestation
+      - Bip353Dnssec
+    VerificationStatus:
+      oneOf:
+      - $ref: '#/components/schemas/VerificationStatusUnverified'
+      - $ref: '#/components/schemas/VerificationStatusVerified'
+      discriminator:
+        propertyName: status
+        mapping:
+          Unverified: '#/components/schemas/VerificationStatusUnverified'
+          Verified: '#/components/schemas/VerificationStatusVerified'
+    VerificationStatusUnverified:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - Unverified
+      required:
+      - status
+    VerificationStatusVerified:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - Verified
+        proof_type:
+          $ref: '#/components/schemas/ProofType'
+        verified_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+          nullable: true
+        proof:
+          $ref: '#/components/schemas/OwnershipProof'
+      required:
+      - status
+      - proof_type
+      - verified_at
+      - proof
+    MethodVerification:
+      type: object
+      properties:
+        method_descriptor:
+          type: string
+          description: Equals the method's ownership descriptor, e.g. `ln-address:alice@example.com`.
+        status:
+          $ref: '#/components/schemas/VerificationStatus'
+      required:
+      - method_descriptor
+      - status
+    PqcSuite:
+      type: string
+      enum:
+      - mlkem768_x25519
+      - mldsa65_schnorr
+    HybridPublicKey:
+      type: object
+      properties:
+        classical_pubkey:
+          type: string
+        pqc_verification_key:
+          type: string
+        suite:
+          $ref: '#/components/schemas/PqcSuite'
+      required:
+      - classical_pubkey
+      - pqc_verification_key
+      - suite
+      description: 'RESEARCH: post-quantum hybrid public key bundle.'
+    HybridSignature:
+      type: object
+      properties:
+        schnorr_sig:
+          type: string
+        pqc_sig:
+          type: string
+        suite:
+          $ref: '#/components/schemas/PqcSuite'
+      required:
+      - schnorr_sig
+      - pqc_sig
+      - suite
+      description: 'RESEARCH: Schnorr + ML-DSA-65 hybrid signature.'
+    PaymentProfile:
+      type: object
+      properties:
+        alias:
+          type: string
+          description: Human-readable identifier, e.g. `alice@example.com`.
+        identity_pubkey:
+          type: string
+          description: Compressed secp256k1 identity public key (33 bytes).
+          pattern: ^[0-9a-f]{66}$
+        methods:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaymentMethod'
+          description: Ordered, most preferred first.
+        updated_at:
+          type: integer
+          format: int64
+          description: Unix timestamp of last update.
+        expires_at:
+          type: integer
+          format: int64
+          description: Unix timestamp after which the profile must not be routed.
+        sequence:
+          type: integer
+          format: int64
+          description: Strictly increasing replay-protection counter.
+          minimum: 0
+        preferences:
+          type: array
+          items:
+            type: string
+          description: Rail preference order, e.g. `[lightning, ark, onchain]`.
+        nonce:
+          type: string
+        rotation:
+          $ref: '#/components/schemas/KeyRotation'
+        method_verifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/MethodVerification'
+        hybrid_pubkey:
+          $ref: '#/components/schemas/HybridPublicKey'
+        pqc_required:
+          type: boolean
+          default: false
+        revoked:
+          type: boolean
+          description: Owner revoked this profile/key.
+          default: false
+        recovery_policy:
+          $ref: '#/components/schemas/RecoveryPolicy'
+        recovery:
+          $ref: '#/components/schemas/KeyRecoveryProof'
+      required:
+      - alias
+      - identity_pubkey
+      - methods
+      - updated_at
+      description: Public payment profile. Contains no private material.
+    SignedPaymentProfile:
+      type: object
+      properties:
+        profile:
+          $ref: '#/components/schemas/PaymentProfile'
+        signature:
+          type: string
+          description: BIP-340 Schnorr signature over `SHA256("SatsPathProfileV1" || canonical_json(profile))`.
+          pattern: ^[0-9a-f]{128}$
+        hybrid_signature:
+          $ref: '#/components/schemas/HybridSignature'
+      required:
+      - profile
+      - signature
+    MerkleInclusionProof:
+      type: object
+      properties:
+        leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+        tree_size:
+          type: integer
+          format: int64
+          minimum: 0
+        leaf_hash:
+          type: string
+        audit_path:
+          type: array
+          items:
+            type: string
+        root_hash:
+          type: string
+      required:
+      - leaf_index
+      - tree_size
+      - leaf_hash
+      - audit_path
+      - root_hash
+    MerkleConsistencyProof:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+          description: 1 = full leaf list (<=16384 leaves), 2 = compact RFC 6962.
+        old_tree_size:
+          type: integer
+          format: int64
+          minimum: 0
+        new_tree_size:
+          type: integer
+          format: int64
+          minimum: 0
+        old_root:
+          type: string
+        new_root:
+          type: string
+        audit_path:
+          type: array
+          items:
+            type: string
+      required:
+      - version
+      - old_tree_size
+      - new_tree_size
+      - old_root
+      - new_root
+      - audit_path
+    BitcoinAnchor:
+      type: object
+      properties:
+        network:
+          $ref: '#/components/schemas/BitcoinNetwork'
+        txid:
+          type: string
+        block_hash:
+          type: string
+          nullable: true
+        block_height:
+          type: integer
+          format: int64
+          nullable: true
+        confirmations:
+          type: integer
+          format: int32
+        commitment:
+          type: string
+        verified:
+          type: boolean
+        prev_txid:
+          type: string
+        prev_vout:
+          type: integer
+          format: int32
+        continuation_vout:
+          type: integer
+          format: int32
+        chain_index:
+          type: integer
+          format: int64
+      required:
+      - network
+      - txid
+      - confirmations
+      - commitment
+      - verified
+      description: OP_RETURN checkpoint anchor (Catena chain). Regtest only in the current build.
+    OperatorKeyRotation:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        log_id:
+          type: string
+        previous_operator_pubkey:
+          type: string
+        new_operator_pubkey:
+          type: string
+        previous_checkpoint_hash:
+          type: string
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        rotated_at:
+          type: integer
+          format: int64
+        old_key_authorization:
+          type: string
+        new_key_acceptance:
+          type: string
+      required:
+      - version
+      - log_id
+      - previous_operator_pubkey
+      - new_operator_pubkey
+      - previous_checkpoint_hash
+      - sequence
+      - rotated_at
+      - old_key_authorization
+      - new_key_acceptance
+    TransparencyCheckpoint:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        log_id:
+          type: string
+        log_size:
+          type: integer
+          format: int64
+          minimum: 0
+        log_root:
+          type: string
+        map_root:
+          type: string
+          nullable: true
+        previous_checkpoint_hash:
+          type: string
+          nullable: true
+        created_at:
+          type: integer
+          format: int64
+        operator_pubkey:
+          type: string
+        operator_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        operator_rotation:
+          anyOf:
+          - $ref: '#/components/schemas/OperatorKeyRotation'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        operator_signature:
+          type: string
+        bitcoin_anchor:
+          anyOf:
+          - $ref: '#/components/schemas/BitcoinAnchor'
+          - type: object
+            nullable: true
+            enum:
+            - null
+      required:
+      - version
+      - log_id
+      - log_size
+      - log_root
+      - created_at
+      - operator_pubkey
+      - operator_sequence
+      - operator_signature
+      description: Operator-signed commitment to the append-only log.
+    NameAction:
+      type: string
+      enum:
+      - register
+      - update_profile
+      - rotate_key
+      - revoke
+      - recover_key
+    NameEvent:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        identifier_hash:
+          type: string
+        action:
+          $ref: '#/components/schemas/NameAction'
+        identity_pubkey:
+          type: string
+        profile_hash:
+          type: string
+        sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        previous_event_hash:
+          type: string
+          nullable: true
+        created_at:
+          type: integer
+          format: int64
+        identifier_attestation_hash:
+          type: string
+          nullable: true
+        removed_method_hashes:
+          type: array
+          items:
+            type: string
+        rotation:
+          anyOf:
+          - $ref: '#/components/schemas/KeyRotation'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        recovery_policy:
+          $ref: '#/components/schemas/RecoveryPolicy'
+        recovery:
+          $ref: '#/components/schemas/KeyRecoveryProof'
+        owner_signature:
+          type: string
+      required:
+      - version
+      - identifier_hash
+      - action
+      - identity_pubkey
+      - profile_hash
+      - sequence
+      - created_at
+      - owner_signature
+    StateMapValue:
+      type: object
+      properties:
+        latest_event_hash:
+          type: string
+        sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        status:
+          type: string
+          enum:
+          - Registered
+          - Revoked
+      required:
+      - latest_event_hash
+      - sequence
+      - status
+    StateMapProof:
+      type: object
+      properties:
+        key_hash:
+          type: string
+        value:
+          anyOf:
+          - $ref: '#/components/schemas/StateMapValue'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        audit_path:
+          type: array
+          items:
+            type: string
+      required:
+      - key_hash
+      - audit_path
+      description: 'Sparse-Merkle proof; `value: null` proves non-inclusion.'
+    NamespaceDescriptor:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        domain:
+          type: string
+        log_id:
+          type: string
+        authority_pubkey:
+          type: string
+        endpoint_urls:
+          type: array
+          items:
+            type: string
+        witness_quorum:
+          type: integer
+          format: int32
+          minimum: 0
+        witness_pubkeys:
+          type: array
+          items:
+            type: string
+        valid_from:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        signature:
+          type: string
+          description: Currently an empty string (the daemon does not sign the descriptor).
+      required:
+      - version
+      - domain
+      - log_id
+      - authority_pubkey
+      - endpoint_urls
+      - witness_quorum
+      - witness_pubkeys
+      - valid_from
+      - expires_at
+      - signature
+    WitnessCosignature:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        witness_id:
+          type: string
+        witness_pubkey:
+          type: string
+        checkpoint_hash:
+          type: string
+        tree_size:
+          type: integer
+          format: int64
+          minimum: 0
+        timestamp:
+          type: integer
+          format: int64
+        signature:
+          type: string
+      required:
+      - version
+      - witness_id
+      - witness_pubkey
+      - checkpoint_hash
+      - tree_size
+      - timestamp
+      - signature
+    ResolutionRequest:
+      type: object
+      properties:
+        identifier:
+          type: string
+          description: Identifier to resolve, e.g. `alice@example.com`.
+        pinned_tree_size:
+          type: integer
+          format: int64
+          description: Accepted by the schema; currently ignored by the daemon.
+          minimum: 0
+        include_history:
+          type: boolean
+          description: Accepted by the schema; currently ignored by the daemon.
+          default: false
+      required:
+      - identifier
+    ResolutionEnvelope:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+          enum:
+          - 2
+        identifier:
+          type: string
+        namespace_descriptor:
+          $ref: '#/components/schemas/NamespaceDescriptor'
+        signed_profile:
+          $ref: '#/components/schemas/SignedPaymentProfile'
+        name_events:
+          type: array
+          items:
+            $ref: '#/components/schemas/NameEvent'
+        inclusion_proof:
+          $ref: '#/components/schemas/MerkleInclusionProof'
+        checkpoint:
+          $ref: '#/components/schemas/TransparencyCheckpoint'
+        consistency_proof:
+          anyOf:
+          - $ref: '#/components/schemas/MerkleConsistencyProof'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        current_state_proof:
+          anyOf:
+          - $ref: '#/components/schemas/StateMapProof'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        witness_cosignatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/WitnessCosignature'
+        served_at:
+          type: integer
+          format: int64
+      required:
+      - version
+      - identifier
+      - namespace_descriptor
+      - signed_profile
+      - name_events
+      - inclusion_proof
+      - checkpoint
+      - witness_cosignatures
+      - served_at
+      description: Proof-carrying S2S v2 resolution result. `consistency_proof` is currently always null
+        and `witness_cosignatures` always empty on this daemon.
+    TransparencyStatus:
+      type: object
+      properties:
+        log_size:
+          type: integer
+          format: int64
+          minimum: 0
+        log_root:
+          type: string
+        latest_checkpoint_hash:
+          type: string
+          nullable: true
+        registered_identifiers:
+          type: integer
+          format: int64
+          minimum: 0
+        key_rotations:
+          type: integer
+          format: int64
+          minimum: 0
+        key_recoveries:
+          type: integer
+          format: int64
+          minimum: 0
+        revocations:
+          type: integer
+          format: int64
+          minimum: 0
+        map_root:
+          type: string
+          nullable: true
+        consistency_status:
+          type: string
+          enum:
+          - empty
+          - valid
+          - invalid
+          - unanchored
+      required:
+      - log_size
+      - log_root
+      - registered_identifiers
+      - key_rotations
+      - revocations
+      - consistency_status
+    CheckpointPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransparencyCheckpoint'
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+        limit:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 200
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+      - items
+      - offset
+      - limit
+      - total
+    EventPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/NameEvent'
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+        limit:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 200
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+      - items
+      - offset
+      - limit
+      - total
+    AnchorPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BitcoinAnchor'
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+        limit:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 200
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+      - items
+      - offset
+      - limit
+      - total
+    IdentifierHistory:
+      type: object
+      properties:
+        identifier_hash:
+          type: string
+        latest:
+          anyOf:
+          - $ref: '#/components/schemas/NameEvent'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/NameEvent'
+      required:
+      - identifier_hash
+      - latest
+      - history
+    CatenaChain:
+      type: object
+      properties:
+        chain_length:
+          type: integer
+          format: int64
+          minimum: 0
+        genesis:
+          anyOf:
+          - $ref: '#/components/schemas/BitcoinAnchor'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        latest:
+          anyOf:
+          - $ref: '#/components/schemas/BitcoinAnchor'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        anchors:
+          $ref: '#/components/schemas/AnchorPage'
+      required:
+      - chain_length
+      - genesis
+      - latest
+      - anchors
+    InclusionVerifyRequest:
+      type: object
+      properties:
+        event_hash:
+          type: string
+        proof:
+          $ref: '#/components/schemas/MerkleInclusionProof'
+        checkpoint:
+          $ref: '#/components/schemas/TransparencyCheckpoint'
+      required:
+      - event_hash
+      - proof
+      - checkpoint
+    ConsistencyVerifyRequest:
+      type: object
+      properties:
+        proof:
+          $ref: '#/components/schemas/MerkleConsistencyProof'
+      required:
+      - proof
+    CatenaVerifyRequest:
+      type: object
+      properties:
+        anchors:
+          type: array
+          items:
+            $ref: '#/components/schemas/BitcoinAnchor'
+        checkpoint_hashes:
+          type: array
+          items:
+            type: string
+          description: Optional commitments to check against the anchors.
+      required:
+      - anchors
+    ValidResult:
+      type: object
+      properties:
+        valid:
+          type: boolean
+      required:
+      - valid
+    CatenaVerifyResult:
+      type: object
+      properties:
+        structurally_consistent:
+          type: boolean
+        commitments_valid:
+          type: boolean
+          description: Present only when `checkpoint_hashes` was supplied.
+      required:
+      - structurally_consistent
+    TrustTier:
+      type: string
+      enum:
+      - Cryptographic
+      - DomainControl
+      - SelfAsserted
+    PaymentMethodVerificationState:
+      type: object
+      properties:
+        descriptor:
+          type: string
+        verified:
+          type: boolean
+        trust_tier:
+          anyOf:
+          - $ref: '#/components/schemas/TrustTier'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        reason:
+          type: string
+      required:
+      - descriptor
+      - verified
+      - trust_tier
+      - reason
+    VerificationStates:
+      type: object
+      properties:
+        profile_signature_verified:
+          type: boolean
+        identifier_verified:
+          type: boolean
+          description: True only with a trusted-verifier attestation; plain email syntax is `false`.
+        key_continuity_verified:
+          type: boolean
+        transparency_inclusion_verified:
+          type: boolean
+        checkpoint_binding_verified:
+          type: boolean
+        checkpoint_consistency_verified:
+          type: boolean
+        operator_continuity_verified:
+          type: boolean
+        payment_methods_verified:
+          type: boolean
+        payment_method_states:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaymentMethodVerificationState'
+      required:
+      - profile_signature_verified
+      - identifier_verified
+      - key_continuity_verified
+      - transparency_inclusion_verified
+      - checkpoint_binding_verified
+      - checkpoint_consistency_verified
+      - operator_continuity_verified
+      - payment_methods_verified
+      - payment_method_states
+    IdentifierAttestation:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int32
+        identifier_hash:
+          type: string
+        identity_pubkey:
+          type: string
+        profile_hash:
+          type: string
+        nonce:
+          type: string
+        issued_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        method:
+          type: string
+          enum:
+          - email
+          - dns
+          - nip05
+          - platform
+          - domain
+        verifier_pubkey:
+          type: string
+        verifier_signature:
+          type: string
+      required:
+      - version
+      - identifier_hash
+      - identity_pubkey
+      - profile_hash
+      - nonce
+      - issued_at
+      - expires_at
+      - method
+      - verifier_pubkey
+      - verifier_signature
+    ResolvedTransparentProfile:
+      type: object
+      properties:
+        signed_profile:
+          $ref: '#/components/schemas/SignedPaymentProfile'
+        latest_event:
+          $ref: '#/components/schemas/NameEvent'
+        inclusion_proof:
+          $ref: '#/components/schemas/MerkleInclusionProof'
+        checkpoint:
+          $ref: '#/components/schemas/TransparencyCheckpoint'
+        consistency_proof:
+          anyOf:
+          - $ref: '#/components/schemas/MerkleConsistencyProof'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        identifier_attestation:
+          anyOf:
+          - $ref: '#/components/schemas/IdentifierAttestation'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        resolver_source:
+          type: string
+          enum:
+          - local_registry
+          - http
+          - bip353
+          - nostr
+          - p2p
+        verification:
+          $ref: '#/components/schemas/VerificationStates'
+      required:
+      - signed_profile
+      - latest_event
+      - inclusion_proof
+      - checkpoint
+      - consistency_proof
+      - identifier_attestation
+      - resolver_source
+      - verification
+      description: Result of the mandatory transparency composition (signature, history, continuity, inclusion,
+        consistency, operator continuity, method ownership). Failure is terminal.
+    AliasRequest:
+      type: object
+      properties:
+        alias:
+          type: string
+      required:
+      - alias
+      example:
+        alias: alice@example.com
+    QuoteRequest:
+      type: object
+      properties:
+        recipient:
+          type: string
+          description: Recipient identifier.
+        amount_sats:
+          type: integer
+          format: int64
+          minimum: 1
+      required:
+      - recipient
+      - amount_sats
+      example:
+        recipient: alice@example.com
+        amount_sats: 50000
+    PayRequest:
+      type: object
+      properties:
+        recipient:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+          minimum: 1
+        memo:
+          type: string
+          description: Screened for private material.
+      required:
+      - recipient
+      - amount_sats
+      example:
+        recipient: alice@example.com
+        amount_sats: 21000
+        memo: coffee
+    QuoteRecipient:
+      type: object
+      properties:
+        alias:
+          type: string
+        verified:
+          type: boolean
+          description: Legacy flag; prefer the two explicit fields.
+        profile_signature_verified:
+          type: boolean
+        identifier_verified:
+          type: boolean
+        identifier_verification:
+          type: string
+        fingerprint:
+          type: string
+          nullable: true
+      required:
+      - alias
+      - verified
+      - profile_signature_verified
+      - identifier_verified
+      - identifier_verification
+    Invite:
+      type: object
+      properties:
+        alias_hash:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+          minimum: 0
+        created_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        claim_url:
+          type: string
+        warning:
+          type: string
+        sender_signature:
+          type: string
+        sender_pubkey:
+          type: string
+        invite_id:
+          type: string
+      required:
+      - alias_hash
+      - amount_sats
+      - created_at
+      - expires_at
+      - claim_url
+      - warning
+    ExecutionMode:
+      type: string
+      enum:
+      - preview
+      - mainnet_preview
+      - testnet_experimental
+      - manual_wallet
+    QuoteResponse:
+      oneOf:
+      - $ref: '#/components/schemas/QuoteOk'
+      - $ref: '#/components/schemas/QuoteNotRegistered'
+      - $ref: '#/components/schemas/QuoteNoRoute'
+      - $ref: '#/components/schemas/QuoteInvalidSignature'
+      discriminator:
+        propertyName: status
+        mapping:
+          ok: '#/components/schemas/QuoteOk'
+          not_registered: '#/components/schemas/QuoteNotRegistered'
+          no_route: '#/components/schemas/QuoteNoRoute'
+          invalid_signature: '#/components/schemas/QuoteInvalidSignature'
+      description: Protocol quote contract. Always returned with HTTP 200; branch on `status`.
+    QuoteOk:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+        recipient:
+          $ref: '#/components/schemas/QuoteRecipient'
+        selected_method:
+          $ref: '#/components/schemas/PaymentMethod'
+        fee_sats:
+          type: integer
+          format: int64
+          minimum: 0
+          nullable: true
+        eta:
+          type: string
+          nullable: true
+        reason:
+          type: string
+        qr:
+          type: string
+          description: Public payment payload for the wallet (BIP-21, LN address/LNURL, Ark pointer).
+        execution:
+          $ref: '#/components/schemas/ExecutionMode'
+        wallet_hint:
+          type: string
+      required:
+      - status
+      - recipient
+      - selected_method
+      - reason
+      - qr
+    QuoteNotRegistered:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - not_registered
+        invite:
+          $ref: '#/components/schemas/Invite'
+      required:
+      - status
+      - invite
+    QuoteNoRoute:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - no_route
+        reason:
+          type: string
+      required:
+      - status
+      - reason
+    QuoteInvalidSignature:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - invalid_signature
+        recipient:
+          $ref: '#/components/schemas/QuoteRecipient'
+      required:
+      - status
+      - recipient
+    SafetyStatus:
+      type: object
+      properties:
+        moves_funds:
+          type: boolean
+          enum:
+          - false
+        signs_bitcoin_transactions:
+          type: boolean
+          enum:
+          - false
+        broadcasts_transactions:
+          type: boolean
+          enum:
+          - false
+        stores_wallet_seeds_or_spending_keys:
+          type: boolean
+          enum:
+          - false
+        manages_signed_profiles:
+          type: boolean
+      required:
+      - moves_funds
+      - signs_bitcoin_transactions
+      - broadcasts_transactions
+      - stores_wallet_seeds_or_spending_keys
+      - manages_signed_profiles
+      description: Constant non-custody attestation included in handoff responses.
+    PreviewResponse:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum:
+          - preview_only
+        warnings:
+          type: array
+          items:
+            type: string
+        quote:
+          $ref: '#/components/schemas/QuoteResponse'
+      required:
+      - mode
+      - warnings
+      - quote
+    WalletHandoff:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum:
+          - external_wallet
+        instruction:
+          type: string
+        opens_external_wallet:
+          type: boolean
+        daemon_executes_payment:
+          type: boolean
+          enum:
+          - false
+      required:
+      - mode
+      - instruction
+      - opens_external_wallet
+      - daemon_executes_payment
+    PayResponse:
+      oneOf:
+      - $ref: '#/components/schemas/PayWalletHandoff'
+      - $ref: '#/components/schemas/PayInviteCreated'
+      - $ref: '#/components/schemas/PayNoRoute'
+      - $ref: '#/components/schemas/PayInvalidSignature'
+      discriminator:
+        propertyName: status
+        mapping:
+          wallet_handoff: '#/components/schemas/PayWalletHandoff'
+          invite_created: '#/components/schemas/PayInviteCreated'
+          no_route: '#/components/schemas/PayNoRoute'
+          invalid_signature: '#/components/schemas/PayInvalidSignature'
+      description: Wallet handoff decision. Never moves funds. Always HTTP 200; branch on `status`.
+    PayWalletHandoff:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - wallet_handoff
+        decision_protocol:
+          type: string
+          enum:
+          - satspathd.v1
+        safety:
+          $ref: '#/components/schemas/SafetyStatus'
+        quote:
+          $ref: '#/components/schemas/QuoteResponse'
+        recipient:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+        payment_payload:
+          type: string
+        qr_svg:
+          type: string
+          description: Self-contained SVG QR.
+        handoff:
+          $ref: '#/components/schemas/WalletHandoff'
+      required:
+      - status
+      - decision_protocol
+      - recipient
+      - amount_sats
+      - quote
+      - payment_payload
+      - qr_svg
+      - handoff
+      - safety
+    PayInviteCreated:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - invite_created
+        decision_protocol:
+          type: string
+          enum:
+          - satspathd.v1
+        safety:
+          $ref: '#/components/schemas/SafetyStatus'
+        quote:
+          $ref: '#/components/schemas/QuoteResponse'
+        recipient_hint:
+          type: string
+          description: Masked identifier.
+        amount_sats:
+          type: integer
+          format: int64
+      required:
+      - status
+      - decision_protocol
+      - recipient_hint
+      - amount_sats
+      - quote
+      - safety
+    PayNoRoute:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - no_route
+        decision_protocol:
+          type: string
+          enum:
+          - satspathd.v1
+        safety:
+          $ref: '#/components/schemas/SafetyStatus'
+        quote:
+          $ref: '#/components/schemas/QuoteResponse'
+        reason:
+          type: string
+      required:
+      - status
+      - decision_protocol
+      - reason
+      - quote
+      - safety
+    PayInvalidSignature:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - invalid_signature
+        decision_protocol:
+          type: string
+          enum:
+          - satspathd.v1
+        safety:
+          $ref: '#/components/schemas/SafetyStatus'
+        quote:
+          $ref: '#/components/schemas/QuoteResponse'
+      required:
+      - status
+      - decision_protocol
+      - quote
+      - safety
+    DnsResolveRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: BIP-353 name, e.g. `₿alice@example.com`.
+        allow_insecure_dns_for_dev:
+          type: boolean
+          description: Switch DNSSEC policy from Strict to DevInsecure. Development only.
+          default: false
+      required:
+      - name
+      example:
+        name: alice@example.com
+    Bip353Name:
+      type: object
+      properties:
+        user:
+          type: string
+        domain:
+          type: string
+        display:
+          type: string
+        dns_name:
+          type: string
+      required:
+      - user
+      - domain
+      - display
+      - dns_name
+    Bip353Resolution:
+      type: object
+      properties:
+        name:
+          $ref: '#/components/schemas/Bip353Name'
+        bitcoin_uri:
+          type: string
+        dnssec_validated:
+          type: boolean
+        ttl_seconds:
+          type: integer
+          format: int32
+          nullable: true
+        resolved_at:
+          type: integer
+          format: int64
+        warnings:
+          type: array
+          items:
+            type: string
+      required:
+      - name
+      - bitcoin_uri
+      - dnssec_validated
+      - resolved_at
+      - warnings
+    Bip321Instruction:
+      oneOf:
+      - $ref: '#/components/schemas/Bip321Onchain'
+      - $ref: '#/components/schemas/Bip321Bolt11'
+      - $ref: '#/components/schemas/Bip321Bolt12'
+      - $ref: '#/components/schemas/Bip321SilentPayment'
+      - $ref: '#/components/schemas/Bip321Unknown'
+      discriminator:
+        propertyName: kind
+        mapping:
+          onchain: '#/components/schemas/Bip321Onchain'
+          lightning_bolt11: '#/components/schemas/Bip321Bolt11'
+          bolt12_offer: '#/components/schemas/Bip321Bolt12'
+          silent_payment: '#/components/schemas/Bip321SilentPayment'
+          unknown: '#/components/schemas/Bip321Unknown'
+    Bip321Onchain:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - onchain
+        address:
+          type: string
+        amount_btc:
+          type: string
+          nullable: true
+      required:
+      - kind
+      - address
+    Bip321Bolt11:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - lightning_bolt11
+        invoice:
+          type: string
+      required:
+      - kind
+      - invoice
+    Bip321Bolt12:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - bolt12_offer
+        offer:
+          type: string
+      required:
+      - kind
+      - offer
+    Bip321SilentPayment:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - silent_payment
+        address:
+          type: string
+      required:
+      - kind
+      - address
+    Bip321Unknown:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - unknown
+        key:
+          type: string
+        value:
+          type: string
+        required:
+          type: boolean
+      required:
+      - kind
+      - key
+      - value
+      - required
+    ParsedBip321Uri:
+      type: object
+      properties:
+        raw:
+          type: string
+        address:
+          type: string
+          nullable: true
+        amount_btc:
+          type: string
+          nullable: true
+        instructions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Bip321Instruction'
+        sp_profile:
+          type: string
+        sp_profile_hash:
+          type: string
+      required:
+      - raw
+      - address
+      - amount_btc
+      - instructions
+    DnsResolveResponse:
+      oneOf:
+      - $ref: '#/components/schemas/DnsResolveOk'
+      - $ref: '#/components/schemas/DnsResolveError'
+      discriminator:
+        propertyName: status
+        mapping:
+          ok: '#/components/schemas/DnsResolveOk'
+          error: '#/components/schemas/DnsResolveError'
+      description: 'Always HTTP 200; DNS failures are reported as `status: error`.'
+    DnsResolveOk:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+        resolution:
+          $ref: '#/components/schemas/Bip353Resolution'
+        parsed:
+          $ref: '#/components/schemas/ParsedBip321Uri'
+      required:
+      - status
+      - resolution
+      - parsed
+    DnsResolveError:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - error
+        name:
+          type: string
+        error:
+          type: string
+        strict_mode:
+          type: boolean
+      required:
+      - status
+      - name
+      - error
+      - strict_mode
+    ReceiveRequest:
+      type: object
+      properties:
+        rail:
+          type: string
+          description: '`lightning`, `onchain` or `ark` (case-insensitive). Default: first configured
+            in that order.'
+        amount_sats:
+          type: integer
+          format: int64
+          minimum: 1
+      example:
+        rail: onchain
+        amount_sats: 25000
+    ReceiveView:
+      type: object
+      properties:
+        alias:
+          type: string
+          description: Masked, e.g. `a***@example.com`.
+        rail:
+          type: string
+          enum:
+          - Lightning
+          - Onchain
+          - Ark
+          - Bolt12
+        payload:
+          type: string
+        qr_svg:
+          type: string
+      required:
+      - alias
+      - rail
+      - payload
+      - qr_svg
+    SendRequest:
+      type: object
+      properties:
+        recipient:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+          minimum: 1
+        routing_ok:
+          type: boolean
+          description: Model Lightning routing health (default true).
+      required:
+      - recipient
+      - amount_sats
+      example:
+        recipient: alice@example.com
+        amount_sats: 21000
+    EmailInvite:
+      type: object
+      properties:
+        to:
+          type: string
+        subject:
+          type: string
+        body:
+          type: string
+        mailto:
+          type: string
+      required:
+      - to
+      - subject
+      - body
+      - mailto
+    SendResponse:
+      oneOf:
+      - $ref: '#/components/schemas/SendOk'
+      - $ref: '#/components/schemas/SendInvite'
+      - $ref: '#/components/schemas/SendInvalidSignature'
+      - $ref: '#/components/schemas/SendNoRoute'
+      discriminator:
+        propertyName: status
+        mapping:
+          ok: '#/components/schemas/SendOk'
+          invite: '#/components/schemas/SendInvite'
+          invalid_signature: '#/components/schemas/SendInvalidSignature'
+          no_route: '#/components/schemas/SendNoRoute'
+      description: Preview-only routing result. Always HTTP 200; branch on `status`.
+    SendOk:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+        mode:
+          type: string
+          enum:
+          - preview_only
+        rail:
+          type: string
+        reason:
+          type: string
+        recipient:
+          type: string
+          description: Masked.
+        profile_signature_verified:
+          type: boolean
+        identifier_verified:
+          type: boolean
+        identifier_verification:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+        payload:
+          type: string
+        qr_svg:
+          type: string
+        safety:
+          $ref: '#/components/schemas/SafetyStatus'
+      required:
+      - status
+      - mode
+      - rail
+      - reason
+      - recipient
+      - profile_signature_verified
+      - identifier_verified
+      - identifier_verification
+      - amount_sats
+      - payload
+      - qr_svg
+      - safety
+    SendInvite:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - invite
+        mode:
+          type: string
+          enum:
+          - preview_only
+        experimental:
+          type: boolean
+        recipient_hint:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+        claim_url:
+          type: string
+        email:
+          $ref: '#/components/schemas/EmailInvite'
+        safety:
+          $ref: '#/components/schemas/SafetyStatus'
+      required:
+      - status
+      - mode
+      - experimental
+      - recipient_hint
+      - amount_sats
+      - claim_url
+      - email
+      - safety
+    SendInvalidSignature:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - invalid_signature
+        recipient:
+          type: string
+      required:
+      - status
+      - recipient
+    SendNoRoute:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - no_route
+        reason:
+          type: string
+      required:
+      - status
+      - reason
+    BroadcastResponse:
+      type: object
+      properties:
+        broadcasting:
+          type: boolean
+          enum:
+          - false
+        status:
+          type: string
+      required:
+      - broadcasting
+      - status
+    RateLimiterStats:
+      type: object
+      properties:
+        tracked_ips:
+          type: integer
+          format: int64
+          minimum: 0
+        total_allowed:
+          type: integer
+          format: int64
+          minimum: 0
+        total_blocked:
+          type: integer
+          format: int64
+          minimum: 0
+        total_payload_too_large:
+          type: integer
+          format: int64
+          minimum: 0
+        burst_capacity:
+          type: integer
+          format: int32
+        refill_rate_per_sec:
+          type: number
+          format: double
+        trust_proxy_headers:
+          type: boolean
+        max_body_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+      - tracked_ips
+      - total_allowed
+      - total_blocked
+      - total_payload_too_large
+      - burst_capacity
+      - refill_rate_per_sec
+      - trust_proxy_headers
+      - max_body_bytes
+    StatusResponse:
+      type: object
+      properties:
+        daemon:
+          type: string
+          enum:
+          - satspathd
+        version:
+          type: string
+        bind:
+          type: string
+        network:
+          type: string
+          description: '`devnet` (default), `testnet`, `regtest` or `mainnet`.'
+        home:
+          type: string
+          description: Daemon home directory (filesystem path).
+        wallet_initialized:
+          type: boolean
+        alias:
+          type: string
+          nullable: true
+        identity_fingerprint:
+          type: string
+          nullable: true
+        methods:
+          type: array
+          items:
+            type: string
+            enum:
+            - Onchain
+            - Lightning
+            - Ark
+            - Bolt12
+        safety:
+          $ref: '#/components/schemas/SafetyStatus'
+        rate_limit:
+          $ref: '#/components/schemas/RateLimiterStats'
+        is_tls:
+          type: boolean
+        behind_proxy:
+          type: boolean
+      required:
+      - daemon
+      - version
+      - bind
+      - network
+      - home
+      - wallet_initialized
+      - alias
+      - identity_fingerprint
+      - methods
+      - safety
+      - rate_limit
+      - is_tls
+      - behind_proxy
+    WalletState:
+      type: object
+      properties:
+        alias:
+          type: string
+        identity_pubkey:
+          type: string
+        lightning_address:
+          type: string
+        onchain_address:
+          type: string
+        onchain_pubkey:
+          type: string
+        ark_server:
+          type: string
+        ark_pubkey:
+          type: string
+        created_at:
+          type: integer
+          format: int64
+        updated_at:
+          type: integer
+          format: int64
+        recovery_policy:
+          $ref: '#/components/schemas/RecoveryPolicy'
+      description: Public wallet state. Absent fields are omitted. Never contains secret keys.
+    ProfileResponse:
+      type: object
+      properties:
+        wallet:
+          $ref: '#/components/schemas/WalletState'
+        signed_profile:
+          anyOf:
+          - $ref: '#/components/schemas/SignedPaymentProfile'
+          - type: object
+            nullable: true
+            enum:
+            - null
+        signature_valid:
+          type: boolean
+          nullable: true
+      required:
+      - wallet
+      - signed_profile
+      - signature_valid
+    NodeResponse:
+      type: object
+      properties:
+        status:
+          $ref: '#/components/schemas/StatusResponse'
+        profile:
+          $ref: '#/components/schemas/ProfileResponse'
+      required:
+      - status
+      - profile
+    ProfileUpdateRequest:
+      type: object
+      properties:
+        alias:
+          type: string
+          description: Must equal the already-verified alias (see challenge/verify), else HTTP 400.
+        lightning_address:
+          type: string
+        onchain_address:
+          type: string
+          description: Validated against the daemon network.
+        onchain_pubkey:
+          type: string
+          description: Compressed pubkey hint; requires `onchain_address`.
+        ark_server:
+          type: string
+          description: Must be sent together with `ark_pubkey`.
+        ark_pubkey:
+          type: string
+        remove_methods:
+          type: array
+          items:
+            type: string
+            enum:
+            - lightning
+            - onchain
+            - ark
+        recovery_policy:
+          $ref: '#/components/schemas/RecoveryPolicy'
+      description: All fields optional. `POST /v1/profile/methods` requires at least one.
+      example:
+        lightning_address: alice@getalby.com
+        onchain_address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+    ChallengeResponse:
+      type: object
+      properties:
+        challenge_id:
+          type: string
+        message:
+          type: string
+      required:
+      - challenge_id
+      - message
+      description: 'MOCK email verifier: the token equals the email address itself. Not a real attestation.'
+    VerifyRequest:
+      type: object
+      properties:
+        alias:
+          type: string
+        token:
+          type: string
+      required:
+      - alias
+      - token
+      example:
+        alias: alice@example.com
+        token: alice@example.com
+    KeyRotationResponse:
+      type: object
+      properties:
+        alias:
+          type: string
+        sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        previous_fingerprint:
+          type: string
+        new_fingerprint:
+          type: string
+        event_hash:
+          type: string
+        checkpoint_hash:
+          type: string
+      required:
+      - alias
+      - sequence
+      - previous_fingerprint
+      - new_fingerprint
+      - event_hash
+      - checkpoint_hash
+    KeyRecoveryResponse:
+      type: object
+      properties:
+        alias:
+          type: string
+        sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        previous_fingerprint:
+          type: string
+        new_fingerprint:
+          type: string
+        event_hash:
+          type: string
+        checkpoint_hash:
+          type: string
+      required:
+      - alias
+      - sequence
+      - previous_fingerprint
+      - new_fingerprint
+      - event_hash
+      - checkpoint_hash
+    ProfileRecoverRequest:
+      type: object
+      properties:
+        alias:
+          type: string
+        proof:
+          $ref: '#/components/schemas/KeyRecoveryProof'
+        signed_profile:
+          $ref: '#/components/schemas/SignedPaymentProfile'
+        event_created_at:
+          type: integer
+          format: int64
+          description: Required when `event_signature` is given; must be within +/-300 s.
+        event_signature:
+          type: string
+          description: Owner signature over the recovery event when the new key is not in the local keystore.
+      required:
+      - alias
+      - proof
+      - signed_profile
+    InviteStatus:
+      type: string
+      enum:
+      - waiting_for_claim
+      - email_sent
+      - claimed_with_public_profile
+      - expired
+      - cancelled
+    InviteRecord:
+      type: object
+      properties:
+        invite_id:
+          type: string
+        identifier_hash:
+          type: string
+        display_hint:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+        memo:
+          type: string
+          nullable: true
+        sender_fingerprint:
+          type: string
+        status:
+          $ref: '#/components/schemas/InviteStatus'
+        created_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        sender_pubkey:
+          type: string
+        sender_signature:
+          type: string
+        claimed_at:
+          type: integer
+          format: int64
+        claimed_profile_pubkey:
+          type: string
+      required:
+      - invite_id
+      - identifier_hash
+      - display_hint
+      - amount_sats
+      - memo
+      - sender_fingerprint
+      - status
+      - created_at
+      - expires_at
+    InspectInviteResponse:
+      type: object
+      properties:
+        invite_id:
+          type: string
+        identifier_hash:
+          type: string
+        display_hint:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+        memo:
+          type: string
+          nullable: true
+        status:
+          $ref: '#/components/schemas/InviteStatus'
+        is_expired:
+          type: boolean
+        is_claimable:
+          type: boolean
+        created_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        sender_verified:
+          type: boolean
+        sender_pubkey:
+          type: string
+          nullable: true
+      required:
+      - invite_id
+      - identifier_hash
+      - display_hint
+      - amount_sats
+      - memo
+      - status
+      - is_expired
+      - is_claimable
+      - created_at
+      - expires_at
+      - sender_verified
+      - sender_pubkey
+    ClaimRequest:
+      type: object
+      properties:
+        invite_id:
+          type: string
+        alias:
+          type: string
+        signed_profile:
+          $ref: '#/components/schemas/SignedPaymentProfile'
+        lightning_address:
+          type: string
+        onchain_address:
+          type: string
+        onchain_pubkey:
+          type: string
+        ark_server:
+          type: string
+        ark_pubkey:
+          type: string
+      required:
+      - invite_id
+      - alias
+      description: Either supply a `signed_profile`, or plain receive methods (the daemon signs with its
+        own identity).
+      example:
+        invite_id: 6f1c2d3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+        alias: alice@example.com
+        lightning_address: alice@getalby.com
+    ClaimResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - claimed
+        invite_id:
+          type: string
+        alias:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+        profile_pubkey:
+          type: string
+        claimed_at:
+          type: integer
+          format: int64
+        message:
+          type: string
+      required:
+      - status
+      - invite_id
+      - alias
+      - amount_sats
+      - profile_pubkey
+      - claimed_at
+      - message
+    ClaimNotification:
+      type: object
+      properties:
+        notification_id:
+          type: string
+        invite_id:
+          type: string
+        identifier_hash:
+          type: string
+        display_hint:
+          type: string
+        amount_sats:
+          type: integer
+          format: int64
+        claimed_at:
+          type: integer
+          format: int64
+        claimed_profile_pubkey:
+          type: string
+        read:
+          type: boolean
+      required:
+      - notification_id
+      - invite_id
+      - identifier_hash
+      - display_hint
+      - amount_sats
+      - claimed_at
+      - claimed_profile_pubkey
+      - read
+    NotificationReadResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+        notification_id:
+          type: string
+        read:
+          type: boolean
+      required:
+      - status
+      - notification_id
+      - read
+    AllNotificationsReadResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+        all_read:
+          type: boolean
+      required:
+      - status
+      - all_read
+    TransportStatus:
+      type: object
+      properties:
+        state:
+          type: string
+          enum:
+          - disabled
+          - starting
+          - active
+          - degraded
+          - stopped
+        announcements:
+          type: integer
+          format: int64
+          minimum: 0
+        last_publish:
+          type: integer
+          format: int64
+          nullable: true
+        last_resolution:
+          type: integer
+          format: int64
+          nullable: true
+        active_peers:
+          type: integer
+          format: int64
+          minimum: 0
+          nullable: true
+      required:
+      - state
+      - announcements
+      - last_publish
+      - last_resolution
+      - active_peers
+      description: '`active_peers` is null (unknown), not zero, when the peer count is unavailable.'
+    ControlResponse:
+      type: object
+      properties:
+        identity:
+          type: object
+          properties:
+            fingerprint:
+              type: string
+              nullable: true
+            active_aliases:
+              type: integer
+              format: int64
+              minimum: 0
+            identifier_scope:
+              type: string
+              enum:
+              - local_dev
+              - self_asserted
+              nullable: true
+            identifier_authority:
+              type: string
+              enum:
+              - attested
+              - unverified
+            verification:
+              type: object
+              properties:
+                profile_signature_verified:
+                  type: boolean
+                identifier_verified:
+                  type: boolean
+                key_continuity_verified:
+                  type: boolean
+                transparency_inclusion_verified:
+                  type: boolean
+                payment_methods_verified:
+                  type: boolean
+              nullable: true
+            capabilities:
+              type: array
+              items:
+                type: string
+              nullable: true
+            privacy:
+              type: object
+              properties:
+                plaintext_dht_aliases:
+                  type: boolean
+                private_keys_transmitted:
+                  type: boolean
+                spending_keys_transmitted:
+                  type: boolean
+                peer_addresses_logged:
+                  type: boolean
+            routing_policy:
+              type: string
+        hyperswarm:
+          $ref: '#/components/schemas/TransportStatus'
+        http:
+          type: string
+          enum:
+          - active
+        nostr:
+          type: string
+          enum:
+          - on_demand_resolver
+        experimental:
+          type: boolean
+      required:
+      - identity
+      - hyperswarm
+      - http
+      - nostr
+      - experimental
+      description: EXPERIMENTAL node control summary. Exposes no profile contents or descriptors.
+    P2pCandidateResponse:
+      type: object
+      properties:
+        source:
+          type: string
+          enum:
+          - hyperswarm
+        routing_eligible:
+          type: boolean
+          enum:
+          - false
+        profile_signature_verified:
+          type: boolean
+        identifier_verified:
+          type: boolean
+          enum:
+          - false
+        key_continuity_verified:
+          type: boolean
+          enum:
+          - false
+        transparency_verified:
+          type: boolean
+          enum:
+          - false
+        identifier_scope:
+          type: string
+          enum:
+          - local_dev
+          - self_asserted
+        payment_method_states:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaymentMethodVerificationState'
+        signed_profile:
+          $ref: '#/components/schemas/SignedPaymentProfile'
+        warning:
+          type: string
+      required:
+      - source
+      - routing_eligible
+      - profile_signature_verified
+      - identifier_verified
+      - key_continuity_verified
+      - transparency_verified
+      - identifier_scope
+      - payment_method_states
+      - signed_profile
+      - warning
+      description: 'A candidate only: never imported, never usable for routing.'
+    DashboardAuthResponse:
+      type: object
+      properties:
+        authenticated:
+          type: boolean
+          enum:
+          - true
+      required:
+      - authenticated
+    HealthSimple:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          enum:
+          - healthy
+      required:
+      - ok
+      - status
+    DependencyHealth:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - healthy
+          - degraded
+          - unhealthy
+        latency_ms:
+          type: number
+          format: double
+        error:
+          type: string
+      required:
+      - status
+      - latency_ms
+      description: Common fields; additional dependency-specific keys (`writable`, `log_id`, `cached`,
+        `checkpoint_count`, ...) are flattened into the object.
+      additionalProperties: true
+    DeepHealthResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          description: True for `healthy` and `degraded`.
+        status:
+          type: string
+          enum:
+          - healthy
+          - degraded
+          - unhealthy
+        version:
+          type: string
+        uptime_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+        timestamp:
+          type: integer
+          format: int64
+        dependencies:
+          type: object
+          properties:
+            sqlite:
+              $ref: '#/components/schemas/DependencyHealth'
+            fee_api:
+              $ref: '#/components/schemas/DependencyHealth'
+            transparency_log:
+              $ref: '#/components/schemas/DependencyHealth'
+          required:
+          - sqlite
+          - fee_api
+          - transparency_log
+      required:
+      - ok
+      - status
+      - version
+      - uptime_seconds
+      - timestamp
+      - dependencies
+    V2HealthResponse:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+          - 2.0.0
+        status:
+          type: string
+          enum:
+          - healthy
+          - degraded
+        checkpoint_age_secs:
+          type: integer
+          format: int64
+          description: -1 when the log cannot be opened.
+        witness_quorum_healthy:
+          type: boolean
+          description: Currently mirrors log readability.
+        replica_count:
+          type: integer
+          format: int32
+      required:
+      - version
+      - status
+      - checkpoint_age_secs
+      - witness_quorum_healthy
+      - replica_count

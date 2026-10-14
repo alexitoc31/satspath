@@ -305,4 +305,5 @@ SatsPath is developed as **free and open-source public infrastructure** for the 
 * **BOLT12 Handling:** [`docs/bolt12_handling.md`](docs/bolt12_handling.md)
 * **Docker Deployment:** [`docs/docker.md`](docs/docker.md)
 * **SDK Quickstart:** [`docs/SDK_QUICKSTART.md`](docs/SDK_QUICKSTART.md)
+* **Daemon HTTP API Reference:** [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) and OpenAPI spec [`docs/openapi.yaml`](docs/openapi.yaml)
 * **v0.2 Roadmap:** [`docs/v02_roadmap.md`](docs/v02_roadmap.md)
