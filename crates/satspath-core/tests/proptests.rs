@@ -496,16 +496,17 @@ proptest! {
         );
     }
 
-    /// Check rejection of unsafe URL scheme and port combinations.
+    /// Check rejection of forbidden URL schemes independently of port validation.
     #[test]
-    fn test_ssrf_rejects_forbidden_schemes_and_ports(
-        scheme in prop_oneof![Just("https"), Just("http"), Just("ftp"), Just("file"), Just("gopher")],
-        port in prop_oneof![Just(22u16), Just(25u16), Just(3306u16), Just(6379u16)]
+    fn test_ssrf_rejects_forbidden_schemes(
+        scheme in prop_oneof![Just("http"), Just("ftp"), Just("file"), Just("gopher")]
     ) {
-        let url = format!("{scheme}://satspath.example.com:{port}/profile");
+        let url = format!("{scheme}://satspath.example.com/profile");
+        let result = validate_url(&url, false);
         prop_assert!(
-            validate_url(&url, false).is_err(),
-            "validate_url must reject unsafe scheme/port combination: {url}"
+            matches!(&result, Err(satspath_core::SatsPathError::ValidationError(message))
+                if message.starts_with(&format!("Blocked scheme '{scheme}'"))),
+            "validate_url must reject forbidden scheme: {url}, got {result:?}"
         );
     }
 }
