@@ -10,77 +10,74 @@ pub fn validate_method(method: &crate::PaymentMethod, sats: u64) -> crate::Resul
 
 /// Validate using an explicit clock so expiry tests remain deterministic.
 fn validate(method: &crate::PaymentMethod, sats: u64, now: i64) -> Result<(), String> {
-    check::amount(sats)?;
-    use crate::PaymentMethod;
-    match method {
-        PaymentMethod::Onchain {
-            network,
-            address,
-            silent_payment_pubkey,
-            ..
-        } => {
-            let network = match network {
-                crate::BitcoinNetwork::Mainnet => Network::Bitcoin,
-                crate::BitcoinNetwork::Testnet => Network::Testnet,
-                crate::BitcoinNetwork::Regtest => Network::Regtest,
-            };
-            if address.is_none() && silent_payment_pubkey.is_none() {
-                return Err("missing on-chain receiver".into());
-            }
-            if let Some(address) = address {
-                check::onchain(address, network)?;
-            }
-            if let Some(address) = silent_payment_pubkey {
-                check::silent(address, network)?;
-            }
-            Ok(())
+    check::validate_method(method.into(), sats, now)
+}
+
+impl<'a> From<&'a crate::PaymentMethod> for check::PaymentMethod<'a> {
+    fn from(method: &'a crate::PaymentMethod) -> Self {
+        use crate::PaymentMethod;
+        match method {
+            PaymentMethod::Onchain {
+                network,
+                address,
+                silent_payment_pubkey,
+                ..
+            } => Self::Onchain {
+                network: match network {
+                    crate::BitcoinNetwork::Mainnet => Network::Bitcoin,
+                    crate::BitcoinNetwork::Testnet => Network::Testnet,
+                    crate::BitcoinNetwork::Regtest => Network::Regtest,
+                },
+                address: address.as_deref(),
+                silent_payment_pubkey: silent_payment_pubkey.as_deref(),
+            },
+            PaymentMethod::Lightning {
+                lightning_address,
+                lnurl,
+                bolt12,
+                receiver_pubkey,
+                ..
+            } => Self::Lightning {
+                lightning_address: lightning_address.as_deref(),
+                lnurl: lnurl.as_deref(),
+                bolt12: bolt12.as_deref(),
+                receiver_pubkey: receiver_pubkey.as_deref(),
+            },
+            PaymentMethod::Ark {
+                server,
+                pubkey,
+                vtxo_pointer,
+                opaque_uri,
+                expires_at,
+                ..
+            } => Self::Ark {
+                server,
+                pubkey,
+                vtxo_pointer: vtxo_pointer.as_deref(),
+                opaque_uri: opaque_uri.as_deref(),
+                expires_at: *expires_at,
+            },
+            PaymentMethod::Bolt12(offer) => Self::Bolt12(&offer.offer),
         }
-        PaymentMethod::Lightning {
-            lightning_address,
-            lnurl,
-            bolt12,
-            receiver_pubkey,
-            ..
-        } => {
-            if lightning_address.is_none() && lnurl.is_none() && bolt12.is_none() {
-                return Err("missing Lightning receiver".into());
-            }
-            if let Some(address) = lightning_address {
-                check::lightning_address(address)?;
-            }
-            if let Some(url) = lnurl {
-                check::https(url)?;
-            }
-            if let Some(key) = receiver_pubkey {
-                check::public_key(&hex::decode(key).map_err(|e| e.to_string())?)?;
-            }
-            if let Some(offer) = bolt12 {
-                if offer.to_ascii_lowercase().starts_with("lnbc")
-                    || offer.to_ascii_lowercase().starts_with("lntb")
-                    || offer.to_ascii_lowercase().starts_with("lnbcrt")
-                {
-                    check::bolt11(offer, sats, Network::Bitcoin, now.max(0) as u64)?;
-                } else {
-                    check::bolt12(offer)?;
-                }
-            }
-            Ok(())
-        }
-        PaymentMethod::Ark {
-            server,
-            pubkey,
-            vtxo_pointer,
-            opaque_uri,
-            expires_at,
-            ..
-        } => check::ark(
-            server,
-            &hex::decode(pubkey).map_err(|e| e.to_string())?,
-            vtxo_pointer.as_deref(),
-            opaque_uri.as_deref(),
-            *expires_at,
-            now,
-        ),
-        PaymentMethod::Bolt12(offer) => check::bolt12(&offer.offer),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The public BOLT11 testnet vector must pass through the shared method validator.
+    #[test]
+    fn testnet_invoice_handoff_uses_shared_policy() {
+        let method = crate::PaymentMethod::Lightning {
+            label: "testnet invoice".into(),
+            lightning_address: None,
+            lnurl: None,
+            bolt12: Some("lntb20m1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygshp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqfpp3x9et2e20v6pu37c5d9vax37wxq72un989qrsgqdj545axuxtnfemtpwkc45hx9d2ft7x04mt8q7y6t0k2dge9e7h8kpy9p34ytyslj3yu569aalz2xdk8xkd7ltxqld94u8h2esmsmacgpghe9k8".into()),
+            receiver_pubkey: None,
+        };
+        assert!(validate(&method, 2_000_000, 1_496_314_658).is_ok());
+        assert!(validate(&method, 2_000_001, 1_496_314_658).is_err());
+        assert!(validate(&method, 2_000_000, 1_496_318_258).is_err());
     }
 }

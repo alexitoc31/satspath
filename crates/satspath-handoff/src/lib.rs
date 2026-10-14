@@ -7,6 +7,106 @@ use std::{str::FromStr, time::Duration};
 /// Maximum number of satoshis in Bitcoin's supply.
 pub const MAX_SATS: u64 = 21_000_000 * 100_000_000;
 
+/// Borrowed receiver fields adapted from native or browser payment methods.
+pub enum PaymentMethod<'a> {
+    Onchain {
+        network: Network,
+        address: Option<&'a str>,
+        silent_payment_pubkey: Option<&'a str>,
+    },
+    Lightning {
+        lightning_address: Option<&'a str>,
+        lnurl: Option<&'a str>,
+        bolt12: Option<&'a str>,
+        receiver_pubkey: Option<&'a str>,
+    },
+    Ark {
+        server: &'a str,
+        pubkey: &'a str,
+        vtxo_pointer: Option<&'a str>,
+        opaque_uri: Option<&'a str>,
+        expires_at: Option<i64>,
+    },
+    Bolt12(&'a str),
+}
+
+/// Validate every supplied receiver field before route selection or wallet handoff.
+/// The explicit clock keeps native and browser expiry policy identical.
+pub fn validate_method(method: PaymentMethod<'_>, sats: u64, now: i64) -> Result<(), String> {
+    amount(sats)?;
+    match method {
+        PaymentMethod::Onchain {
+            network,
+            address,
+            silent_payment_pubkey,
+        } => {
+            if address.is_none() && silent_payment_pubkey.is_none() {
+                return Err("missing on-chain receiver".into());
+            }
+            if let Some(address) = address {
+                onchain(address, network)?;
+            }
+            if let Some(address) = silent_payment_pubkey {
+                silent(address, network)?;
+            }
+            Ok(())
+        }
+        PaymentMethod::Lightning {
+            lightning_address,
+            lnurl,
+            bolt12: offer,
+            receiver_pubkey,
+        } => {
+            if lightning_address.is_none() && lnurl.is_none() && offer.is_none() {
+                return Err("missing Lightning receiver".into());
+            }
+            if let Some(address) = lightning_address {
+                self::lightning_address(address)?;
+            }
+            if let Some(url) = lnurl {
+                https(url)?;
+            }
+            if let Some(key) = receiver_pubkey {
+                public_key(&hex::decode(key).map_err(|e| e.to_string())?)?;
+            }
+            if let Some(offer) = offer {
+                let lower = offer.to_ascii_lowercase();
+                // Regtest must precede mainnet because `lnbcrt` starts with `lnbc`.
+                let network = if lower.starts_with("lnbcrt") {
+                    Some(Network::Regtest)
+                } else if lower.starts_with("lntb") {
+                    Some(Network::Testnet)
+                } else if lower.starts_with("lnbc") {
+                    Some(Network::Bitcoin)
+                } else {
+                    None
+                };
+                if let Some(network) = network {
+                    bolt11(offer, sats, network, now.max(0) as u64)?;
+                } else {
+                    bolt12(offer)?;
+                }
+            }
+            Ok(())
+        }
+        PaymentMethod::Ark {
+            server,
+            pubkey,
+            vtxo_pointer,
+            opaque_uri,
+            expires_at,
+        } => ark(
+            server,
+            &hex::decode(pubkey).map_err(|e| e.to_string())?,
+            vtxo_pointer,
+            opaque_uri,
+            expires_at,
+            now,
+        ),
+        PaymentMethod::Bolt12(offer) => bolt12(offer),
+    }
+}
+
 /// Reject zero, overflow-prone, and above-supply payment amounts.
 pub fn amount(sats: u64) -> Result<(), String> {
     if sats == 0 || sats > MAX_SATS {
@@ -266,6 +366,47 @@ mod tests {
 #[cfg(test)]
 mod invoice_tests {
     use super::*;
+
+    /// Invoice currency determines the network for method handoff, including regtest.
+    #[test]
+    fn method_handoff_uses_invoice_network_and_enforces_amount_and_expiry() {
+        use bitcoin::{
+            hashes::{sha256, Hash},
+            secp256k1::{Secp256k1, SecretKey},
+        };
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+        let secp = Secp256k1::new();
+        let fixture_key = SecretKey::from_slice(&[1; 32]).unwrap();
+        for currency in [
+            Currency::Bitcoin,
+            Currency::BitcoinTestnet,
+            Currency::Regtest,
+        ] {
+            let invoice = InvoiceBuilder::new(currency.clone())
+                .description("handoff regression fixture".into())
+                .payment_hash(sha256::Hash::hash(b"handoff regression fixture"))
+                .payment_secret(PaymentSecret([42; 32]))
+                .duration_since_epoch(Duration::from_secs(100))
+                .expiry_time(Duration::from_secs(60))
+                .min_final_cltv_expiry_delta(18)
+                .amount_milli_satoshis(1_000_000)
+                .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &fixture_key))
+                .unwrap()
+                .to_string();
+            for invoice in [&invoice, &invoice.to_ascii_uppercase()] {
+                let method = || PaymentMethod::Lightning {
+                    lightning_address: None,
+                    lnurl: None,
+                    bolt12: Some(invoice),
+                    receiver_pubkey: None,
+                };
+                assert!(validate_method(method(), 1000, 100).is_ok(), "{currency:?}");
+                assert!(validate_method(method(), 1001, 100).is_err());
+                assert!(validate_method(method(), 1000, 160).is_err());
+            }
+        }
+    }
 
     /// BOLT #11's public coffee invoice needs no private key fixture.
     #[test]

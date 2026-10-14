@@ -118,41 +118,19 @@ pub fn build_arkade_qr(pointer: &ArkadePointer, amount_sats: u64) -> Result<Stri
                 chrono::Utc::now().timestamp(),
             )
             .map_err(SatsPathError::InvalidPaymentPointer)?;
+            let mut enc = form_urlencoded::Serializer::new(String::new());
+            enc.append_pair("server", server);
+            enc.append_pair("amount", &amount_sats.to_string());
+            let payload = format!("ark:{}?{}", pubkey, enc.finish());
+            assert_no_private_material(&payload)?;
+            Ok(payload)
         }
-        _ => {
-            return Err(SatsPathError::InvalidPaymentPointer(
+        ArkadePointer::VtxoPointer { .. } | ArkadePointer::OpaqueUri { .. } => {
+            Err(SatsPathError::InvalidPaymentPointer(
                 "opaque Ark URI/VTXO handoff requires protocol validation".into(),
             ))
         }
     }
-    let payload = match pointer {
-        ArkadePointer::ServerPubkey { server, pubkey } => {
-            let mut enc = form_urlencoded::Serializer::new(String::new());
-            enc.append_pair("server", server);
-            enc.append_pair("amount", &amount_sats.to_string());
-            format!("ark:{}?{}", pubkey, enc.finish())
-        }
-        ArkadePointer::VtxoPointer {
-            server,
-            vtxo_pointer,
-        } => {
-            let mut enc = form_urlencoded::Serializer::new(String::new());
-            enc.append_pair("server", server);
-            enc.append_pair("amount", &amount_sats.to_string());
-            format!("ark:{}?{}", vtxo_pointer, enc.finish())
-        }
-        ArkadePointer::OpaqueUri { uri } => {
-            // Preserve the uri as-is if it already carries an ark: scheme;
-            // otherwise emit it directly (ark1q... addresses are self-contained).
-            if uri.starts_with("ark:") {
-                uri.clone()
-            } else {
-                format!("ark:{uri}")
-            }
-        }
-    };
-    assert_no_private_material(&payload)?;
-    Ok(payload)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

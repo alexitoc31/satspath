@@ -432,9 +432,9 @@ proptest! {
         }
     }
 
-    /// Prototype offers remain unavailable even when their declared minimum is met.
+    /// A validated fallback is selected regardless of the BOLT12 offer minimum.
     #[test]
-    fn test_prototype_offer_is_unavailable_at_minimum_amount_boundary(minimum in 1_001u64..100_000u64) {
+    fn test_validated_fallback_is_selected_regardless_of_offer_minimum(minimum in 1_001u64..100_000u64) {
         let offer = valid_unblinded_bolt12_offer();
         let bolt12 = PaymentMethod::Bolt12(Bolt12Offer {
             label: "Minimum amount offer".into(),

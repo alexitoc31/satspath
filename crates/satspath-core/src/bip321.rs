@@ -6,7 +6,8 @@
 //!
 //! Supported keys: on-chain address (URI path), `amount`, `lightning` (BOLT11),
 //! `lno` (BOLT12 offer), `sp` (Silent Payment, preview-only). Unknown `req-*`
-//! parameters make the URI invalid; other unknown parameters are ignored. The
+//! parameters make the URI invalid; other unknown parameters are captured, with
+//! wallet handoff restricted to `label`, `message`, and `sp-profile*`. The
 //! optional SatsPath extension `sp-profile` / `sp-profile-hash` is captured
 //! without breaking BIP-321 compatibility.
 
@@ -75,7 +76,14 @@ impl ParsedBip321Uri {
                     Bip321Instruction::SilentPayment { address } => {
                         check::silent(address, network)?
                     }
-                    Bip321Instruction::Unknown { .. } => {}
+                    Bip321Instruction::Unknown { key, required, .. } => {
+                        if *required
+                            || !(matches!(key.as_str(), "label" | "message")
+                                || key.starts_with("sp-profile"))
+                        {
+                            return Err(format!("unsupported wallet URI parameter: {key}"));
+                        }
+                    }
                 }
             }
             Ok(())
@@ -268,6 +276,40 @@ mod tests {
                 .unwrap()
                 .validate_handoff(1000, bitcoin::Network::Bitcoin, 100)
                 .is_err());
+        }
+    }
+
+    /// Optional parsing stays forward compatible; wallet handoff uses an allowlist.
+    #[test]
+    fn handoff_rejects_unknown_parameters_except_metadata() {
+        let base = "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00001000";
+        for parameter in [
+            "label=Coffee",
+            "message=Thanks",
+            "sp-profile=https%3A%2F%2Fexample.com%2Fprofile",
+            "sp-profile-hash=abc",
+            "sp-profile-version=1",
+        ] {
+            let parsed = parse_bip321(&format!("{base}&{parameter}")).unwrap();
+            assert!(
+                parsed
+                    .validate_handoff(1000, bitcoin::Network::Bitcoin, 100)
+                    .is_ok(),
+                "{parameter}"
+            );
+        }
+        for parameter in [
+            "somefuture=x",
+            "payjoin=https%3A%2F%2Fexample.com",
+            "%70j=x",
+        ] {
+            let parsed = parse_bip321(&format!("{base}&{parameter}")).unwrap();
+            assert!(
+                parsed
+                    .validate_handoff(1000, bitcoin::Network::Bitcoin, 100)
+                    .is_err(),
+                "{parameter}"
+            );
         }
     }
 

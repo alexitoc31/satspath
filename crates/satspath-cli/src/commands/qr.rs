@@ -21,17 +21,12 @@ pub fn bitcoin_uri(
     amount_sats: u64,
     network: satspath_core::BitcoinNetwork,
 ) -> Result<String> {
-    satspath_core::pointer::build_qr_payload(
+    Ok(satspath_core::pointer::build_qr_payload(
         &satspath_core::PaymentPointer::OnchainAddress {
             network,
             address: address.into(),
             claim_policy: None,
         },
         amount_sats,
-    )?;
-    Ok(format!(
-        "bitcoin:{address}?amount={}.{:08}",
-        amount_sats / 100_000_000,
-        amount_sats % 100_000_000
-    ))
+    )?)
 }

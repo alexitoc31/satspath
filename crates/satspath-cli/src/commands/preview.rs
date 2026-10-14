@@ -536,7 +536,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             qr,
-            "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00001000"
+            "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00001"
         );
     }
 

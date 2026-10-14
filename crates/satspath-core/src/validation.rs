@@ -112,6 +112,7 @@ pub fn validate_bitcoin_address(address: &str, network: BitcoinNetwork) -> Resul
 
 /// Validate BIP-352 encoding and public keys using the shared wallet policy.
 pub fn validate_silent_payment_address(address: &str, network: BitcoinNetwork) -> Result<()> {
+    let address = address.trim();
     assert_no_private_material(address)?;
     let network = match network {
         BitcoinNetwork::Mainnet => Network::Bitcoin,
@@ -453,6 +454,16 @@ mod tests {
         // Valid addresses
         assert!(validate_silent_payment_address(&mainnet_sp, BitcoinNetwork::Mainnet).is_ok());
         assert!(validate_silent_payment_address(&testnet_sp, BitcoinNetwork::Testnet).is_ok());
+        assert!(validate_silent_payment_address(
+            &format!(" \t{mainnet_sp}\n"),
+            BitcoinNetwork::Mainnet
+        )
+        .is_ok());
+        assert!(validate_silent_payment_address(
+            &format!("\n{testnet_sp} \t"),
+            BitcoinNetwork::Testnet
+        )
+        .is_ok());
 
         // Network mismatch
         assert!(validate_silent_payment_address(&mainnet_sp, BitcoinNetwork::Testnet).is_err());
@@ -465,6 +476,10 @@ mod tests {
         assert!(
             validate_silent_payment_address("sp1q_xprv_secret", BitcoinNetwork::Mainnet).is_err()
         );
+        assert!(matches!(
+            validate_silent_payment_address(" \tsp1q_xprv_secret\n", BitcoinNetwork::Mainnet),
+            Err(SatsPathError::PrivateMaterialRejected(_))
+        ));
 
         // Truncated payload
         let truncated = bech32::encode("sp", &payload[..30], bech32::Variant::Bech32m).unwrap();
