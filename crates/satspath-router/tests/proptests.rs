@@ -3,7 +3,8 @@ use bitcoin::{Address, CompressedPublicKey, Network};
 use proptest::prelude::*;
 use satspath_core::crypto::sign_profile;
 use satspath_core::{
-    BitcoinNetwork, Bolt12Offer, PaymentMethod, PaymentProfile, SignedPaymentProfile,
+    BitcoinNetwork, Bolt12Offer, PaymentMethod, PaymentPointer, PaymentProfile, SatsPathError,
+    SignedPaymentProfile,
 };
 use satspath_router::ark_routes::SenderCapabilities;
 use satspath_router::bolt12::{
@@ -89,6 +90,65 @@ fn payment_profile(sk: &SecretKey, methods: Vec<PaymentMethod>) -> PaymentProfil
         revoked: false,
         recovery_policy: None,
         recovery: None,
+    }
+}
+
+fn route_request(amount_sats: u64, methods: Vec<PaymentMethod>) -> RouteRequest {
+    let sk = SecretKey::from_slice(&[1u8; 32]).expect("fixture identity key");
+    let profile = payment_profile(&sk, methods);
+    RouteRequest {
+        alias: profile.alias.clone(),
+        amount_sats,
+        signed_profile: sign_profile(profile, &sk).expect("sign fixture profile"),
+        urgency: PaymentUrgency::Normal,
+        max_fee_sats: None,
+        max_fee_percent: None,
+    }
+}
+
+fn lightning_method() -> PaymentMethod {
+    PaymentMethod::Lightning {
+        label: "Lightning".into(),
+        lightning_address: Some("alice@example.com".into()),
+        lnurl: None,
+        bolt12: None,
+        receiver_pubkey: None,
+    }
+}
+
+fn onchain_method() -> PaymentMethod {
+    let sk = SecretKey::from_slice(&[1u8; 32]).expect("fixture address key");
+    let pk = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+    PaymentMethod::Onchain {
+        label: "Bitcoin".into(),
+        network: BitcoinNetwork::Mainnet,
+        address: Some(Address::p2wpkh(&CompressedPublicKey(pk), Network::Bitcoin).to_string()),
+        silent_payment_pubkey: None,
+        pubkey_hint: None,
+        descriptor_hint: None,
+        address_list: vec![],
+    }
+}
+
+fn ark_method() -> PaymentMethod {
+    PaymentMethod::Ark {
+        label: "Ark".into(),
+        server: "https://example.com/ark".into(),
+        pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+        vtxo_pointer: None,
+        proof: None,
+        expires_at: None,
+        opaque_uri: None,
+    }
+}
+
+fn low_fees() -> FeeEstimate {
+    FeeEstimate {
+        fastest_fee: 5,
+        half_hour_fee: 4,
+        hour_fee: 3,
+        economy_fee: 2,
+        minimum_fee: 1,
     }
 }
 
@@ -339,6 +399,62 @@ fn arb_payment_urgency() -> impl Strategy<Value = PaymentUrgency> {
 // ── Property Tests ─────────────────────────────────────────────────────────
 
 proptest! {
+    /// A fee limit includes the exact estimate and excludes an estimate one satoshi above it.
+    #[test]
+    fn test_score_routes_fee_limit_is_inclusive(fee in 0u64..10_000u64) {
+        let req = route_request(10_000, vec![lightning_method()]);
+        let snapshot = FeeSnapshot {
+            lightning_fee_sats_estimate: Some(fee),
+            ..FeeSnapshot::default()
+        };
+        let mut preferences = RoutePreferences {
+            max_fee_sats: Some(fee),
+            ..RoutePreferences::default()
+        };
+        let decision = score_routes(req.amount_sats, &req.signed_profile, &snapshot, &preferences)
+            .expect("exact fee limit must allow the route");
+        prop_assert_eq!(decision.selected.estimated_fee_sats, Some(fee));
+        prop_assert_eq!(decision.selected.rail, PaymentRail::Lightning);
+        prop_assert!(decision.alternatives.is_empty());
+        if fee > 0 {
+            preferences.max_fee_sats = Some(fee - 1);
+            prop_assert!(matches!(
+                score_routes(req.amount_sats, &req.signed_profile, &snapshot, &preferences),
+                Err(SatsPathError::NoRouteFound(_))
+            ));
+        }
+    }
+
+    /// An unavailable first offer must not hide a usable later method.
+    #[test]
+    fn test_select_route_bolt12_minimum_amount_boundary(minimum in 1_001u64..100_000u64) {
+        let offer = valid_unblinded_bolt12_offer();
+        let bolt12 = PaymentMethod::Bolt12(Bolt12Offer {
+            label: "Minimum amount offer".into(),
+            offer: offer.clone(),
+            network: BitcoinNetwork::Mainnet,
+            minimum_amount_sats: Some(minimum),
+            expires_at: None,
+            issuer_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+        });
+        let fallback = lightning_method();
+        let mut req = route_request(minimum - 1, vec![bolt12.clone(), fallback.clone()]);
+        let below = select_route_with_fees(&req, &low_fees()).expect("fallback below offer minimum");
+        prop_assert_eq!(below.selected_method, fallback);
+        prop_assert!(
+            matches!(below.swap_directive, SwapDirective::LightningPayment { .. }),
+            "fallback must use a direct Lightning payment"
+        );
+        req.amount_sats = minimum;
+        let at = select_route_with_fees(&req, &low_fees()).expect("offer at minimum");
+        prop_assert_eq!(at.selected_method, bolt12);
+        prop_assert_eq!(at.swap_directive, SwapDirective::Bolt12Payment {
+            offer,
+            target_invoice: None,
+            has_blinded_paths: false,
+        });
+    }
+
     // ── 1. Route Scoring Determinism & Contract Invariants ─────────────────
 
     /// Check repeatable scoring, candidate eligibility, and maximal selected scores.
@@ -453,4 +569,200 @@ proptest! {
         }
     }
 
+}
+
+#[test]
+fn test_empty_profiles_return_no_route_at_amount_boundaries() {
+    for amount in [0, 1, 999, 1_000, 99_999, 100_000] {
+        let req = route_request(amount, vec![]);
+        assert!(matches!(
+            score_routes(
+                amount,
+                &req.signed_profile,
+                &FeeSnapshot::default(),
+                &RoutePreferences::default()
+            ),
+            Err(SatsPathError::NoRouteFound(_))
+        ));
+        assert!(matches!(
+            select_route_with_fees(&req, &low_fees()),
+            Err(SatsPathError::NoRouteFound(_))
+        ));
+    }
+}
+
+#[test]
+fn test_score_routes_onchain_dust_boundary_and_missing_fees() {
+    let req = route_request(546, vec![onchain_method()]);
+    let fees = FeeSnapshot {
+        onchain_fastest_sat_vb: Some(1),
+        ..FeeSnapshot::default()
+    };
+    let preferences = RoutePreferences::default();
+    assert!(matches!(
+        score_routes(545, &req.signed_profile, &fees, &preferences),
+        Err(SatsPathError::NoRouteFound(_))
+    ));
+    let at_dust_limit = score_routes(546, &req.signed_profile, &fees, &preferences)
+        .expect("onchain is available at the dust limit");
+    assert_eq!(at_dust_limit.selected.rail, PaymentRail::Onchain);
+    assert_eq!(at_dust_limit.selected.estimated_fee_sats, Some(141));
+    assert!(matches!(
+        score_routes(
+            546,
+            &req.signed_profile,
+            &FeeSnapshot::default(),
+            &preferences
+        ),
+        Err(SatsPathError::NoRouteFound(_))
+    ));
+}
+
+#[test]
+fn test_score_routes_pointer_matches_method_after_skipped_candidate() {
+    let unavailable = PaymentMethod::Lightning {
+        label: "No pointer".into(),
+        lightning_address: None,
+        lnurl: None,
+        bolt12: None,
+        receiver_pubkey: None,
+    };
+    let req = route_request(
+        10_000,
+        vec![unavailable, lightning_method(), onchain_method()],
+    );
+    let decision = score_routes(
+        req.amount_sats,
+        &req.signed_profile,
+        &FeeSnapshot::default(),
+        &RoutePreferences::default(),
+    )
+    .expect("usable method after skipped method");
+    assert_eq!(decision.selected.rail, PaymentRail::Lightning);
+    assert_eq!(
+        decision.payment_pointer,
+        PaymentPointer::LightningAddress {
+            address: "alice@example.com".into(),
+            receiver_pubkey: None,
+        }
+    );
+    assert_eq!(decision.alternatives.len(), 1);
+    assert_eq!(decision.alternatives[0].rail, PaymentRail::Onchain);
+    assert!(!decision.alternatives[0].available);
+}
+
+#[test]
+fn test_select_route_lightning_amount_thresholds() {
+    let lightning = lightning_method();
+    let onchain = onchain_method();
+    let mut req = route_request(1_000, vec![lightning.clone(), onchain.clone()]);
+    for amount in [1_000, 99_999] {
+        req.amount_sats = amount;
+        let quote = select_route_with_fees(&req, &low_fees()).expect("Lightning below threshold");
+        assert_eq!(quote.selected_method, lightning);
+        assert!(quote.fee_snapshot.is_none());
+        assert_eq!(
+            quote.swap_directive,
+            SwapDirective::LightningPayment {
+                target_ln_address: Some("alice@example.com".into()),
+            }
+        );
+    }
+    req.amount_sats = 100_000;
+    let quote = select_route_with_fees(&req, &low_fees()).expect("onchain at threshold");
+    assert_eq!(quote.selected_method, onchain);
+    assert!(quote.fee_snapshot.is_some());
+    let lightning_only = route_request(999, vec![lightning.clone()]);
+    assert!(matches!(
+        select_route_with_fees(&lightning_only, &low_fees()),
+        Err(SatsPathError::NoRouteFound(_))
+    ));
+    let lightning_only = route_request(100_000, vec![lightning]);
+    assert!(matches!(
+        select_route_with_fees(&lightning_only, &low_fees()),
+        Err(SatsPathError::NoRouteFound(_))
+    ));
+}
+
+#[test]
+fn test_select_route_urgency_changes_onchain_and_ark_choice() {
+    let onchain = onchain_method();
+    let ark = ark_method();
+    let mut req = route_request(100_000, vec![onchain.clone(), ark.clone()]);
+    let fees = FeeEstimate {
+        fastest_fee: 10,
+        half_hour_fee: 9,
+        hour_fee: 8,
+        economy_fee: 7,
+        minimum_fee: 1,
+    };
+    for (urgency, expected) in [
+        (PaymentUrgency::Urgent, &ark),
+        (PaymentUrgency::Commercial, &onchain),
+        (PaymentUrgency::Normal, &onchain),
+        (PaymentUrgency::Economy, &onchain),
+    ] {
+        req.urgency = urgency;
+        let quote = select_route_with_fees(&req, &fees).expect("route for urgency");
+        assert_eq!(&quote.selected_method, expected, "{urgency:?}");
+        let snapshot = quote.fee_snapshot.expect("provided fee snapshot");
+        assert_eq!(snapshot.fastest_sat_vb, 10);
+        assert_eq!(snapshot.half_hour_sat_vb, 9);
+        assert_eq!(snapshot.hour_sat_vb, 8);
+    }
+}
+
+#[test]
+fn test_bolt12_fixture_privacy_and_directives_for_both_method_variants() {
+    for (offer, blinded, privacy) in [
+        (valid_blinded_bolt12_offer(), true, 9),
+        (valid_unblinded_bolt12_offer(), false, 8),
+    ] {
+        let methods = [
+            PaymentMethod::Lightning {
+                label: "Embedded offer".into(),
+                lightning_address: None,
+                lnurl: None,
+                bolt12: Some(offer.clone()),
+                receiver_pubkey: None,
+            },
+            PaymentMethod::Bolt12(Bolt12Offer {
+                label: "Standalone offer".into(),
+                offer: offer.clone(),
+                network: BitcoinNetwork::Mainnet,
+                minimum_amount_sats: None,
+                expires_at: None,
+                issuer_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                    .into(),
+            }),
+        ];
+        for method in methods {
+            let req = route_request(10_000, vec![method.clone()]);
+            let decision = score_routes(
+                req.amount_sats,
+                &req.signed_profile,
+                &FeeSnapshot::default(),
+                &RoutePreferences::default(),
+            )
+            .expect("score offer fixture");
+            assert_eq!(decision.selected.rail, PaymentRail::Lightning);
+            assert_eq!(decision.selected.privacy_score, privacy);
+            assert_eq!(
+                decision.payment_pointer,
+                PaymentPointer::Bolt12Offer {
+                    offer: offer.clone()
+                }
+            );
+            let quote = select_route_with_fees(&req, &low_fees()).expect("select offer fixture");
+            assert_eq!(quote.selected_method, method);
+            assert_eq!(
+                quote.swap_directive,
+                SwapDirective::Bolt12Payment {
+                    offer: offer.clone(),
+                    target_invoice: None,
+                    has_blinded_paths: blinded,
+                }
+            );
+        }
+    }
 }

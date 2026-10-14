@@ -3,9 +3,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use proptest::prelude::*;
 use satspath_core::crypto::{canonical_profile_bytes, sign_profile, verify_signed_profile};
 use satspath_core::ssrf::{is_private_or_reserved_ip, validate_url};
-use satspath_core::transparency::{inclusion_proof, verify_inclusion_proof};
+use satspath_core::transparency::{
+    inclusion_proof, leaf_hash, merkle_root, node_hash, verify_inclusion_proof,
+};
 use satspath_core::{
     canonicalize_identifier, BitcoinNetwork, Bolt12Offer, PaymentMethod, PaymentProfile,
+    SatsPathError, TransparencyError,
 };
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
@@ -149,7 +152,8 @@ fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
         Just(serde_json::Value::Null),
         any::<bool>().prop_map(serde_json::Value::Bool),
         any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
-        "[a-zA-Z0-9_ -]{0,32}".prop_map(serde_json::Value::String),
+        proptest::collection::vec(any::<char>(), 0..32)
+            .prop_map(|chars| serde_json::Value::String(chars.into_iter().collect())),
     ];
     leaf.prop_recursive(3, 16, 4, |inner| {
         prop_oneof![
@@ -192,6 +196,7 @@ fn arb_private_ipv4() -> impl Strategy<Value = Ipv4Addr> {
         // 100.64.0.0/10 (Carrier-grade NAT)
         (64u8..=127u8, any::<u8>(), any::<u8>()).prop_map(|(b, c, d)| Ipv4Addr::new(100, b, c, d)),
         // Documentation & benchmark ranges
+        (any::<u8>()).prop_map(|d| Ipv4Addr::new(192, 0, 0, d)),
         (any::<u8>()).prop_map(|d| Ipv4Addr::new(192, 0, 2, d)),
         (any::<u8>()).prop_map(|d| Ipv4Addr::new(198, 51, 100, d)),
         (any::<u8>()).prop_map(|d| Ipv4Addr::new(203, 0, 113, d)),
@@ -233,6 +238,18 @@ fn arb_private_ipv6() -> impl Strategy<Value = Ipv6Addr> {
                 0x2001, 0x0db8, segs[0], segs[1], segs[2], segs[3], segs[4], segs[5],
             )
         }),
+        // Discard-only 100::/64, benchmarking 2001:2::/48, and site-local fec0::/10
+        any::<[u16; 4]>().prop_map(|segs| {
+            Ipv6Addr::new(0x0100, 0, 0, 0, segs[0], segs[1], segs[2], segs[3])
+        }),
+        any::<[u16; 5]>().prop_map(|segs| {
+            Ipv6Addr::new(0x2001, 2, 0, segs[0], segs[1], segs[2], segs[3], segs[4])
+        }),
+        (0xfec0u16..=0xfeffu16, any::<[u16; 7]>()).prop_map(|(prefix, segs)| {
+            Ipv6Addr::new(
+                prefix, segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6],
+            )
+        }),
         // IPv4-mapped private IPv4
         arb_private_ipv4().prop_map(|v4| v4.to_ipv6_mapped()),
         // NAT64 embedded private IPv4 (64:ff9b::a.b.c.d)
@@ -269,6 +286,7 @@ proptest! {
     fn test_canonical_json_idempotency_on_arbitrary_json(val in arb_json_value()) {
         let c1 = canonical_json::to_string(&val).expect("canonicalize generated JSON");
         let val2: serde_json::Value = serde_json::from_str(&c1).expect("reparse canonical JSON");
+        prop_assert_eq!(&val2, &val, "canonicalization must preserve JSON values");
         let c2 = canonical_json::to_string(&val2).expect("re-canonicalize parsed JSON");
         prop_assert_eq!(c1, c2, "canonical_json(canonical_json(x)) == canonical_json(x)");
     }
@@ -290,6 +308,63 @@ proptest! {
         let signed = sign_profile(profile, &sk).expect("signing valid profile must succeed");
         let verified = verify_signed_profile(&signed).expect("verification call must not error");
         prop_assert!(verified, "any valid profile signed with its private key must verify");
+    }
+
+    /// Exercise numeric limits that are outside the ordinary profile generator's ranges.
+    #[test]
+    fn test_signed_profile_roundtrip_at_numeric_limits((sk, mut profile) in arb_valid_profile_and_key()) {
+        for (timestamp, sequence) in [(i64::MIN, 0), (i64::MAX, u64::MAX)] {
+            profile.updated_at = timestamp;
+            profile.expires_at = Some(timestamp);
+            profile.sequence = Some(sequence);
+            let bytes = canonical_profile_bytes(&profile).expect("serialize boundary profile");
+            let decoded: PaymentProfile = serde_json::from_slice(&bytes).expect("deserialize boundary profile");
+            prop_assert_eq!(decoded.updated_at, timestamp);
+            prop_assert_eq!(decoded.expires_at, Some(timestamp));
+            prop_assert_eq!(decoded.sequence, Some(sequence));
+            let signed = sign_profile(profile.clone(), &sk).expect("sign boundary profile");
+            prop_assert!(verify_signed_profile(&signed).expect("verify boundary profile"));
+        }
+    }
+
+    /// Optional signed fields must be authenticated even when the generator leaves them absent.
+    #[test]
+    fn test_tampered_optional_profile_fields_fail_verification((sk, profile) in arb_valid_profile_and_key()) {
+        let signed = sign_profile(profile, &sk).expect("sign profile");
+        prop_assert!(verify_signed_profile(&signed).expect("verify original profile"));
+        for field in ["expires_at", "preferences", "nonce"] {
+            let mut tampered = signed.clone();
+            match field {
+                "expires_at" => tampered.profile.expires_at = if tampered.profile.expires_at.is_some() {
+                    None
+                } else {
+                    Some(0)
+                },
+                "preferences" => tampered.profile.preferences.push("tampered".into()),
+                "nonce" => tampered.profile.nonce = Some("tampered-nonce".into()),
+                _ => unreachable!(),
+            }
+            prop_assert!(
+                matches!(verify_signed_profile(&tampered), Ok(false)),
+                "modifying {field} must invalidate the signature"
+            );
+        }
+    }
+
+    /// Malformed encodings are errors, distinct from well-formed signatures that do not verify.
+    #[test]
+    fn test_malformed_profile_signature_and_key_return_errors((sk, profile) in arb_valid_profile_and_key()) {
+        let signed = sign_profile(profile, &sk).expect("sign profile");
+        for signature in [String::new(), "zz".into(), "00".repeat(63), "00".repeat(65)] {
+            let mut malformed = signed.clone();
+            malformed.signature = signature;
+            prop_assert!(matches!(verify_signed_profile(&malformed), Err(SatsPathError::CryptoError(_))));
+        }
+        for pubkey in [String::new(), "zz".into(), "00".repeat(33)] {
+            let mut malformed = signed.clone();
+            malformed.profile.identity_pubkey = pubkey;
+            prop_assert!(matches!(verify_signed_profile(&malformed), Err(SatsPathError::InvalidPublicKey(_))));
+        }
     }
 
     // ── 3. Tampered Profile Fails Verification (No False Positives) ────────
@@ -371,8 +446,26 @@ proptest! {
         (leaves, index) in arb_tree_and_index()
     ) {
         let proof = inclusion_proof(&leaves, index).expect("inclusion proof generation");
+        prop_assert_eq!(proof.leaf_index, index as u64);
+        prop_assert_eq!(proof.tree_size, leaves.len() as u64);
+        prop_assert_eq!(&proof.leaf_hash, &hex::encode(leaves[index]));
+        prop_assert_eq!(&proof.root_hash, &hex::encode(merkle_root(&leaves)));
         let verified = verify_inclusion_proof(&proof).expect("proof verification");
         prop_assert!(verified, "inclusion proof for leaf {index} in tree of size {} must verify", leaves.len());
+    }
+
+    /// Proofs must consume exactly the required siblings, including singleton trees.
+    #[test]
+    fn test_merkle_proof_rejects_truncated_and_extended_paths((leaves, index) in arb_tree_and_index()) {
+        let proof = inclusion_proof(&leaves, index).expect("generate proof");
+        let mut extended = proof.clone();
+        extended.audit_path.push(hex::encode([0u8; 32]));
+        prop_assert!(matches!(verify_inclusion_proof(&extended), Ok(false)));
+        if !proof.audit_path.is_empty() {
+            let mut truncated = proof;
+            truncated.audit_path.pop();
+            prop_assert!(matches!(verify_inclusion_proof(&truncated), Ok(false)));
+        }
     }
 
     /// Check that altered Merkle hashes, paths, sizes, or indices fail verification.
@@ -508,5 +601,173 @@ proptest! {
                 if message.starts_with(&format!("Blocked scheme '{scheme}'"))),
             "validate_url must reject forbidden scheme: {url}, got {result:?}"
         );
+    }
+
+    /// The HTTP test flag only relaxes the scheme check, never the private-address check.
+    #[test]
+    fn test_ssrf_http_flag_does_not_allow_private_ips(v4 in arb_private_ipv4(), v6 in arb_private_ipv6()) {
+        for url in [
+            format!("http://{v4}/profile"),
+            format!("http://[{v6}]/profile"),
+            // The metadata IP is also a blocked hostname, so that check rejects it first.
+            "http://169.254.169.254/profile".into(),
+        ] {
+            let result = validate_url(&url, true);
+            prop_assert!(
+                matches!(&result, Err(SatsPathError::ValidationError(message))
+                    if message.starts_with("Blocked IP:") || message.starts_with("Blocked host:")),
+                "private IP must remain blocked with HTTP enabled: {url}, got {result:?}"
+            );
+        }
+    }
+
+    /// Check every generated port against the policy, using a public host to isolate port validation.
+    #[test]
+    fn test_ssrf_port_allowlist(port in any::<u16>()) {
+        let url = format!("https://example.com:{port}/profile");
+        let result = validate_url(&url, false);
+        if [80, 443, 8080, 8443].contains(&port) {
+            prop_assert!(result.is_ok(), "allowed port {port}: {result:?}");
+        } else {
+            prop_assert!(
+                matches!(&result, Err(SatsPathError::ValidationError(message)) if message.starts_with(&format!("Blocked port {port}"))),
+                "disallowed port {port}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_inclusion_proof_public_exports_handle_singleton_tree() {
+    let leaf = leaf_hash(b"only leaf");
+    let proof = satspath_core::inclusion_proof(&[leaf], 0).expect("crate-root export");
+    assert_eq!(proof, inclusion_proof(&[leaf], 0).expect("module export"));
+    assert_eq!(proof.leaf_index, 0);
+    assert_eq!(proof.tree_size, 1);
+    assert_eq!(proof.leaf_hash, hex::encode(leaf));
+    assert_eq!(proof.root_hash, proof.leaf_hash);
+    assert!(proof.audit_path.is_empty());
+    assert!(verify_inclusion_proof(&proof).expect("verify singleton proof"));
+}
+
+#[test]
+fn test_inclusion_proof_public_exports_reject_invalid_indices() {
+    let leaves = [leaf_hash(b"a"), leaf_hash(b"b")];
+    for (tree, index) in [
+        (&[][..], 0),
+        (&[][..], usize::MAX),
+        (&leaves[..], leaves.len()),
+        (&leaves[..], usize::MAX),
+    ] {
+        assert_eq!(
+            inclusion_proof(tree, index),
+            Err(TransparencyError::InvalidInclusionProof)
+        );
+        assert_eq!(
+            satspath_core::inclusion_proof(tree, index),
+            Err(TransparencyError::InvalidInclusionProof)
+        );
+    }
+}
+
+#[test]
+fn test_inclusion_proof_paths_for_three_leaf_tree() {
+    let leaves = [leaf_hash(b"a"), leaf_hash(b"b"), leaf_hash(b"c")];
+    // RFC 6962 splits this tree into a two-leaf left subtree and one right leaf.
+    let left_root = node_hash(&leaves[0], &leaves[1]);
+    let root = node_hash(&left_root, &leaves[2]);
+    let paths = [
+        vec![hex::encode(leaves[1]), hex::encode(leaves[2])],
+        vec![hex::encode(leaves[0]), hex::encode(leaves[2])],
+        vec![hex::encode(left_root)],
+    ];
+    for (index, expected_path) in paths.into_iter().enumerate() {
+        let proof = inclusion_proof(&leaves, index).expect("generate three-leaf proof");
+        assert_eq!(proof.audit_path, expected_path, "leaf {index}");
+        assert_eq!(proof.root_hash, hex::encode(root));
+        assert_eq!(proof.leaf_hash, hex::encode(leaves[index]));
+        assert_eq!(proof.leaf_index, index as u64);
+        assert_eq!(proof.tree_size, 3);
+        assert!(verify_inclusion_proof(&proof).expect("verify three-leaf proof"));
+    }
+}
+
+#[test]
+fn test_inclusion_proof_duplicate_leaves_at_tree_size_boundaries() {
+    for size in [1, 2, 3, 7, 8, 9, 63, 64, 65] {
+        let leaves = vec![leaf_hash(b"repeated leaf"); size];
+        for index in 0..size {
+            let proof = inclusion_proof(&leaves, index).expect("prove repeated leaf");
+            assert_eq!(proof.leaf_index, index as u64);
+            assert_eq!(proof.tree_size, size as u64);
+            assert!(
+                verify_inclusion_proof(&proof).expect("verify repeated leaf"),
+                "size {size}, index {index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_canonical_json_preserves_unicode_escapes_and_integer_limits() {
+    let value = serde_json::json!({
+        "unicode": "\u{1f680} e\u{301} \u{e9}",
+        "escaped": "\"\\\n\r\t\u{0}",
+        "nested": {"z": [], "a": {}},
+        "limits": [i64::MIN, i64::MAX, u64::MAX, 0, -1],
+        "scalars": [null, true, false],
+    });
+    let canonical = canonical_json::to_string(&value).expect("canonicalize boundary JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&canonical).expect("parse boundary JSON");
+    assert_eq!(parsed, value);
+    assert_eq!(canonical_json::to_string(&parsed).unwrap(), canonical);
+}
+
+#[test]
+fn test_ssrf_port_boundaries_on_public_host() {
+    for port in [80, 443, 8080, 8443] {
+        assert!(validate_url(&format!("https://example.com:{port}/profile"), false).is_ok());
+    }
+    for port in [
+        0, 79, 81, 442, 444, 1023, 1024, 8079, 8081, 8442, 8444, 65535,
+    ] {
+        let result = validate_url(&format!("https://example.com:{port}/profile"), false);
+        assert!(
+            matches!(&result, Err(SatsPathError::ValidationError(message)) if message.starts_with(&format!("Blocked port {port}"))),
+            "port {port}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn test_ssrf_blocked_hostnames_with_case_and_trailing_dot() {
+    for host in [
+        "LOCALHOST.",
+        "App.LocalHost.",
+        "METADATA.GOOGLE.INTERNAL.",
+        "sub.METADATA.GOOGLE.INTERNAL.",
+        "IP6-LOOPBACK.",
+    ] {
+        let result = validate_url(&format!("https://{host}/profile"), false);
+        assert!(
+            matches!(&result, Err(SatsPathError::ValidationError(message)) if message.starts_with("Blocked host:")),
+            "host {host}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn test_ssrf_allows_public_ipv4_and_embedded_ipv6_addresses() {
+    // Positive controls prevent a reject-everything policy from satisfying the SSRF properties.
+    for literal in [
+        "8.8.8.8",
+        "[::ffff:8.8.8.8]",
+        "[64:ff9b::808:808]",
+        "[2606:4700:4700::1111]",
+    ] {
+        let ip: IpAddr = literal.trim_matches(['[', ']']).parse().expect("public IP");
+        assert!(!is_private_or_reserved_ip(ip), "{ip}");
+        assert!(validate_url(&format!("https://{literal}/profile"), false).is_ok());
+        assert!(validate_url(&format!("http://{literal}/profile"), true).is_ok());
     }
 }
