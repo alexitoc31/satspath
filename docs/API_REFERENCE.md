@@ -50,7 +50,7 @@ are **not** cryptographically valid.
 | Content type | `application/json` for all JSON bodies and responses |
 | Default network | `devnet` (`--network` or `SATSPATH_NETWORK`) |
 | Correlation id | Send `X-Request-Id`; the daemon echoes it or generates one |
-| Max request body | 64 KiB (65,536 bytes) |
+| Max request body | 64 KiB (65,536 bytes) for declared `Content-Length` values and JSON request readers |
 
 A production deployment must not expose cleartext HTTP. See
 [`docker.md`](docker.md) and
@@ -58,11 +58,15 @@ A production deployment must not expose cleartext HTTP. See
 
 ### Host header allow-list
 
-Every route validates exactly one `Host` header before routing. Loopback binds
-accept `localhost` and loopback IP literals. For a DNS name (proxy or native TLS),
-set `SATSPATH_AUTHORITY_DOMAIN=node.example.com` or
+Requests normally require exactly one trusted `Host` header before routing.
+Internal `/metrics` scrapes are an exception: when the parsed `Host` is
+`satspathd`, the router may allow the request even if the normal allow-list
+check fails. Loopback binds accept `localhost` and loopback IP literals. For a
+DNS name (proxy or native TLS), set
+`SATSPATH_AUTHORITY_DOMAIN=node.example.com` or
 `SATSPATH_AUTHORITY_URL=https://node.example.com/v2`. Missing, duplicate,
-malformed, or untrusted hosts receive `400 {"error":"untrusted HTTP Host"}`.
+malformed, or untrusted hosts on other requests receive
+`400 {"error":"untrusted HTTP Host"}`.
 `X-Forwarded-Host` and `--behind-proxy` do not bypass this check. See
 [`dashboard_authentication.md`](dashboard_authentication.md).
 
@@ -114,7 +118,7 @@ Checks run in this order; the first failure wins.
 
 | Order | Check | Response |
 | :--- | :--- | :--- |
-| 1 | `Host` allow-list | `400` `{"error":"untrusted HTTP Host"}` |
+| 1 | `Host` allow-list (except internal `/metrics` scrapes) | `400` `{"error":"untrusted HTTP Host"}` |
 | 2 | Declared `Content-Length` over limit | `413` `{"error":"...","max_bytes":65536}` |
 | 3 | Per-IP token bucket (burst 60, refill 10/s) | `429` with `Retry-After` header and `{"error":"...","retry_after":N}` |
 | 4 | Bearer token (protected routes) | `401` `{"error":"Unauthorized: ..."}` |
@@ -127,7 +131,8 @@ daemon with `--behind-proxy` (or `SATSPATHD_BEHIND_PROXY=1`) so
 
 ### Error body
 
-All failures use the same shape:
+All failures include an `error` field. Some responses also include metadata
+such as `max_bytes` or `retry_after`:
 
 ```json
 { "error": "human-readable message" }
