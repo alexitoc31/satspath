@@ -144,6 +144,7 @@ Responses carry `Access-Control-Allow-Origin` set to the **first** entry of
 `SATSPATHD_CORS_ORIGIN` (default `http://localhost:5173`), plus
 `Access-Control-Allow-Methods: GET, POST, OPTIONS` and
 `Access-Control-Allow-Headers: Content-Type, Authorization, X-Request-Id`.
+After Host validation, the declared body-size check, and rate limiting pass,
 `OPTIONS` on any path returns `204`. Because `PUT` is not in the allowed methods,
 browsers cannot call `PUT /v1/profile` cross-origin; use `POST /v1/profile`
 instead. For multiple origins, use a reverse proxy.
@@ -345,14 +346,13 @@ curl -s -X POST http://127.0.0.1:9737/v1/quote \
   -d '{"recipient":"alice@example.com","amount_sats":50000}'
 ```
 
-The response is always HTTP 200 and tagged by `status`:
+After global checks and JSON parsing pass, `/v1/quote` returns HTTP 200 and is
+tagged by `status`:
 
 | `status` | Meaning |
 | :--- | :--- |
 | `ok` | Route selected; `qr` holds the public payload for the wallet. |
-| `not_registered` | No profile found; an `invite` object is returned. |
-| `no_route` | Profile valid but nothing routable (see below). |
-| `invalid_signature` | Profile failed verification. Do not offer payment. |
+| `no_route` | Profile resolution failed (including lookup or signature verification), or no usable route was found (see below). Resolution failures have a `reason` starting with `transparency verification failed:`. |
 
 `/v1/quote`, `/v1/preview`, and `/v1/pay` route only through the mandatory
 transparency composition (signature, identifier history, key continuity,
