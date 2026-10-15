@@ -1,0 +1,13 @@
+[package]
+name = "satspath-handoff"
+version = "0.1.0"
+edition = "2021"
+description = "Portable validation of public wallet handoff payloads"
+
+[dependencies]
+bitcoin = { workspace = true }
+lightning-invoice = { workspace = true }
+bech32 = { workspace = true }
+url = { workspace = true }
+secp256k1 = { workspace = true }
+hex = { workspace = true }

@@ -39,7 +39,7 @@ Capability discovery (Lightning, BOLT12, on-chain, Silent Payments, Ark)
        ↓
 Reference route selection (amount, multi-source fee consensus, priority)
        ↓
-Wallet handoff payload (BIP-21 URI, BOLT11 invoice, BOLT12 offer, Ark pointer)
+Wallet handoff payload (BIP-21 URI or validated BOLT11 invoice where supported)
        ↓
 Host wallet signs and executes the payment
 ```

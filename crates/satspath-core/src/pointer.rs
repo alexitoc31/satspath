@@ -46,6 +46,7 @@ pub enum PaymentPointer {
 }
 
 impl PaymentPointer {
+    /// Return the human-readable rail name for a payment pointer.
     pub fn rail_name(&self) -> &'static str {
         match self {
             PaymentPointer::LightningAddress { .. } => "Lightning Address",
@@ -58,8 +59,54 @@ impl PaymentPointer {
     }
 }
 
+/// Validate a direct pointer before it becomes a wallet payload.
+fn validate_handoff(pointer: &PaymentPointer, sats: u64) -> Result<()> {
+    use satspath_handoff as check;
+    let now = chrono::Utc::now().timestamp();
+    let result = match pointer {
+        PaymentPointer::LightningAddress { address, .. } => check::lightning_address(address),
+        PaymentPointer::LnurlPay { callback_url, .. } => check::https(callback_url),
+        PaymentPointer::Bolt11Invoice { invoice, .. } => check::bolt11_network(invoice)
+            .ok_or_else(|| "unrecognized BOLT11 network".to_string())
+            .and_then(|network| check::bolt11(invoice, sats, network, now.max(0) as u64)),
+        PaymentPointer::Bolt12Offer { offer } => check::bolt12(offer, None, now.max(0) as u64),
+        PaymentPointer::OnchainAddress {
+            network, address, ..
+        } => {
+            let network = match network {
+                BitcoinNetwork::Mainnet => bitcoin::Network::Bitcoin,
+                BitcoinNetwork::Testnet => bitcoin::Network::Testnet,
+                BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
+            };
+            let is_silent = bech32::decode(address)
+                .map(|(hrp, _, _)| {
+                    let hrp_lower = hrp.to_ascii_lowercase();
+                    matches!(hrp_lower.as_str(), "sp" | "tsp" | "sprt")
+                })
+                .unwrap_or(false);
+            if is_silent {
+                check::silent(address, network)
+            } else {
+                check::onchain(address, network)
+            }
+        }
+        PaymentPointer::Ark {
+            server,
+            receiver_pubkey,
+            vtxo_pointer,
+        } => {
+            let key = hex::decode(receiver_pubkey)
+                .map_err(|e| SatsPathError::InvalidPublicKey(e.to_string()))?;
+            check::ark(server, &key, vtxo_pointer.as_deref(), None, None, now)
+        }
+    };
+    result.map_err(SatsPathError::InvalidPaymentPointer)
+}
+
+/// Build a validated public wallet payload for a positive amount.
 pub fn build_qr_payload(pointer: &PaymentPointer, amount_sats: u64) -> Result<String> {
     validate_amount_sats(amount_sats)?;
+    validate_handoff(pointer, amount_sats)?;
 
     let payload = match pointer {
         PaymentPointer::LightningAddress { address, .. } => {
@@ -129,15 +176,47 @@ fn sats_to_btc(amount_sats: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bech32::ToBase32;
 
     #[test]
-    fn qr_payload_for_bolt11_returns_invoice() {
+    fn bolt12_qr_payload_checks_expiry_and_features_without_a_network() {
+        let key = hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .unwrap();
+        for hrp in ["lno", "lnot", "lnob", "lnos"] {
+            for (fields, accepted) in [
+                (vec![], true),
+                (vec![14, 0], false),
+                (
+                    [vec![14, 8], u64::MAX.to_be_bytes().to_vec()].concat(),
+                    true,
+                ),
+                (vec![12, 1, 1], false),
+                (vec![12, 1, 2], true),
+            ] {
+                let raw = [fields, vec![22, 33], key.clone()].concat();
+                let offer = bech32::encode(hrp, raw.to_base32(), bech32::Variant::Bech32m).unwrap();
+                let pointer = PaymentPointer::Bolt12Offer {
+                    offer: offer.clone(),
+                };
+                let result = build_qr_payload(&pointer, 1);
+                if accepted {
+                    assert_eq!(result.unwrap(), offer);
+                } else {
+                    assert!(result.is_err(), "{offer}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    /// Verify that qr payload for bolt11 rejects malformed invoice.
+    fn qr_payload_for_bolt11_rejects_malformed_invoice() {
         let invoice = "lnbc210n1pexampleinvoice".to_string();
         let pointer = PaymentPointer::Bolt11Invoice {
             invoice: invoice.clone(),
             amount_sats: Some(21_000),
         };
-        assert_eq!(build_qr_payload(&pointer, 21_000).unwrap(), invoice);
+        assert!(build_qr_payload(&pointer, 21_000).is_err());
     }
 
     #[test]
@@ -151,6 +230,35 @@ mod tests {
             build_qr_payload(&pointer, 21_000).unwrap(),
             "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00021"
         );
+    }
+
+    #[test]
+    fn qr_payload_routes_silent_payment_by_hrp_and_network() {
+        let key = hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .unwrap();
+        let mut data = vec![bech32::u5::try_from_u8(0).unwrap()];
+        data.extend([key.clone(), key].concat().to_base32());
+        for (network, hrp) in [
+            (BitcoinNetwork::Mainnet, "sp"),
+            (BitcoinNetwork::Testnet, "tsp"),
+            (BitcoinNetwork::Regtest, "sprt"),
+        ] {
+            let address = bech32::encode(hrp, &data, bech32::Variant::Bech32m).unwrap();
+            let pointer = PaymentPointer::OnchainAddress {
+                network,
+                address: address.clone(),
+                claim_policy: None,
+            };
+            assert!(build_qr_payload(&pointer, 21_000).is_ok(), "{hrp}");
+            let wrong_network = PaymentPointer::OnchainAddress {
+                network: BitcoinNetwork::Mainnet,
+                address,
+                claim_policy: None,
+            };
+            if network != BitcoinNetwork::Mainnet {
+                assert!(build_qr_payload(&wrong_network, 21_000).is_err(), "{hrp}");
+            }
+        }
     }
 
     #[test]

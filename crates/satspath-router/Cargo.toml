@@ -14,6 +14,7 @@ wasm = ["satspath-core/wasm", "getrandom/js", "web-sys/Request", "web-sys/Respon
 
 [dependencies]
 satspath-core = { path = "../satspath-core" }
+satspath-handoff = { path = "../satspath-handoff" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -41,3 +42,4 @@ mockito = "1"
 secp256k1 = { workspace = true }
 bitcoin = { workspace = true }
 async-trait = "0.1"
+proptest = "1.5"

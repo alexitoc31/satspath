@@ -15,6 +15,9 @@ pub mod silent_payments;
 pub mod split_payments;
 pub mod urgency;
 
+#[cfg(test)]
+mod lightning_tests;
+
 pub use ark_routes::{plan_ark_route, ArkRoutePlan, SenderCapabilities};
 pub use bip353_preview::quote_from_bip353_resolution;
 pub use bolt12::{parse_bolt12_offer, Bolt12Invoice, Bolt12InvoiceRequest, Bolt12Offer};

@@ -251,7 +251,21 @@ mod tests {
             "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=not-an-amount",
             "bitcoin:mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn?amount=0.00001000",
         ] {
-            let res = resolution(uri, true);
+            // Invalid records can be rejected by the resolver before reaching
+            // the quote adapter; exercise the adapter's own fail-closed gate.
+            let res = Bip353Resolution {
+                name: Bip353Name {
+                    user: "rodrigo".into(),
+                    domain: "satspath.dev".into(),
+                    display: "₿rodrigo@satspath.dev".into(),
+                    dns_name: "rodrigo.user._bitcoin-payment.satspath.dev".into(),
+                },
+                bitcoin_uri: uri.into(),
+                dnssec_validated: true,
+                ttl_seconds: None,
+                resolved_at: 1_700_000_000,
+                warnings: vec![],
+            };
             assert!(
                 matches!(
                     quote_from_bip353_resolution(&res, 1000),

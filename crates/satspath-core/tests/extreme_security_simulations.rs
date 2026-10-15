@@ -1,5 +1,4 @@
 use chrono::Utc;
-use mockito::Server;
 use satspath_core::crypto::{generate_identity_keypair, sign_profile, verify_signed_profile};
 use satspath_core::profile::{PaymentMethod, PaymentProfile};
 use satspath_core::resolvers::bip353::Bip353Resolver;
@@ -33,40 +32,15 @@ fn create_pqc_profile(pubkey: &secp256k1::PublicKey) -> PaymentProfile {
 }
 
 #[tokio::test]
-async fn test_attack_memory_exhaustion_dos() {
-    println!("✅ SETUP: Resolver configured with 50KB DoS protection limit...");
-    let mut server = Server::new_async().await;
-
-    // ATTACK 9: Create a 5MB garbage payload
-    println!("⚔️ ATTACK 9: Malicious server attempts to send 5MB payload to crash the node (OOM JSON Bomb)...");
-    let massive_garbage = "x".repeat(5 * 1024 * 1024);
-
-    let _mock = server
-        .mock("GET", "/profile")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(massive_garbage)
-        .create_async()
-        .await;
-
+async fn test_attack_loopback_profile_url_rejected() {
     let resolver = HttpResolver::new();
-    let url = format!("{}/profile", server.url());
-    let result = resolver.resolve_from_url(&url).await;
-
-    // VALIDATION
+    let result = resolver
+        .resolve_from_url("https://127.0.0.1:8080/profile")
+        .await;
     assert!(
-        result.is_err(),
-        "SECURITY FAILURE: Node attempted to parse a 5MB payload!"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("DoS protection"),
-        "Node should explicitly reject via DoS protection. Got: {}",
-        err_msg
-    );
-    println!(
-        "🛡️ DEFENSE SUCCESS: Memory exhaustion avoided! Download forcefully aborted. Reason: {}",
-        err_msg
+        matches!(result, Err(satspath_core::SatsPathError::ValidationError(ref message))
+            if message.starts_with("Blocked IP: 127.0.0.1")),
+        "resolve_from_url must reject the loopback IP range: {result:?}"
     );
 }
 

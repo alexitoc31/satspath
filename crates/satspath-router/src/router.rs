@@ -83,7 +83,21 @@ pub struct RouteQuote {
 ///   3. Ark        — fallback when on-chain fees are too high.
 ///   4. Error      — no suitable rail found.
 pub async fn select_route(req: &RouteRequest) -> satspath_core::Result<RouteQuote> {
-    let methods = &req.signed_profile.profile.methods;
+    satspath_core::validation::validate_amount_sats(req.amount_sats)?;
+    let valid_methods: Vec<_> = req
+        .signed_profile
+        .profile
+        .methods
+        .iter()
+        .filter(|method| satspath_core::handoff::validate_method(method, req.amount_sats).is_ok())
+        .cloned()
+        .collect();
+    if valid_methods.is_empty() {
+        return Err(satspath_core::SatsPathError::NoRouteFound(
+            "no validated payment methods".into(),
+        ));
+    }
+    let methods = &valid_methods;
 
     // 1. Lightning — evaluated first, independent of fee environment.
     if req.amount_sats < LIGHTNING_THRESHOLD_SATS {
@@ -99,6 +113,14 @@ pub async fn select_route(req: &RouteRequest) -> satspath_core::Result<RouteQuot
                 _ => None,
             };
             let swap_directive = match ln {
+                PaymentMethod::Lightning {
+                    bolt12: Some(invoice),
+                    ..
+                } if satspath_handoff::bolt11_network(invoice).is_some() => {
+                    SwapDirective::LightningPayment {
+                        target_ln_address: None,
+                    }
+                }
                 PaymentMethod::Lightning {
                     bolt12: Some(offer),
                     ..
@@ -276,7 +298,21 @@ pub fn select_route_with_fees(
     req: &RouteRequest,
     fee_est: &FeeEstimate,
 ) -> satspath_core::Result<RouteQuote> {
-    let methods = &req.signed_profile.profile.methods;
+    satspath_core::validation::validate_amount_sats(req.amount_sats)?;
+    let valid_methods: Vec<_> = req
+        .signed_profile
+        .profile
+        .methods
+        .iter()
+        .filter(|method| satspath_core::handoff::validate_method(method, req.amount_sats).is_ok())
+        .cloned()
+        .collect();
+    if valid_methods.is_empty() {
+        return Err(satspath_core::SatsPathError::NoRouteFound(
+            "no validated payment methods".into(),
+        ));
+    }
+    let methods = &valid_methods;
 
     // Lightning first — no fee check, but enforce dust threshold.
     if req.amount_sats < LIGHTNING_THRESHOLD_SATS {
@@ -291,6 +327,14 @@ pub fn select_route_with_fees(
                 _ => None,
             };
             let swap_directive = match ln {
+                PaymentMethod::Lightning {
+                    bolt12: Some(invoice),
+                    ..
+                } if satspath_handoff::bolt11_network(invoice).is_some() => {
+                    SwapDirective::LightningPayment {
+                        target_ln_address: None,
+                    }
+                }
                 PaymentMethod::Lightning {
                     bolt12: Some(offer),
                     ..
@@ -553,11 +597,12 @@ mod tests {
     }
 
     #[test]
+    /// Verify that chooses onchain for large amount low fees.
     fn chooses_onchain_for_large_amount_low_fees() {
         let signed = make_profile(vec![PaymentMethod::Onchain {
             label: "BTC".into(),
             network: BitcoinNetwork::Mainnet,
-            address: Some("bc1q...".into()),
+            address: Some("1BoatSLRHtKNngkdXEeobR76b53LETtpyT".into()),
             silent_payment_pubkey: None,
             pubkey_hint: None,
             descriptor_hint: None,
@@ -577,12 +622,13 @@ mod tests {
     }
 
     #[test]
+    /// Verify that falls back to ark when fees high.
     fn falls_back_to_ark_when_fees_high() {
         let signed = make_profile(vec![
             PaymentMethod::Onchain {
                 label: "BTC".into(),
                 network: BitcoinNetwork::Mainnet,
-                address: Some("bc1q...".into()),
+                address: Some("1BoatSLRHtKNngkdXEeobR76b53LETtpyT".into()),
                 silent_payment_pubkey: None,
                 pubkey_hint: None,
                 descriptor_hint: None,
@@ -629,11 +675,12 @@ mod tests {
     }
 
     #[test]
+    /// Verify that onchain boundary at 10 sat vb hour fee.
     fn onchain_boundary_at_10_sat_vb_hour_fee() {
         let signed = make_profile(vec![PaymentMethod::Onchain {
             label: "BTC".into(),
             network: BitcoinNetwork::Mainnet,
-            address: Some("bc1q...".into()),
+            address: Some("1BoatSLRHtKNngkdXEeobR76b53LETtpyT".into()),
             silent_payment_pubkey: None,
             pubkey_hint: None,
             descriptor_hint: None,
