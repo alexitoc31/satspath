@@ -1,8 +1,15 @@
 use async_trait::async_trait;
+use reqwest::dns::Resolve;
+#[cfg(test)]
+use reqwest::dns::{Addrs, Name, Resolving};
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::crypto::{check_profile_expiry, verify_signed_profile};
+#[cfg(test)]
+use crate::outbound::ValidatingDnsResolver;
+use crate::outbound::{http_client_with_resolver, SystemDnsResolver};
 use crate::resolver::ProfileResolver;
 use crate::ssrf::validate_url;
 use crate::{Result, SatsPathError, SignedPaymentProfile};
@@ -24,14 +31,15 @@ pub struct HttpResolver {
 }
 
 impl HttpResolver {
+    /// Construct the resolver with its configured transport policy.
     pub fn new() -> Self {
+        Self::with_dns_resolver(Arc::new(SystemDnsResolver))
+    }
+
+    /// Build a resolver with injectable DNS for controlled connection tests.
+    fn with_dns_resolver<R: Resolve + 'static>(resolver: Arc<R>) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                // Disallow redirects to prevent open redirect → SSRF chains
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap_or_default(),
+            client: http_client_with_resolver(Duration::from_secs(10), resolver),
         }
     }
 
@@ -73,28 +81,25 @@ impl ProfileResolver for HttpResolver {
 impl HttpResolver {
     /// Fetch, verify, and return a signed profile from an explicit URL.
     ///
-    /// Extracted so tests can pass a mock server URL directly without
-    /// needing a real DNS entry for the test domain.
+    /// The URL must satisfy all production SSRF constraints unconditionally.
     pub async fn resolve_from_url(&self, url: &str) -> Result<SignedPaymentProfile> {
-        let is_test_build = cfg!(any(test, feature = "test-utils"));
-        let parsed =
-            url::Url::parse(url).map_err(|e| SatsPathError::InvalidPaymentUri(e.to_string()))?;
-        let is_local = parsed.username().is_empty()
-            && parsed.password().is_none()
-            && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1"));
+        validate_url(url, false)?;
+        self.fetch_from_validated_url(url).await
+    }
 
-        if is_test_build && is_local {
-            if let Some(port) = parsed.port() {
-                if matches!(port, 22 | 3306 | 5432 | 6379 | 27017) {
-                    return Err(SatsPathError::ValidationError(format!(
-                        "Blocked port '{port}'"
-                    )));
-                }
-            }
-        } else {
-            validate_url(url, false)?;
-        }
+    /// Test-only resolution path for mock servers without production SSRF checks.
+    #[cfg(test)]
+    pub(crate) async fn resolve_from_mock_url(&self, url: &str) -> Result<SignedPaymentProfile> {
+        self.fetch_from_validated_url(url).await
+    }
 
+    /// Construct a resolver with a custom HTTP client (for test dependency injection).
+    #[cfg(test)]
+    pub(crate) fn with_client(client: Client) -> Self {
+        Self { client }
+    }
+
+    async fn fetch_from_validated_url(&self, url: &str) -> Result<SignedPaymentProfile> {
         let mut resp = self.client.get(url).send().await.map_err(|e| {
             SatsPathError::NetworkError(format!("Failed to connect to {}: {}", url, e))
         })?;
@@ -155,6 +160,99 @@ mod tests {
     use crate::crypto::{generate_identity_keypair, sign_profile};
     use crate::profile::{PaymentMethod, PaymentProfile};
     use mockito::Server;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct StubResolver {
+        addrs: Vec<std::net::SocketAddr>,
+        calls: AtomicUsize,
+    }
+
+    impl StubResolver {
+        /// Return the supplied socket addresses and track DNS lookup calls.
+        fn new(addrs: Vec<std::net::SocketAddr>) -> Self {
+            Self {
+                addrs,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Resolve for StubResolver {
+        /// Resolve the hostname at the connector boundary.
+        fn resolve(&self, name: Name) -> Resolving {
+            assert_eq!(name.as_str(), "profile.example");
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let addrs = self.addrs.clone();
+            Box::pin(async move { Ok(Box::new(addrs.into_iter()) as Addrs) })
+        }
+    }
+
+    #[tokio::test]
+    /// Verify that hostname resolving to private ip is rejected before connect.
+    async fn hostname_resolving_to_private_ip_is_rejected_before_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stub = Arc::new(StubResolver::new(vec![listener.local_addr().unwrap()]));
+        let resolver = HttpResolver::with_dns_resolver(stub.clone());
+        let url = "https://profile.example/profile";
+        assert!(validate_url(url, false).is_ok());
+
+        let result = resolver.resolve_from_url(url).await;
+
+        assert!(matches!(result, Err(SatsPathError::NetworkError(_))));
+        assert_eq!(stub.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the resolver must reject the DNS answer before opening a socket"
+        );
+    }
+
+    #[tokio::test]
+    /// Verify that dns resolver rejects disallowed and mixed answers.
+    async fn dns_resolver_rejects_disallowed_and_mixed_answers() {
+        let public = "8.8.8.8:0".parse().unwrap();
+        for blocked in [
+            "10.0.0.1:0",
+            "127.0.0.1:0",
+            "169.254.169.254:0",
+            "192.0.2.1:0",
+            "[::1]:0",
+            "[fc00::1]:0",
+            "[::ffff:192.168.1.1]:0",
+            "[64:ff9b::a00:1]:0",
+        ] {
+            let blocked = blocked.parse().unwrap();
+            for addrs in [vec![blocked], vec![public, blocked], vec![blocked, public]] {
+                let resolver = ValidatingDnsResolver(Arc::new(StubResolver::new(addrs)));
+                let error = resolver
+                    .resolve("profile.example".parse().unwrap())
+                    .await
+                    .err()
+                    .expect("a disallowed DNS answer must reject the entire result");
+                assert!(matches!(
+                    error.downcast_ref::<SatsPathError>(),
+                    Some(SatsPathError::ValidationError(message)) if message.starts_with("Blocked IP:")
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    /// Verify that dns resolver preserves public answers.
+    async fn dns_resolver_preserves_public_answers() {
+        let addrs = vec![
+            "8.8.8.8:0".parse().unwrap(),
+            "[2606:4700:4700::1111]:0".parse().unwrap(),
+        ];
+        let resolver = ValidatingDnsResolver(Arc::new(StubResolver::new(addrs.clone())));
+        let resolved = resolver
+            .resolve("profile.example".parse().unwrap())
+            .await
+            .expect("public DNS answers must remain usable");
+        assert_eq!(resolved.collect::<Vec<_>>(), addrs);
+    }
 
     /// Build a valid signed profile.
     fn make_valid_signed(alias: &str, expires_at: Option<i64>) -> SignedPaymentProfile {
@@ -204,7 +302,7 @@ mod tests {
 
         let resolver = HttpResolver::new();
         let url = format!("{}/profile", server.url());
-        let result = resolver.resolve_from_url(&url).await;
+        let result = resolver.resolve_from_mock_url(&url).await;
 
         assert!(
             result.is_ok(),
@@ -235,7 +333,7 @@ mod tests {
 
         let resolver = HttpResolver::new();
         let url = format!("{}/profile", server.url());
-        let result = resolver.resolve_from_url(&url).await;
+        let result = resolver.resolve_from_mock_url(&url).await;
 
         assert!(result.is_err(), "tampered signature must be rejected");
         let err = result.unwrap_err().to_string();
@@ -265,7 +363,7 @@ mod tests {
 
         let resolver = HttpResolver::new();
         let url = format!("{}/profile", server.url());
-        let result = resolver.resolve_from_url(&url).await;
+        let result = resolver.resolve_from_mock_url(&url).await;
 
         assert!(result.is_err(), "expired profile must be rejected");
         let err = result.unwrap_err().to_string();
@@ -286,7 +384,7 @@ mod tests {
 
         let resolver = HttpResolver::new();
         let url = format!("{}/profile", server.url());
-        let result = resolver.resolve_from_url(&url).await;
+        let result = resolver.resolve_from_mock_url(&url).await;
 
         assert!(result.is_err());
         assert!(
@@ -309,7 +407,7 @@ mod tests {
 
         let resolver = HttpResolver::new();
         let url = format!("{}/profile", server.url());
-        let result = resolver.resolve_from_url(&url).await;
+        let result = resolver.resolve_from_mock_url(&url).await;
 
         assert!(result.is_err());
         assert!(
@@ -334,12 +432,86 @@ mod tests {
 
         let resolver = HttpResolver::new();
         let url = format!("{}/profile", server.url());
-        let result = resolver.resolve_from_url(&url).await;
+        let result = resolver.resolve_from_mock_url(&url).await;
 
         assert!(result.is_err(), "malformed JSON must be rejected");
         assert!(
             matches!(result.unwrap_err(), SatsPathError::SerializationError(_)),
             "malformed JSON must map to SerializationError"
         );
+    }
+
+    // ── Test 7: Loopback URLs unconditionally rejected in resolve_from_url ────
+
+    #[tokio::test]
+    async fn resolve_from_url_unconditionally_rejects_loopback() {
+        let resolver = HttpResolver::new();
+        let loopback_urls = [
+            "http://127.0.0.1:8080/profile",
+            "https://127.0.0.1:8080/profile",
+            "http://localhost:8080/profile",
+            "https://localhost:8080/profile",
+        ];
+        for url in loopback_urls {
+            let result = resolver.resolve_from_url(url).await;
+            assert!(
+                matches!(result, Err(SatsPathError::ValidationError(_))),
+                "expected ValidationError for {url}, got: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attack_memory_exhaustion_dos() {
+        use tokio_rustls::rustls::{pki_types::PrivatePkcs8KeyDer, ServerConfig};
+
+        // Route a public-looking hostname to a local TLS mock through a test-only client.
+        // Production construction retains DNS answer validation and cannot inject this client.
+        let cert = rcgen::generate_simple_self_signed(vec!["profile.example".into()]).unwrap();
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let mut request = [0; 4096];
+            let len = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..len]).contains("GET /profile"));
+            // One byte past the cap exercises the same boundary without a multi-MB buffer.
+            let body = "x".repeat(50 * 1024 + 1);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            // The client intentionally stops reading after 50 KiB.
+            let _ = stream.write_all(body.as_bytes()).await;
+        });
+
+        let client = Client::builder()
+            .resolve("profile.example", address)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(reqwest::Certificate::from_der(cert.cert.der()).unwrap())
+            .build()
+            .unwrap();
+        let resolver = HttpResolver::with_client(client);
+        let result = resolver
+            .resolve_from_url("https://profile.example/profile")
+            .await;
+        assert!(result.is_err(), "Node must reject an oversized payload");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("DoS protection"),
+            "Expected DoS protection error, got: {err_msg}"
+        );
+        server.await.unwrap();
     }
 }

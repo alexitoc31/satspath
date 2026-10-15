@@ -405,10 +405,6 @@ pub(crate) fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-pub(crate) fn fmt_btc(sats: u64) -> String {
-    format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000)
-}
-
 /// Minimal percent-encoding for mailto: query components.
 pub(crate) fn pct(s: &str) -> String {
     let mut out = String::new();

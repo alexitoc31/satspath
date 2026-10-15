@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/satspath-handoff",
     "crates/satspath-core",
     "crates/satspath-router",
     "crates/satspath-cli",
@@ -9,6 +10,7 @@ members = [
     "crates/satspath-pqc",
     "crates/satspath-witness",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

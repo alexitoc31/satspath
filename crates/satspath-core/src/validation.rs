@@ -1,4 +1,3 @@
-use bech32::FromBase32;
 use bitcoin::{Address, Network};
 use secp256k1::PublicKey;
 use std::str::FromStr;
@@ -63,39 +62,24 @@ pub fn validate_lightning_address(address: &str) -> Result<()> {
     }
 }
 
-/// Validate a BOLT12 offer string.
-/// BOLT12 offers are bech32 encoded with prefix "lno" (mainnet) or "lnot" (testnet).
-/// They contain an amount, node_id, paths, and other metadata.
+/// Validate a BOLT12 offer string using the shared handoff validator.
 pub fn validate_bolt12_offer(offer: &str) -> Result<()> {
-    let trimmed = offer.trim();
-    if trimmed.is_empty() {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "BOLT12 offer cannot be empty".into(),
-        ));
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    // BOLT12 offers use bech32 with prefixes lno (mainnet) or lnot (testnet)
-    if !lower.starts_with("lno") && !lower.starts_with("lnot") {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "BOLT12 offer must start with 'lno' (mainnet) or 'lnot' (testnet)".into(),
-        ));
-    }
-    // Decode and validate the bech32 payload
-    let (_, data, _) = bech32::decode(&lower).map_err(|e| {
-        SatsPathError::InvalidPaymentPointer(format!("BOLT12 offer bech32 decode failed: {e}"))
-    })?;
-    // A real BOLT12 offer always has substantial TLV data -- reject suspiciously
-    // short payloads that are likely truncated, synthetic, or just a prefix.
-    if data.len() < 40 {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "BOLT12 offer data too short -- likely truncated or invalid".into(),
-        ));
-    }
-    // Ensure no private material
-    assert_no_private_material(trimmed)?;
-    Ok(())
+    validate_bolt12_offer_for_network(offer, None)
 }
 
+fn validate_bolt12_offer_for_network(offer: &str, network: Option<BitcoinNetwork>) -> Result<()> {
+    let trimmed = offer.trim();
+    assert_no_private_material(trimmed)?;
+    let network = network.map(|net| match net {
+        BitcoinNetwork::Mainnet => Network::Bitcoin,
+        BitcoinNetwork::Testnet => Network::Testnet,
+        BitcoinNetwork::Regtest => Network::Regtest,
+    });
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    satspath_handoff::bolt12(trimmed, network, now).map_err(SatsPathError::InvalidPaymentPointer)
+}
+
+/// Decode a Bitcoin address and require the declared network.
 pub fn validate_bitcoin_address(address: &str, network: BitcoinNetwork) -> Result<()> {
     let parsed = Address::from_str(address.trim())
         .map_err(|e| SatsPathError::InvalidPaymentPointer(e.to_string()))?;
@@ -110,86 +94,16 @@ pub fn validate_bitcoin_address(address: &str, network: BitcoinNetwork) -> Resul
     Ok(())
 }
 
+/// Validate BIP-352 encoding and public keys using the shared wallet policy.
 pub fn validate_silent_payment_address(address: &str, network: BitcoinNetwork) -> Result<()> {
-    let trimmed = address.trim();
-    if trimmed.is_empty() {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "silent payment address cannot be empty".into(),
-        ));
-    }
-
-    assert_no_private_material(trimmed)?;
-
-    let lower = trimmed.to_ascii_lowercase();
-
-    // BIP-352: mainnet uses 'sp', testnet/regtest use 'tsp'
-    let expected_hrp = match network {
-        BitcoinNetwork::Mainnet => "sp",
-        BitcoinNetwork::Testnet | BitcoinNetwork::Regtest => "tsp",
+    let address = address.trim();
+    assert_no_private_material(address)?;
+    let network = match network {
+        BitcoinNetwork::Mainnet => Network::Bitcoin,
+        BitcoinNetwork::Testnet => Network::Testnet,
+        BitcoinNetwork::Regtest => Network::Regtest,
     };
-
-    if !lower.starts_with(expected_hrp) {
-        return Err(SatsPathError::InvalidPaymentPointer(format!(
-            "silent payment address must start with '{expected_hrp}' for {network:?}"
-        )));
-    }
-
-    let (hrp, data, variant) = bech32::decode(&lower).map_err(|e| {
-        SatsPathError::InvalidPaymentPointer(format!("silent payment bech32 decode failed: {e}"))
-    })?;
-
-    if hrp != expected_hrp {
-        return Err(SatsPathError::InvalidPaymentPointer(format!(
-            "silent payment address HRP '{hrp}' does not match expected '{expected_hrp}'"
-        )));
-    }
-
-    if variant != bech32::Variant::Bech32m {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "silent payment address must use Bech32m encoding".into(),
-        ));
-    }
-
-    let bytes = Vec::<u8>::from_base32(&data).map_err(|e| {
-        SatsPathError::InvalidPaymentPointer(format!(
-            "silent payment base32 conversion failed: {e}"
-        ))
-    })?;
-
-    // BIP-352 payload: 1 byte version (0x00) + 33 bytes scan pubkey + 33 bytes spend pubkey = 67 bytes
-    if bytes.len() != 67 {
-        return Err(SatsPathError::InvalidPaymentPointer(format!(
-            "silent payment address payload must be 67 bytes, got {}",
-            bytes.len()
-        )));
-    }
-
-    if bytes[0] != 0 {
-        return Err(SatsPathError::InvalidPaymentPointer(format!(
-            "unsupported silent payment address version: {}",
-            bytes[0]
-        )));
-    }
-
-    // Validate both compressed public keys (must start with 0x02 or 0x03)
-    let scan_header = bytes[1];
-    let spend_header = bytes[34];
-    if (scan_header != 0x02 && scan_header != 0x03)
-        || (spend_header != 0x02 && spend_header != 0x03)
-    {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "silent payment public keys must be 33-byte compressed secp256k1 keys".into(),
-        ));
-    }
-
-    secp256k1::PublicKey::from_slice(&bytes[1..34]).map_err(|e| {
-        SatsPathError::InvalidPaymentPointer(format!("invalid scan public key: {e}"))
-    })?;
-    secp256k1::PublicKey::from_slice(&bytes[34..67]).map_err(|e| {
-        SatsPathError::InvalidPaymentPointer(format!("invalid spend public key: {e}"))
-    })?;
-
-    Ok(())
+    satspath_handoff::silent(address, network).map_err(SatsPathError::InvalidPaymentPointer)
 }
 
 pub fn assert_no_private_material(payload: &str) -> Result<()> {
@@ -337,16 +251,18 @@ pub fn validate_public_profile(profile: &PaymentProfile) -> Result<()> {
                     validate_lightning_address(address)?;
                 }
                 if let Some(url) = lnurl {
-                    let parsed = url::Url::parse(url)
-                        .map_err(|e| SatsPathError::InvalidPaymentPointer(e.to_string()))?;
-                    if !matches!(parsed.scheme(), "https" | "http") {
-                        return Err(SatsPathError::InvalidPaymentPointer(
-                            "LNURL must be http(s)".into(),
-                        ));
-                    }
+                    assert_no_private_material(url)?;
+                    satspath_handoff::https(url).map_err(SatsPathError::InvalidPaymentPointer)?;
                 }
                 if let Some(invoice) = bolt12 {
-                    validate_bolt12_offer(invoice)?;
+                    assert_no_private_material(invoice)?;
+                    if let Some(network) = satspath_handoff::bolt11_network(invoice) {
+                        let now = chrono::Utc::now().timestamp().max(0) as u64;
+                        satspath_handoff::bolt11_profile(invoice, network, now)
+                            .map_err(SatsPathError::InvalidPaymentPointer)?;
+                    } else {
+                        validate_bolt12_offer(invoice)?;
+                    }
                 }
                 if let Some(pubkey) = receiver_pubkey {
                     validate_compressed_pubkey(pubkey)?;
@@ -374,7 +290,7 @@ pub fn validate_public_profile(profile: &PaymentProfile) -> Result<()> {
                 }
             }
             PaymentMethod::Bolt12(offer) => {
-                validate_bolt12_offer(&offer.offer)?;
+                validate_bolt12_offer_for_network(&offer.offer, Some(offer.network))?;
             }
             PaymentMethod::Ark {
                 server,
@@ -511,28 +427,29 @@ mod tests {
     }
 
     #[test]
+    /// Verify that silent payment address validation.
     fn silent_payment_address_validation() {
         use bech32::ToBase32;
 
-        let secp = secp256k1::Secp256k1::new();
-        let sk1 = secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let pk1 = secp256k1::PublicKey::from_secret_key(&secp, &sk1);
-        let sk2 = secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let pk2 = secp256k1::PublicKey::from_secret_key(&secp, &sk2);
-
-        let mut payload = Vec::with_capacity(67);
-        payload.push(0x00);
-        payload.extend_from_slice(&pk1.serialize());
-        payload.extend_from_slice(&pk2.serialize());
-
-        let mainnet_sp =
-            bech32::encode("sp", payload.to_base32(), bech32::Variant::Bech32m).unwrap();
-        let testnet_sp =
-            bech32::encode("tsp", payload.to_base32(), bech32::Variant::Bech32m).unwrap();
+        let key = hex::decode(VALID_PUBKEY).unwrap();
+        let mut payload = vec![bech32::u5::try_from_u8(0).unwrap()];
+        payload.extend([key.clone(), key].concat().to_base32());
+        let mainnet_sp = bech32::encode("sp", &payload, bech32::Variant::Bech32m).unwrap();
+        let testnet_sp = bech32::encode("tsp", &payload, bech32::Variant::Bech32m).unwrap();
 
         // Valid addresses
         assert!(validate_silent_payment_address(&mainnet_sp, BitcoinNetwork::Mainnet).is_ok());
         assert!(validate_silent_payment_address(&testnet_sp, BitcoinNetwork::Testnet).is_ok());
+        assert!(validate_silent_payment_address(
+            &format!(" \t{mainnet_sp}\n"),
+            BitcoinNetwork::Mainnet
+        )
+        .is_ok());
+        assert!(validate_silent_payment_address(
+            &format!("\n{testnet_sp} \t"),
+            BitcoinNetwork::Testnet
+        )
+        .is_ok());
 
         // Network mismatch
         assert!(validate_silent_payment_address(&mainnet_sp, BitcoinNetwork::Testnet).is_err());
@@ -545,25 +462,60 @@ mod tests {
         assert!(
             validate_silent_payment_address("sp1q_xprv_secret", BitcoinNetwork::Mainnet).is_err()
         );
+        assert!(matches!(
+            validate_silent_payment_address(" \tsp1q_xprv_secret\n", BitcoinNetwork::Mainnet),
+            Err(SatsPathError::PrivateMaterialRejected(_))
+        ));
 
         // Truncated payload
-        let truncated = bech32::encode(
-            "sp",
-            payload[..30].to_vec().to_base32(),
-            bech32::Variant::Bech32m,
-        )
-        .unwrap();
+        let truncated = bech32::encode("sp", &payload[..30], bech32::Variant::Bech32m).unwrap();
         assert!(validate_silent_payment_address(&truncated, BitcoinNetwork::Mainnet).is_err());
 
         // Invalid version byte
         let mut bad_version_payload = payload.clone();
-        bad_version_payload[0] = 0x01;
-        let bad_version = bech32::encode(
-            "sp",
-            bad_version_payload.to_base32(),
-            bech32::Variant::Bech32m,
-        )
-        .unwrap();
+        bad_version_payload[0] = bech32::u5::try_from_u8(1).unwrap();
+        let bad_version =
+            bech32::encode("sp", bad_version_payload, bech32::Variant::Bech32m).unwrap();
         assert!(validate_silent_payment_address(&bad_version, BitcoinNetwork::Mainnet).is_err());
+    }
+
+    #[test]
+    fn bolt12_and_profile_validation_match_handoff_rules() {
+        let checksumless = "lno1pgx9getnwss8vetrw3hhyucs5ypjgef743p5fzqq9nqxh0ah7y87rzv3ud0eleps9kl2d5348hq2k8qzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgqpqqqqqqqqqqqqqqqqqqqqqqqqqqqzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqqzq3zyg3zyg3zygs";
+        assert!(validate_bolt12_offer(checksumless).is_ok());
+
+        let mut profile = PaymentProfile {
+            alias: "alice@example.com".into(),
+            identity_pubkey: VALID_PUBKEY.into(),
+            methods: vec![PaymentMethod::Lightning {
+                label: "BOLT12".into(),
+                lightning_address: None,
+                lnurl: Some("https://example.com/.well-known/lnurlp/alice".into()),
+                bolt12: Some(checksumless.into()),
+                receiver_pubkey: None,
+            }],
+            updated_at: 1,
+            expires_at: Some(2),
+            sequence: None,
+            preferences: vec![],
+            nonce: None,
+            rotation: None,
+            method_verifications: Vec::new(),
+            hybrid_pubkey: None,
+            pqc_required: false,
+            revoked: false,
+            recovery_policy: None,
+            recovery: None,
+        };
+        assert!(validate_public_profile(&profile).is_ok());
+
+        profile.methods = vec![PaymentMethod::Lightning {
+            label: "Insecure LNURL".into(),
+            lightning_address: None,
+            lnurl: Some("http://example.com/.well-known/lnurlp/alice".into()),
+            bolt12: None,
+            receiver_pubkey: None,
+        }];
+        assert!(validate_public_profile(&profile).is_err());
     }
 }

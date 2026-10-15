@@ -1,0 +1,107 @@
+name: Fuzzing
+
+on:
+  schedule:
+    # Run nightly at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+      - 'Cargo.toml'
+      - 'crates/satspath-core/**'
+      - 'crates/satspath-router/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz protocol parsers
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_bip321
+          - fuzz_bip353
+          - fuzz_bolt12
+          - fuzz_canonical_json
+          - fuzz_ownership_proof
+          - fuzz_profile_deser
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal && rustup default nightly
+
+      - name: Cache cargo registry & fuzz target
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+            fuzz/corpus
+          key: ${{ runner.os }}-fuzz-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-${{ matrix.target }}-
+
+      - name: Install cargo-fuzz
+        run: which cargo-fuzz || cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Install coverage tools for BOLT12
+        if: matrix.target == 'fuzz_bolt12'
+        run: rustup component add llvm-tools-preview
+
+      - name: Run fuzzing target (${{ matrix.target }})
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: |
+          # Fuzz execution times:
+          # - PR checks: 60s per target for fast regression smoke testing.
+          # - Scheduled nightly runs: 900s (15 min) per target for ongoing regression coverage.
+          # Note: Initial deep fuzzing campaigns (24-48 hours per target) are conducted
+          # separately out-of-band to establish seed corpora and deep reach, rather than
+          # within nightly CI jobs which are bounded by GitHub Actions runner limits.
+          MAX_TIME=60
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            MAX_TIME=900
+          fi
+          if [ "$FUZZ_TARGET" = "fuzz_bip321" ]; then
+            cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME" -max_len=65537
+          elif [ "$FUZZ_TARGET" = "fuzz_bolt12" ] || [ "$FUZZ_TARGET" = "fuzz_ownership_proof" ] || [ "$FUZZ_TARGET" = "fuzz_profile_deser" ]; then
+            cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
+          else
+            cargo fuzz run "$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
+          fi
+
+      - name: Collect BOLT12 corpus coverage
+        if: matrix.target == 'fuzz_bolt12'
+        run: cargo fuzz coverage --target-dir fuzz/target/coverage fuzz_bolt12 fuzz/corpus/fuzz_bolt12
+
+      - name: Upload BOLT12 coverage
+        if: matrix.target == 'fuzz_bolt12'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: fuzz-coverage-fuzz_bolt12
+          path: |
+            fuzz/coverage/fuzz_bolt12
+            fuzz/target/coverage/*/release/fuzz_bolt12
+          if-no-files-found: error
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

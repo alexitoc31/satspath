@@ -1,0 +1,31 @@
+{
+  "profile": {
+    "alias": "alice@satspath.dev",
+    "identity_pubkey": "03efcc8c5f74bb7352713b9bf51a5cc77a189cd971d3eac05b920bf567944cfcf1",
+    "methods": [
+      {
+        "type": "Lightning",
+        "label": "Primary LN",
+        "lightning_address": "alice@satspath.dev",
+        "lnurl": null,
+        "bolt12": null,
+        "receiver_pubkey": null
+      },
+      {
+        "type": "Onchain",
+        "label": "Vault",
+        "network": "Mainnet",
+        "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        "pubkey_hint": null,
+        "descriptor_hint": null
+      }
+    ],
+    "updated_at": 1700000000,
+    "expires_at": 1800000000,
+    "sequence": 1,
+    "nonce": "nonce-1",
+    "pqc_required": false,
+    "revoked": false
+  },
+  "signature": "3fb819fb8c751be71a03b97f267c65933a720b4b9e56d28643f73afa49c03018fca37030473052dca823053d6f83dd85a4142b24b0729352216adf0158e1f3ca"
+}

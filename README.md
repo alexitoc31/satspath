@@ -39,7 +39,7 @@ Capability discovery (Lightning, BOLT12, on-chain, Silent Payments, Ark)
        ↓
 Reference route selection (amount, multi-source fee consensus, priority)
        ↓
-Wallet handoff payload (BIP-21 URI, BOLT11 invoice, BOLT12 offer, Ark pointer)
+Wallet handoff payload (BIP-21 URI or validated BOLT11 invoice where supported)
        ↓
 Host wallet signs and executes the payment
 ```
@@ -61,6 +61,7 @@ A Lightning Address (`user@domain.com`) exclusively targets a Lightning receivin
 ### What Works Today, What is Experimental, and What Has Not Been Audited?
 * **Implemented Today:** Signed profiles, key rotation, HTTPS/Nostr resolvers, multi-source fee consensus, append-only Merkle transparency log, sparse Merkle state map, and witness quorum cosigning.
 * **Preview / Experimental:** BIP-353 (Preview; strict DNSSEC fails closed without local validator), BOLT12 (Experimental / Partial; prototype TLV, offer-handling, and blinded-path primitives exist; standards-conformant checksumless BOLT12 string decoding, invoice-request construction, Merkle signing, and CLN/LDK interop remain incomplete), Silent Payments (Experimental; primitives and address/output construction implemented; standards conformance and mainnet interoperability are not claimed until the official BIP-352 test vectors pass), Ark routing (Preview; ASP rounds simulated).
+* **Wallet handoffs:** Daemon, router, and WASM quotes emit payable QRs only for verified on-chain addresses with a matching network and exact amount. The CLI `quote` and `preview --fetch-lnurl-invoice` commands can also emit BOLT11 invoices after shared payee-key, network, amount, and expiry validation. Amount-less Lightning pointers remain receive-only; BOLT12, Ark, and Silent Payment handoffs fail closed until protocol-aware validation is available.
 * **Audit Status:** SatsPath has completed internal test suites and automated adversarial simulations, but has **NOT yet undergone an independent third-party cryptographic or security audit**.
 
 Website: <https://satspath.com>

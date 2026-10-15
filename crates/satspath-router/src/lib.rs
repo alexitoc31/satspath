@@ -3,6 +3,7 @@ pub mod ark_routes;
 pub mod bip353_preview;
 pub mod bolt12;
 pub mod fees;
+pub mod handoff;
 pub mod key_rotation;
 pub mod lightning;
 pub mod onchain;
@@ -13,6 +14,9 @@ pub mod scoring;
 pub mod silent_payments;
 pub mod split_payments;
 pub mod urgency;
+
+#[cfg(test)]
+mod lightning_tests;
 
 pub use ark_routes::{plan_ark_route, ArkRoutePlan, SenderCapabilities};
 pub use bip353_preview::quote_from_bip353_resolution;

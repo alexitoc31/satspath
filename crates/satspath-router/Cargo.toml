@@ -14,6 +14,7 @@ wasm = ["satspath-core/wasm", "getrandom/js", "web-sys/Request", "web-sys/Respon
 
 [dependencies]
 satspath-core = { path = "../satspath-core" }
+satspath-handoff = { path = "../satspath-handoff" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -22,6 +23,7 @@ reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 hex = { workspace = true }
 urlencoding = "2"
+url = { workspace = true }
 lightning-invoice = { workspace = true }
 secp256k1 = { workspace = true, features = ["global-context"] }
 chrono = { workspace = true }
@@ -40,3 +42,4 @@ mockito = "1"
 secp256k1 = { workspace = true }
 bitcoin = { workspace = true }
 async-trait = "0.1"
+proptest = "1.5"

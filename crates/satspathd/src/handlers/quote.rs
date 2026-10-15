@@ -4,7 +4,7 @@ use satspath_core::{
     privacy::mask_identifier,
     validation::{assert_no_private_material, validate_amount_sats},
 };
-use satspath_router::QuoteResponse;
+use satspath_router::{handoff::validate_payload, QuoteResponse};
 
 use crate::config::AppState;
 use crate::handlers::resolve::resolve_profile;
@@ -34,13 +34,30 @@ pub(crate) async fn quote_response(
         .filter(|state| state.verified)
         .map(|state| state.descriptor.clone())
         .collect();
-    satspath_router::quote_verified_profile(
+    let quote = satspath_router::quote_verified_profile(
         resolved.signed_profile,
         &body.recipient,
         body.amount_sats,
         &allowed,
     )
-    .await
+    .await;
+    checked_quote(quote, &state.network, body.amount_sats)
+}
+
+fn checked_quote(quote: QuoteResponse, network: &str, amount_sats: u64) -> QuoteResponse {
+    if let QuoteResponse::Ok {
+        selected_method,
+        qr,
+        ..
+    } = &quote
+    {
+        if let Err(e) = validate_payload(selected_method, qr, network, Some(amount_sats)) {
+            return QuoteResponse::NoRoute {
+                reason: format!("unsafe payment handoff: {e}"),
+            };
+        }
+    }
+    quote
 }
 
 pub(crate) async fn pay_response(state: &AppState, body: PayRequest) -> PayResponse {
@@ -77,6 +94,8 @@ pub(crate) async fn pay_response(state: &AppState, body: PayRequest) -> PayRespo
         },
     )
     .await;
+    // Keep the final handoff guarded even if quote_response changes later.
+    let quote = checked_quote(quote, &state.network, body.amount_sats);
 
     match quote.clone() {
         QuoteResponse::Ok { qr, .. } => match crate::ui::qr_svg(&qr) {
@@ -120,5 +139,60 @@ pub(crate) async fn pay_response(state: &AppState, body: PayRequest) -> PayRespo
             quote,
             safety: safety_status(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use satspath_core::{BitcoinNetwork, PaymentMethod};
+    use satspath_router::QuoteRecipient;
+
+    #[test]
+    fn quote_gate_replaces_unsafe_qr_with_no_route() {
+        let method = PaymentMethod::Onchain {
+            label: "Bitcoin".into(),
+            network: BitcoinNetwork::Mainnet,
+            address: Some("1BoatSLRHtKNngkdXEeobR76b53LETtpyT".into()),
+            silent_payment_pubkey: None,
+            pubkey_hint: None,
+            descriptor_hint: None,
+            address_list: vec![],
+        };
+        let make_quote = |qr: &str| QuoteResponse::Ok {
+            recipient: QuoteRecipient {
+                alias: "alice@example.com".into(),
+                verified: true,
+                profile_signature_verified: true,
+                identifier_verified: false,
+                identifier_verification: "test".into(),
+                fingerprint: None,
+            },
+            selected_method: method.clone(),
+            fee_sats: None,
+            eta: None,
+            reason: "test".into(),
+            qr: qr.into(),
+            execution: None,
+            wallet_hint: None,
+        };
+        let safe = "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00021000";
+        assert!(matches!(
+            checked_quote(make_quote(safe), "mainnet", 21_000),
+            QuoteResponse::Ok { .. }
+        ));
+        for (payload, network) in [
+            (safe, "devnet"),
+            ("bitcoin:attacker?amount=0.00021000", "mainnet"),
+            (
+                "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=1",
+                "mainnet",
+            ),
+        ] {
+            assert!(matches!(
+                checked_quote(make_quote(payload), network, 21_000),
+                QuoteResponse::NoRoute { .. }
+            ));
+        }
     }
 }

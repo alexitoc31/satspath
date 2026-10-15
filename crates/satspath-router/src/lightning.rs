@@ -47,25 +47,26 @@ pub async fn is_lightning_available_for_amount(method: &PaymentMethod, amount_sa
             bolt12: Some(offer_str),
             ..
         } => {
-            if let Ok(offer) = crate::bolt12::parse_bolt12_offer(offer_str) {
-                if !offer.is_amount_valid(amount_sats * 1_000) {
-                    return false;
-                }
+            if let Some(network) = satspath_handoff::bolt11_network(offer_str) {
+                satspath_handoff::bolt11(
+                    offer_str,
+                    amount_sats,
+                    network,
+                    chrono::Utc::now().timestamp().max(0) as u64,
+                )
+                .is_ok()
+            } else {
+                crate::bolt12::parse_bolt12_offer(offer_str)
+                    .map(|offer| {
+                        amount_sats
+                            .checked_mul(1_000)
+                            .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
+                    })
+                    .unwrap_or(false)
             }
-            true
         }
         PaymentMethod::Bolt12(offer_data) => {
-            if let Some(min_sats) = offer_data.minimum_amount_sats {
-                if amount_sats < min_sats {
-                    return false;
-                }
-            }
-            if let Ok(offer) = crate::bolt12::parse_bolt12_offer(&offer_data.offer) {
-                if !offer.is_amount_valid(amount_sats * 1_000) {
-                    return false;
-                }
-            }
-            true
+            bolt12_profile_offer_available(offer_data, amount_sats)
         }
         _ => false,
     }
@@ -101,28 +102,51 @@ pub fn is_lightning_available_for_amount_sync(method: &PaymentMethod, amount_sat
             bolt12: Some(offer_str),
             ..
         } => {
-            if let Ok(offer) = crate::bolt12::parse_bolt12_offer(offer_str) {
-                if !offer.is_amount_valid(amount_sats * 1_000) {
-                    return false;
-                }
+            if let Some(network) = satspath_handoff::bolt11_network(offer_str) {
+                satspath_handoff::bolt11(
+                    offer_str,
+                    amount_sats,
+                    network,
+                    chrono::Utc::now().timestamp().max(0) as u64,
+                )
+                .is_ok()
+            } else {
+                crate::bolt12::parse_bolt12_offer(offer_str)
+                    .map(|offer| {
+                        amount_sats
+                            .checked_mul(1_000)
+                            .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
+                    })
+                    .unwrap_or(false)
             }
-            true
         }
         PaymentMethod::Bolt12(offer_data) => {
-            if let Some(min_sats) = offer_data.minimum_amount_sats {
-                if amount_sats < min_sats {
-                    return false;
-                }
-            }
-            if let Ok(offer) = crate::bolt12::parse_bolt12_offer(&offer_data.offer) {
-                if !offer.is_amount_valid(amount_sats * 1_000) {
-                    return false;
-                }
-            }
-            true
+            bolt12_profile_offer_available(offer_data, amount_sats)
         }
         _ => false,
     }
+}
+
+fn bolt12_profile_offer_available(
+    offer_data: &satspath_core::Bolt12Offer,
+    amount_sats: u64,
+) -> bool {
+    if offer_data
+        .expires_at
+        .is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp())
+        || offer_data
+            .minimum_amount_sats
+            .is_some_and(|minimum| amount_sats < minimum)
+    {
+        return false;
+    }
+    crate::bolt12::parse_bolt12_offer(&offer_data.offer)
+        .map(|offer| {
+            amount_sats
+                .checked_mul(1_000)
+                .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
+        })
+        .unwrap_or(false)
 }
 
 pub fn estimate_lightning_fee_sats(amount_sats: u64) -> u64 {
@@ -171,25 +195,47 @@ pub struct ValidatedInvoice {
 /// Step 1: resolve a Lightning Address to LNURL-pay metadata.
 /// `user@domain` → GET `https://domain/.well-known/lnurlp/user`
 pub async fn fetch_lnurl_metadata(lightning_address: &str) -> anyhow::Result<LnurlPayMetadata> {
+    fetch_lnurl_metadata_internal(lightning_address, true).await
+}
+
+/// Fetch LNURL metadata with explicit SSRF enforcement control (test-only transport path for mock servers).
+#[cfg(test)]
+pub(crate) async fn fetch_lnurl_metadata_with_options(
+    lightning_address: &str,
+    enforce_ssrf: bool,
+) -> anyhow::Result<LnurlPayMetadata> {
+    fetch_lnurl_metadata_internal(lightning_address, enforce_ssrf).await
+}
+
+async fn fetch_lnurl_metadata_internal(
+    lightning_address: &str,
+    enforce_ssrf: bool,
+) -> anyhow::Result<LnurlPayMetadata> {
     let parts: Vec<&str> = lightning_address.split('@').collect();
     if parts.len() != 2 {
         anyhow::bail!("invalid Lightning Address: {}", lightning_address);
     }
     let domain = parts[1].trim();
-    let scheme = if domain.starts_with("127.0.0.1") || domain.starts_with("localhost") {
-        "http"
-    } else {
-        "https"
-    };
+    let scheme =
+        if !enforce_ssrf && (domain.starts_with("127.0.0.1") || domain.starts_with("localhost")) {
+            "http"
+        } else {
+            "https"
+        };
     let url = format!(
         "{}://{}/.well-known/lnurlp/{}",
         scheme,
         domain,
         parts[0].trim()
     );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let client = if enforce_ssrf {
+        satspath_core::outbound::validate_request_url(&url)?;
+        satspath_core::outbound::http_client(std::time::Duration::from_secs(10))
+    } else {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?
+    };
     let meta = client
         .get(&url)
         .send()
@@ -216,6 +262,27 @@ pub async fn fetch_invoice(
     amount_sats: u64,
     comment: Option<&str>,
 ) -> anyhow::Result<String> {
+    fetch_invoice_internal(meta, amount_sats, comment, true).await
+}
+
+/// Fetch invoice with explicit SSRF enforcement control (test-only transport path for mock servers).
+#[cfg(test)]
+pub(crate) async fn fetch_invoice_with_options(
+    meta: &LnurlPayMetadata,
+    amount_sats: u64,
+    comment: Option<&str>,
+    enforce_ssrf: bool,
+) -> anyhow::Result<String> {
+    fetch_invoice_internal(meta, amount_sats, comment, enforce_ssrf).await
+}
+
+async fn fetch_invoice_internal(
+    meta: &LnurlPayMetadata,
+    amount_sats: u64,
+    comment: Option<&str>,
+    enforce_ssrf: bool,
+) -> anyhow::Result<String> {
+    satspath_core::validation::validate_amount_sats(amount_sats)?;
     let amount_msats = amount_sats * 1_000;
     if amount_msats < meta.min_sendable {
         anyhow::bail!(
@@ -242,9 +309,14 @@ pub async fn fetch_invoice(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let client = if enforce_ssrf {
+        satspath_core::outbound::validate_request_url(&url)?;
+        satspath_core::outbound::http_client(std::time::Duration::from_secs(10))
+    } else {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?
+    };
     let raw_body = client.get(&url).send().await?.text().await?;
     let resp: LnurlInvoiceResponse = serde_json::from_str(&raw_body)
         .map_err(|e| anyhow::anyhow!("failed to parse LNURL callback response: {e}"))?;
@@ -284,6 +356,12 @@ pub fn validate_bolt11_invoice(
     let invoice = Bolt11Invoice::from_str(bolt11)
         .map_err(|e| anyhow::anyhow!("failed to parse BOLT11 invoice: {e:?}"))?;
 
+    if expected_msats == 0
+        || expected_msats > satspath_core::validation::MAX_PREVIEW_AMOUNT_SATS * 1000
+        || invoice.network() != bitcoin::Network::Bitcoin
+    {
+        anyhow::bail!("invoice network or amount is invalid");
+    }
     // LNURL-02: verify amount matches
     let invoice_msats = invoice
         .amount_milli_satoshis()
@@ -484,5 +562,21 @@ mod tests {
         assert_eq!(estimate_lightning_fee_sats(100), 1);
         assert_eq!(estimate_lightning_fee_sats(10_000), 1);
         assert_eq!(estimate_lightning_fee_sats(20_000), 2);
+    }
+
+    #[tokio::test]
+    async fn bolt11_accepted_in_availability_checks() {
+        let inv = make_test_invoice(Some(1_000_000), false); // 1,000 sats = 1,000,000 msats
+        let method = PaymentMethod::Lightning {
+            label: "Invoice".into(),
+            lightning_address: None,
+            lnurl: None,
+            bolt12: Some(inv),
+            receiver_pubkey: None,
+        };
+        assert!(is_lightning_available_for_amount(&method, 1000).await);
+        assert!(is_lightning_available_for_amount_sync(&method, 1000));
+        assert!(!is_lightning_available_for_amount(&method, 500).await);
+        assert!(!is_lightning_available_for_amount_sync(&method, 500));
     }
 }

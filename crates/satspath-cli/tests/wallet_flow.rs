@@ -4,6 +4,10 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+};
 
 const PUBKEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const ONCHAIN: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
@@ -13,10 +17,16 @@ fn bin() -> &'static str {
 }
 
 fn run(dir: &Path, args: &[&str]) -> (String, String, bool) {
+    run_with_fees(dir, args, "mempool:http://127.0.0.1:0")
+}
+
+fn run_with_fees(dir: &Path, args: &[&str], fee_source: &str) -> (String, String, bool) {
     let out = Command::new(bin())
         .args(args)
         .current_dir(dir)
         .env("SATSPATH_PASSWORD", "")
+        // Keep non-quote commands offline; the receive test supplies local cheap fees.
+        .env("SATSPATH_FEE_SOURCES", fee_source)
         .output()
         .expect("failed to run satspath binary");
     (
@@ -80,15 +90,38 @@ fn wallet_init_add_show_receive_end_to_end() {
     assert!(show.contains("Ark"));
 
     // receive: preview-only JSON with the safety warnings.
-    let (json, err, ok) = run(
+    // Supply cheap fees locally so the live-fee router deterministically picks on-chain.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let fee_source = format!("mempool:http://{}/fees", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        let bytes_read = stream.read(&mut request).unwrap();
+        assert!(bytes_read > 0);
+        let body = r#"{"fastestFee":5,"halfHourFee":4,"hourFee":3,"economyFee":2,"minimumFee":1}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let (json, err, ok) = run_with_fees(
         dir.path(),
         &["wallet", "receive", alias, "100000", "--json"],
+        &fee_source,
     );
+    server.join().unwrap();
     assert!(ok, "receive failed: {err}{json}");
     let v: serde_json::Value = serde_json::from_str(json.trim()).expect("receive must emit JSON");
     assert_eq!(v["mode"], "preview_only");
     assert_eq!(v["alias"], alias);
-    assert!(v["qr"].is_string(), "json output was: {}", json);
+    assert_eq!(v["status"], "ok", "unexpected preview status: {json}");
+    assert_eq!(
+        v["qr"],
+        format!("bitcoin:{ONCHAIN}?amount=0.00100000"),
+        "unexpected handoff: {json}"
+    );
     let warnings = v["warnings"].as_array().unwrap();
     assert!(warnings.iter().any(|w| w == "No funds moved by SatsPath"));
     assert!(warnings

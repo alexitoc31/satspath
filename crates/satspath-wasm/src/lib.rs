@@ -16,6 +16,7 @@ use wasm_bindgen::prelude::*;
 
 pub mod bolt12;
 mod crypto;
+pub mod handoff;
 mod helpers;
 mod resolver;
 mod router;

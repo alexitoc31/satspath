@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::outbound::{connect_relay, http_client, validate_relay_url};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::crypto::{check_profile_expiry, verify_signed_profile};
 use crate::peer_registry::canonicalize_identifier;
@@ -57,12 +58,10 @@ impl Default for NostrResolver {
 }
 
 impl NostrResolver {
+    /// Construct the resolver with its configured transport policy.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(6))
-                .build()
-                .unwrap_or_default(),
+            client: http_client(Duration::from_secs(6)),
             fallback_relays: env_relays().unwrap_or_else(|| {
                 DEFAULT_RELAYS
                     .iter()
@@ -72,33 +71,34 @@ impl NostrResolver {
         }
     }
 
+    /// Use the supplied fallback relays with the protected HTTP client.
     pub fn with_relays(relays: Vec<String>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(6))
-                .build()
-                .unwrap_or_default(),
+            client: http_client(Duration::from_secs(6)),
             fallback_relays: relays,
         }
     }
 
+    /// Resolve and validate the NIP-05 identity and relay hints.
     async fn resolve_nip05(&self, alias: &str) -> Result<Nip05Resolution> {
         let canonical = canonicalize_identifier(alias);
         let (name, domain) = canonical
             .split_once('@')
             .ok_or_else(|| SatsPathError::AliasNotFound(alias.to_string()))?;
-        let url = format!("https://{domain}/.well-known/nostr.json?name={name}");
-        let document: Nip05Document = self
+        let mut parsed_url = url::Url::parse(&format!("https://{domain}/.well-known/nostr.json"))
+            .map_err(|e| SatsPathError::ValidationError(e.to_string()))?;
+        parsed_url.query_pairs_mut().append_pair("name", name);
+        let url = parsed_url.to_string();
+        crate::ssrf::validate_url(&url, false)?;
+        let response = self
             .client
             .get(&url)
             .send()
             .await
             .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 fetch failed: {e}")))?
             .error_for_status()
-            .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 HTTP error: {e}")))?
-            .json()
-            .await
-            .map_err(|e| SatsPathError::SerializationError(format!("NIP-05 JSON: {e}")))?;
+            .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 HTTP error: {e}")))?;
+        let document = read_nip05_document(response).await?;
 
         let pubkey = document
             .names
@@ -112,24 +112,7 @@ impl NostrResolver {
         if relays.is_empty() {
             relays = self.fallback_relays.clone();
         }
-        relays.retain(|relay| {
-            let (http_url, allow_http) = if let Some(stripped) = relay.strip_prefix("wss://") {
-                (format!("https://{stripped}"), false)
-            } else if let Some(stripped) = relay.strip_prefix("ws://") {
-                (format!("http://{stripped}"), true)
-            } else {
-                return false;
-            };
-            #[cfg(not(test))]
-            {
-                crate::ssrf::validate_url(&http_url, allow_http).is_ok()
-            }
-            #[cfg(test)]
-            {
-                let _ = (http_url, allow_http);
-                true
-            }
-        });
+        relays.retain(|relay| validate_relay_url(relay).is_ok());
         relays.truncate(8);
         if relays.is_empty() {
             return Err(SatsPathError::NetworkError(
@@ -140,6 +123,7 @@ impl NostrResolver {
         Ok(Nip05Resolution { pubkey, relays })
     }
 
+    /// Fetch a signed profile over a validated, pinned relay connection.
     async fn query_relay(
         &self,
         relay: &str,
@@ -161,7 +145,7 @@ impl NostrResolver {
         ]);
 
         let relay_result = timeout(NOSTR_TIMEOUT, async {
-            let (mut ws, _) = connect_async(relay)
+            let (mut ws, _) = connect_relay(relay)
                 .await
                 .map_err(|e| SatsPathError::NetworkError(format!("Nostr relay connect: {e}")))?;
             ws.send(Message::Text(req.to_string().into()))
@@ -186,6 +170,26 @@ impl NostrResolver {
 
         relay_result
     }
+}
+
+/// Bound the NIP-05 response before parsing attacker-controlled JSON.
+async fn read_nip05_document(mut response: reqwest::Response) -> Result<Nip05Document> {
+    const MAX_NIP05_BYTES: usize = 50 * 1024;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 response read failed: {e}")))?
+    {
+        if chunk.len() > MAX_NIP05_BYTES - body.len() {
+            return Err(SatsPathError::NetworkError(
+                "NIP-05 response exceeded 50 KiB limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|e| SatsPathError::SerializationError(format!("NIP-05 JSON: {e}")))
 }
 
 #[async_trait]
@@ -407,7 +411,7 @@ pub async fn publish_profile(
 
     for relay in relays_to_use {
         let Ok(Ok((mut ws, _))) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(relay)).await
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_relay(relay)).await
         else {
             continue;
         };
@@ -445,6 +449,49 @@ mod tests {
     use super::*;
     use crate::crypto::{generate_identity_keypair, sign_profile};
     use crate::{PaymentMethod, PaymentProfile};
+
+    async fn served_nip05(body: Vec<u8>) -> Result<Nip05Document> {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            let _ = socket.write_all(&body).await;
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/nostr.json"))
+            .send()
+            .await
+            .unwrap();
+        let result = read_nip05_document(response).await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn nip05_response_size_is_bounded_before_json_parsing() {
+        let valid = br#"{"names":{"alice":"0123456789"}}"#;
+        let mut at_limit = valid.to_vec();
+        at_limit.resize(50 * 1024, b' ');
+        assert_eq!(
+            served_nip05(at_limit.clone()).await.unwrap().names["alice"],
+            "0123456789"
+        );
+        at_limit.push(b' ');
+        assert!(matches!(
+            served_nip05(at_limit).await,
+            Err(SatsPathError::NetworkError(message)) if message.contains("50 KiB")
+        ));
+        assert!(matches!(
+            served_nip05(b"not JSON".to_vec()).await,
+            Err(SatsPathError::SerializationError(message)) if message.contains("NIP-05 JSON")
+        ));
+    }
 
     fn signed(alias: &str) -> SignedPaymentProfile {
         let kp = generate_identity_keypair();

@@ -1,5 +1,6 @@
+use crate::lightning::{fetch_invoice_with_options, fetch_lnurl_metadata_with_options};
+use crate::{fetch_invoice, LnurlPayMetadata};
 use mockito::Server;
-use satspath_router::{fetch_invoice, LnurlPayMetadata};
 use serde_json::json;
 
 #[tokio::test]
@@ -57,7 +58,7 @@ async fn test_full_lnurl_flow_with_mock() {
         comment_allowed: 255,
     };
 
-    let result = fetch_invoice(&meta, 2500, None).await;
+    let result = fetch_invoice_with_options(&meta, 2500, None, false).await;
     // We expect it to fail validation (either parse error or expired) because we don't have a fresh invoice
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -94,7 +95,7 @@ async fn test_lnurl_error_flow_with_mock() {
         comment_allowed: 0,
     };
 
-    let result = fetch_invoice(&meta, 5000, None).await;
+    let result = fetch_invoice_with_options(&meta, 5000, None, false).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -163,7 +164,7 @@ async fn test_lnurl_callback_missing_or_empty_pr() {
         comment_allowed: 0,
     };
 
-    let result_missing = fetch_invoice(&meta_missing, 5000, None).await;
+    let result_missing = fetch_invoice_with_options(&meta_missing, 5000, None, false).await;
     assert!(result_missing.is_err());
     assert!(result_missing
         .unwrap_err()
@@ -178,7 +179,7 @@ async fn test_lnurl_callback_missing_or_empty_pr() {
         comment_allowed: 0,
     };
 
-    let result_empty = fetch_invoice(&meta_empty, 5000, None).await;
+    let result_empty = fetch_invoice_with_options(&meta_empty, 5000, None, false).await;
     assert!(result_empty.is_err());
     assert!(result_empty
         .unwrap_err()
@@ -188,7 +189,7 @@ async fn test_lnurl_callback_missing_or_empty_pr() {
 
 #[tokio::test]
 async fn test_invalid_lightning_address_format() {
-    use satspath_router::fetch_lnurl_metadata;
+    use crate::fetch_lnurl_metadata;
 
     // Missing domain
     let res1 = fetch_lnurl_metadata("alice").await;
@@ -209,7 +210,6 @@ async fn test_invalid_lightning_address_format() {
 
 #[tokio::test]
 async fn test_lnurl_invalid_tag() {
-    use satspath_router::fetch_lnurl_metadata;
     let mut server = Server::new_async().await;
     let url = server.url();
     let host = url.strip_prefix("http://").unwrap(); // get 127.0.0.1:port
@@ -231,7 +231,7 @@ async fn test_lnurl_invalid_tag() {
         .await;
 
     let addr = format!("alice@{}", host);
-    let result = fetch_lnurl_metadata(&addr).await;
+    let result = fetch_lnurl_metadata_with_options(&addr, false).await;
     assert!(result.is_err());
     assert!(result
         .unwrap_err()
