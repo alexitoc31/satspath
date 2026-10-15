@@ -222,12 +222,14 @@ mod tests {
         profile::{recover_profile_key, rotate_profile_key, sign_and_store},
         quote::{pay_response, quote_response},
         resolve::resolve_v2_envelope,
-        send::{send_response, send_response_with_resolver},
+        send::{receive_view, send_response, send_response_with_resolver},
         wallet::{load_or_create_identity, save_identity_key, save_wallet},
     };
     use crate::rate_limit;
     use crate::server::{audit_binding_security, serve_server};
-    use crate::types::{now, PayRequest, PayResponse, QuoteRequest, SendRequest, SendResponse};
+    use crate::types::{
+        now, PayRequest, PayResponse, QuoteRequest, ReceiveRequest, SendRequest, SendResponse,
+    };
 
     fn test_state(home: &Path) -> AppState {
         AppState {
@@ -256,6 +258,72 @@ mod tests {
         assert!(!raw.contains("xprv"));
         assert!(!raw.contains("mnemonic"));
         assert!(!raw.contains("secret_key"));
+    }
+
+    #[test]
+    fn receive_view_validates_final_pointer_and_amount() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let mut wallet = load_or_create_identity(dir.path()).unwrap();
+        wallet.alias = Some("alice@example.com".into());
+        wallet.lightning_address = Some("alice@example.com".into());
+        let key = generate_identity_keypair();
+        let pubkey = bitcoin::CompressedPublicKey::from_slice(&key.public_key.serialize()).unwrap();
+        let address = bitcoin::Address::p2wpkh(&pubkey, bitcoin::Network::Testnet).to_string();
+        wallet.onchain_address = Some(address.clone());
+        save_wallet(dir.path(), &wallet).unwrap();
+
+        assert!(receive_view(
+            &state,
+            ReceiveRequest {
+                rail: Some("lightning".into()),
+                amount_sats: None,
+            },
+        )
+        .is_ok());
+        assert!(receive_view(
+            &state,
+            ReceiveRequest {
+                rail: Some("lightning".into()),
+                amount_sats: Some(21_000),
+            },
+        )
+        .is_err());
+        let lightning = receive_view(
+            &state,
+            ReceiveRequest {
+                rail: None,
+                amount_sats: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(lightning.rail, "Lightning");
+        assert_eq!(lightning.payload, "alice@example.com");
+        let preferred_onchain = receive_view(
+            &state,
+            ReceiveRequest {
+                rail: None,
+                amount_sats: Some(21_000),
+            },
+        )
+        .unwrap();
+        assert_eq!(preferred_onchain.rail, "Onchain");
+        assert_eq!(
+            preferred_onchain.payload,
+            format!("bitcoin:{address}?amount=0.00021000")
+        );
+        let onchain = receive_view(
+            &state,
+            ReceiveRequest {
+                rail: Some("onchain".into()),
+                amount_sats: Some(21_000),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            onchain.payload,
+            format!("bitcoin:{address}?amount=0.00021000")
+        );
     }
 
     #[tokio::test]
@@ -1486,6 +1554,31 @@ mod tests {
             assert_eq!(invites.len(), 1);
             assert_eq!(invites[0].amount_sats, 25_000);
             assert!(claim_url.contains(&format!("invite_id={}", invites[0].invite_id)));
+        }
+    }
+
+    #[tokio::test]
+    async fn send_invalid_amount_never_creates_an_invite() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let resolver =
+            SendErrorResolver(|| satspath_core::SatsPathError::AliasNotFound("alice".into()));
+        for amount_sats in [0, u64::MAX] {
+            let response = send_response_with_resolver(
+                &state,
+                SendRequest {
+                    recipient: "alice@example.com".into(),
+                    amount_sats,
+                    routing_ok: Some(true),
+                },
+                &resolver,
+            )
+            .await;
+            assert!(matches!(response, SendResponse::NoRoute { .. }));
+            assert!(!dir
+                .path()
+                .join(satspath_core::invite_store::INVITES_FILE)
+                .exists());
         }
     }
 

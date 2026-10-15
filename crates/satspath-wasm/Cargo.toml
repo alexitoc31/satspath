@@ -45,6 +45,7 @@ satspath-pqc = { path = "../satspath-pqc" }
 
 # Bech32 for address validation
 bech32 = "0.9"
+bitcoin = { workspace = true }
 
 # Hmac for BIP-352
 hmac = "0.12"

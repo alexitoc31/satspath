@@ -13,8 +13,6 @@
 //! and no private key, seed, xprv, macaroon, cert, or secret is ever included —
 //! [`build_qr_payload`] additionally screens payloads for private material.
 
-use serde::{Deserialize, Serialize};
-
 use satspath_core::{
     create_invite,
     crypto::{check_profile_expiry, fingerprint_pubkey, verify_signed_profile},
@@ -23,12 +21,13 @@ use satspath_core::{
     registry::Registry,
     resolver::{ChainResolver, ProfileResolver},
     resolvers::{bip353::Bip353Resolver, http::HttpResolver, nostr::NostrResolver},
-    validation::assert_no_private_material,
-    Invite, PaymentMethod, SatsPathError,
+    validation::validate_amount_sats,
+    BitcoinNetwork, Invite, PaymentMethod, SatsPathError,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::fees::FeeEstimate;
-use crate::lightning::{fetch_invoice, fetch_lnurl_metadata};
+use crate::handoff::{fmt_btc, validate_payload};
 use crate::router::{select_route, select_route_with_fees, RouteRequest};
 use tracing::Instrument;
 
@@ -103,21 +102,20 @@ impl QuoteResponse {
 /// Resolve, verify, route, and build a payment payload for `recipient`.
 ///
 /// Builds the default resolver chain (local registry → BIP-353 → HTTP → Nostr)
-/// and, for a Lightning rail, best-effort fetches a real BOLT11 invoice so the
-/// `qr` field is directly payable. Falls back to a safe Lightning pointer if the
-/// fetch is unavailable.
+/// Only amount-bound, validated on-chain payloads are emitted. Lightning and
+/// experimental rails return `no_route` until a network-bound invoice handoff
+/// can be validated here; an amount-less pointer is never a payable QR.
 ///
 /// Returns a [`QuoteResponse`] for every protocol outcome (found / not
 /// registered / no route / invalid signature) — the frontend never sees a Rust
 /// error type.
 pub async fn quote(recipient: &str, amount_sats: u64) -> QuoteResponse {
     let resolver = default_resolver();
-    quote_inner(&resolver, recipient, amount_sats, None, true).await
+    quote_inner(&resolver, recipient, amount_sats, None).await
 }
 
 /// Like [`quote`], but against a caller-supplied resolver (e.g. an API server
-/// that manages its own resolver chain). Uses live mempool fees and returns a
-/// safe Lightning pointer rather than fetching an invoice in this layer.
+/// that manages its own resolver chain). Uses live mempool fees.
 pub async fn quote_with_resolver<R>(
     resolver: &R,
     recipient: &str,
@@ -126,7 +124,7 @@ pub async fn quote_with_resolver<R>(
 where
     R: ProfileResolver + Sync + ?Sized,
 {
-    quote_inner(resolver, recipient, amount_sats, None, false).await
+    quote_inner(resolver, recipient, amount_sats, None).await
 }
 
 /// Route a profile only after an external transparency verifier has accepted
@@ -137,6 +135,11 @@ pub async fn quote_verified_profile(
     amount_sats: u64,
     allowed_method_descriptors: &[String],
 ) -> QuoteResponse {
+    if let Err(e) = validate_amount_sats(amount_sats) {
+        return QuoteResponse::NoRoute {
+            reason: e.to_string(),
+        };
+    }
     let verified = verify_signed_profile(&signed).unwrap_or(false);
     if !verified {
         return QuoteResponse::InvalidSignature {
@@ -155,70 +158,58 @@ pub async fn quote_verified_profile(
         };
     }
     let recipient_hash = identifier_hash(recipient);
-    route_verified_signed(signed, recipient, &recipient_hash, amount_sats, None, false).await
+    route_verified_signed(signed, recipient, &recipient_hash, amount_sats, None).await
 }
 
 // ─── QR / payment payload ──────────────────────────────────────────────────────
 
 /// Build a public payment payload for a method.
 ///
-/// - **Lightning** — returns the best available pointer (LNURL, then Lightning
-///   Address, then BOLT12). Fetching a concrete BOLT11 invoice happens in the
-///   async [`quote`] flow (or the CLI/API layer), not here.
-/// - **On-chain** — a BIP-21 URI: `bitcoin:<address>?amount=<btc>`.
-/// - **Ark** — an Ark pointer: `ark:<pubkey>?server=…&amount=…`
-///   (preview only; execution is gated elsewhere behind explicit testnet flags).
+/// - **On-chain** — a validated BIP-21 URI: `bitcoin:<address>?amount=<btc>`.
+/// - **Lightning, BOLT12, Ark, Silent Payments** — fail closed until a
+///   network- and amount-bound payload can be validated.
 pub fn build_qr_payload(method: &PaymentMethod, amount_sats: u64) -> satspath_core::Result<String> {
-    let payload = match method {
-        PaymentMethod::Lightning {
-            lightning_address,
-            lnurl,
-            bolt12,
-            ..
-        } => lnurl
-            .clone()
-            .or_else(|| lightning_address.clone())
-            .or_else(|| bolt12.clone())
-            .ok_or_else(|| {
-                SatsPathError::InvalidPaymentPointer(
-                    "Lightning method has no address, LNURL, or BOLT12 pointer".into(),
-                )
-            })?,
+    validate_amount_sats(amount_sats)?;
+    let (payload, network) = match method {
+        PaymentMethod::Lightning { .. } => {
+            return Err(SatsPathError::InvalidPaymentPointer(
+                "Lightning pointers cannot bind the amount; a verified invoice is required".into(),
+            ));
+        }
         PaymentMethod::Onchain {
+            network,
             address,
             silent_payment_pubkey,
             ..
         } => {
-            let target_address = silent_payment_pubkey
-                .clone()
-                .unwrap_or_else(|| address.clone().unwrap_or_default());
-            format!(
-                "bitcoin:{}?amount={}",
-                target_address,
-                sats_to_btc(amount_sats)
+            if silent_payment_pubkey.is_some() {
+                return Err(SatsPathError::InvalidPaymentPointer(
+                    "silent payment handoffs require wallet-side validation".into(),
+                ));
+            }
+            let address = address.as_deref().ok_or_else(|| {
+                SatsPathError::InvalidPaymentPointer("on-chain method has no address".into())
+            })?;
+            let network = match network {
+                BitcoinNetwork::Mainnet => "mainnet",
+                BitcoinNetwork::Testnet => "testnet",
+                BitcoinNetwork::Regtest => "regtest",
+            };
+            (
+                format!("bitcoin:{address}?amount={}", fmt_btc(amount_sats)),
+                network,
             )
         }
-        PaymentMethod::Ark { server, pubkey, .. } => format!(
-            "ark:{}?server={}&amount={}",
-            urlencoding::encode(pubkey),
-            urlencoding::encode(server),
-            amount_sats
-        ),
-        PaymentMethod::Bolt12(offer_data) => offer_data.offer.clone(),
+        PaymentMethod::Ark { .. } | PaymentMethod::Bolt12(_) => {
+            return Err(SatsPathError::InvalidPaymentPointer(
+                "experimental rail handoffs require protocol-aware wallet validation".into(),
+            ));
+        }
     };
 
-    // Defence in depth: a payment payload must never carry private material.
-    assert_no_private_material(&payload)?;
+    validate_payload(method, &payload, network, Some(amount_sats))
+        .map_err(|e| SatsPathError::InvalidPaymentPointer(e.to_string()))?;
     Ok(payload)
-}
-
-/// Format sats as a fixed 8-decimal BTC string, e.g. `21000 -> 0.00021000`.
-fn sats_to_btc(amount_sats: u64) -> String {
-    format!(
-        "{}.{:08}",
-        amount_sats / 100_000_000,
-        amount_sats % 100_000_000
-    )
 }
 
 // ─── Core orchestration ─────────────────────────────────────────────────────────
@@ -227,18 +218,20 @@ fn sats_to_btc(amount_sats: u64) -> String {
 ///
 /// `fees`: `Some` uses deterministic routing (no network — used by tests);
 /// `None` fetches live mempool fees.
-/// `fetch_ln_invoice`: when `true`, a Lightning rail is upgraded to a real
-/// BOLT11 invoice (best effort).
 async fn quote_inner<R>(
     resolver: &R,
     recipient: &str,
     amount_sats: u64,
     fees: Option<FeeEstimate>,
-    fetch_ln_invoice: bool,
 ) -> QuoteResponse
 where
     R: ProfileResolver + Sync + ?Sized,
 {
+    if let Err(e) = validate_amount_sats(amount_sats) {
+        return QuoteResponse::NoRoute {
+            reason: e.to_string(),
+        };
+    }
     let recipient_hash = identifier_hash(recipient);
 
     // 1. Resolve. Anything unresolvable becomes an invite — never a hard error.
@@ -271,24 +264,15 @@ where
         };
     }
 
-    route_verified_signed(
-        signed,
-        recipient,
-        &recipient_hash,
-        amount_sats,
-        fees,
-        fetch_ln_invoice,
-    )
-    .await
+    route_verified_signed(signed, recipient, &recipient_hash, amount_sats, fees).await
 }
 
 async fn route_verified_signed(
-    signed: satspath_core::SignedPaymentProfile,
+    mut signed: satspath_core::SignedPaymentProfile,
     recipient: &str,
     recipient_hash: &str,
     amount_sats: u64,
     fees: Option<FeeEstimate>,
-    fetch_ln_invoice: bool,
 ) -> QuoteResponse {
     let recipient_info = recipient_of(&signed.profile, true);
 
@@ -296,6 +280,29 @@ async fn route_verified_signed(
     if check_profile_expiry(&signed.profile).is_err() {
         return QuoteResponse::NoRoute {
             reason: "Profile expired.".into(),
+        };
+    }
+
+    // Filter to methods that can produce a validated payable QR before routing,
+    // so an unpayable preferred rail (e.g. static Lightning pointer) does not
+    // shadow a valid on-chain handoff.
+    let mut last_payload_err = None;
+    signed
+        .profile
+        .methods
+        .retain(|method| match build_qr_payload(method, amount_sats) {
+            Ok(_) => true,
+            Err(e) => {
+                last_payload_err = Some(e);
+                false
+            }
+        });
+    if signed.profile.methods.is_empty() {
+        return QuoteResponse::NoRoute {
+            reason: match last_payload_err {
+                Some(e) => format!("could not build payment payload: {e}"),
+                None => "No usable rail found in profile.".into(),
+            },
         };
     }
 
@@ -331,7 +338,7 @@ async fn route_verified_signed(
     };
 
     // 5. Build the payment payload.
-    let mut qr = match build_qr_payload(&route.selected_method, amount_sats) {
+    let qr = match build_qr_payload(&route.selected_method, amount_sats) {
         Ok(payload) => payload,
         Err(e) => {
             return QuoteResponse::NoRoute {
@@ -339,55 +346,6 @@ async fn route_verified_signed(
             }
         }
     };
-
-    // 6. Best-effort upgrade Lightning / BOLT12 to a concrete invoice.
-    if fetch_ln_invoice {
-        match &route.selected_method {
-            PaymentMethod::Lightning {
-                lightning_address: Some(addr),
-                ..
-            } => {
-                if let Ok(invoice) = fetch_real_invoice(addr, amount_sats).await {
-                    qr = invoice;
-                }
-            }
-            PaymentMethod::Lightning {
-                bolt12: Some(offer_str),
-                lightning_address: None,
-                ..
-            } => {
-                if let Ok(offer) = crate::bolt12::parse_bolt12_offer(offer_str) {
-                    if let Ok(invoice) = crate::bolt12::fetch_bolt12_invoice(
-                        &offer,
-                        amount_sats * 1_000,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    {
-                        qr = invoice.invoice;
-                    }
-                }
-            }
-            PaymentMethod::Bolt12(offer_data) => {
-                if let Ok(offer) = crate::bolt12::parse_bolt12_offer(&offer_data.offer) {
-                    if let Ok(invoice) = crate::bolt12::fetch_bolt12_invoice(
-                        &offer,
-                        amount_sats * 1_000,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    {
-                        qr = invoice.invoice;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 
     QuoteResponse::Ok {
         recipient: recipient_info,
@@ -411,12 +369,6 @@ fn recipient_of(profile: &PaymentProfile, verified: bool) -> QuoteRecipient {
             "identifier-only; no inbox/domain ownership proof in this response".into(),
         fingerprint: fingerprint_pubkey(&profile.identity_pubkey).ok(),
     }
-}
-
-/// Two-step LNURL-pay: resolve metadata, then fetch a BOLT11 invoice.
-async fn fetch_real_invoice(lightning_address: &str, amount_sats: u64) -> anyhow::Result<String> {
-    let meta = fetch_lnurl_metadata(lightning_address).await?;
-    fetch_invoice(&meta, amount_sats, None).await
 }
 
 /// The default resolver chain, mirroring the CLI: local registry, then public
@@ -543,51 +495,48 @@ mod tests {
         }
     }
 
-    // 1–7: registered Lightning user → status ok with full payload.
-    #[tokio::test]
-    async fn registered_lightning_user_returns_ok_with_full_payload() {
-        let resolver = lightning_resolver("rodrigo@satspath.dev", "rodrigo@getalby.com");
-        let resp = quote_inner(
-            &resolver,
-            "rodrigo@satspath.dev",
-            1000,
-            Some(cheap_fees()),
-            false,
-        )
-        .await;
+    fn onchain_resolver(alias: &str, addr: &str) -> MockResolver {
+        let (profile, secret) = base_profile(alias, vec![onchain_method(addr)]);
+        MockResolver {
+            signed: Some(sign(profile, &secret)),
+        }
+    }
 
+    // Amount-less Lightning addresses must not be presented as payable QRs.
+    #[tokio::test]
+    async fn registered_lightning_user_without_invoice_returns_no_route() {
+        let resolver = lightning_resolver("rodrigo@satspath.dev", "rodrigo@getalby.com");
+        let resp = quote_inner(&resolver, "rodrigo@satspath.dev", 1000, Some(cheap_fees())).await;
+
+        assert!(matches!(resp, QuoteResponse::NoRoute { .. }));
+    }
+
+    #[tokio::test]
+    async fn lightning_plus_onchain_profile_routes_to_onchain_qr() {
+        let (profile, secret) = base_profile(
+            "rodrigo@satspath.dev",
+            vec![
+                lightning_method("rodrigo@getalby.com"),
+                onchain_method("1BoatSLRHtKNngkdXEeobR76b53LETtpyT"),
+            ],
+        );
+        let resolver = MockResolver {
+            signed: Some(sign(profile, &secret)),
+        };
+        let resp = quote_inner(&resolver, "rodrigo@satspath.dev", 1000, Some(cheap_fees())).await;
         match resp {
             QuoteResponse::Ok {
-                recipient,
                 selected_method,
-                fee_sats,
-                eta,
-                reason,
                 qr,
-                execution: _,
-                wallet_hint: _,
+                ..
             } => {
-                // (2) alias, (3) verified true, (4) fingerprint
-                assert_eq!(recipient.alias, "rodrigo@satspath.dev");
-                assert!(recipient.verified);
-                assert!(recipient.profile_signature_verified);
-                assert!(!recipient.identifier_verified);
-                assert!(recipient
-                    .identifier_verification
-                    .contains("identifier-only"));
-                assert!(recipient.fingerprint.is_some());
-                assert_eq!(recipient.fingerprint.as_ref().unwrap().len(), 8);
-                // (5) PaymentMethod embedded unchanged
-                assert!(matches!(selected_method, PaymentMethod::Lightning { .. }));
-                // (6) fee_sats, eta, reason
-                assert!(fee_sats.is_some());
-                assert!(eta.is_some());
-                assert!(!reason.is_empty());
-                // (7) QR / payment payload present
-                assert!(!qr.is_empty());
-                assert_eq!(qr, "rodrigo@getalby.com"); // pointer (no fetch in this path)
+                assert!(matches!(selected_method, PaymentMethod::Onchain { .. }));
+                assert_eq!(
+                    qr,
+                    "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00001000"
+                );
             }
-            other => panic!("expected Ok, got {}", other.status()),
+            other => panic!("expected Ok with on-chain QR, got {}", other.status()),
         }
     }
 
@@ -595,14 +544,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_user_returns_not_registered_with_invite() {
         let resolver = MockResolver { signed: None };
-        let resp = quote_inner(
-            &resolver,
-            "ghost@nowhere.dev",
-            21_000,
-            Some(cheap_fees()),
-            false,
-        )
-        .await;
+        let resp = quote_inner(&resolver, "ghost@nowhere.dev", 21_000, Some(cheap_fees())).await;
         match resp {
             QuoteResponse::NotRegistered { invite } => {
                 assert!(!invite.alias_hash.is_empty());
@@ -611,6 +553,17 @@ mod tests {
                 assert!(invite.claim_url.contains("amount=21000"));
             }
             other => panic!("expected NotRegistered, got {}", other.status()),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_amount_does_not_create_invite_or_run_routing() {
+        let resolver = MockResolver { signed: None };
+        for amount in [0, u64::MAX] {
+            assert!(matches!(
+                quote_inner(&resolver, "ghost@nowhere.dev", amount, Some(cheap_fees())).await,
+                QuoteResponse::NoRoute { .. }
+            ));
         }
     }
 
@@ -627,7 +580,6 @@ mod tests {
             "carol@satspath.dev",
             500_000,
             Some(expensive_fees()),
-            false,
         )
         .await;
         assert_eq!(resp.status(), "no_route");
@@ -647,14 +599,7 @@ mod tests {
         let resolver = MockResolver {
             signed: Some(signed),
         };
-        let resp = quote_inner(
-            &resolver,
-            "evil@hacker.com",
-            1000,
-            Some(cheap_fees()),
-            false,
-        )
-        .await;
+        let resp = quote_inner(&resolver, "evil@hacker.com", 1000, Some(cheap_fees())).await;
 
         assert_ne!(
             resp.status(),
@@ -675,37 +620,34 @@ mod tests {
     // 13: on-chain QR is a BIP-21 URI.
     #[test]
     fn qr_payload_onchain_is_bip21() {
-        let method = onchain_method("bc1qexampleaddr00000000000000000000000000");
+        let method = onchain_method("1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
         let qr = build_qr_payload(&method, 21_000).unwrap();
         assert_eq!(
             qr,
-            "bitcoin:bc1qexampleaddr00000000000000000000000000?amount=0.00021000"
+            "bitcoin:1BoatSLRHtKNngkdXEeobR76b53LETtpyT?amount=0.00021000"
         );
     }
 
-    // 14: Ark QR is an ark: URI.
+    // Experimental Ark pointers are not payable without protocol validation.
     #[test]
-    fn qr_payload_ark_is_ark_uri() {
+    fn qr_payload_ark_fails_closed() {
         let method = ark_method(
             "https://ark.example.com",
             "02c0ded4d352532ee6d5d3fb69c7f08988c0a2b9f68a10fa79b2e769c123456789",
         );
-        let qr = build_qr_payload(&method, 42).unwrap();
-        assert!(qr.starts_with("ark:02c0ded4"));
-        assert!(qr.contains("server=https%3A%2F%2Fark.example.com"));
-        assert!(qr.contains("amount=42"));
+        assert!(build_qr_payload(&method, 42).is_err());
     }
 
     // 15: JSON serialization uses snake_case status values.
     #[tokio::test]
     async fn json_uses_snake_case_status_values() {
-        let resolver = lightning_resolver("rodrigo@satspath.dev", "rodrigo@getalby.com");
+        let resolver =
+            onchain_resolver("rodrigo@satspath.dev", "1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
         let ok = quote_inner(
             &resolver,
             "rodrigo@satspath.dev",
-            1000,
+            21_000,
             Some(cheap_fees()),
-            false,
         )
         .await;
         let json = serde_json::to_string(&ok).unwrap();
@@ -716,7 +658,6 @@ mod tests {
             "x@y.z",
             1,
             Some(cheap_fees()),
-            false,
         )
         .await;
         assert!(serde_json::to_string(&nr)
@@ -727,14 +668,7 @@ mod tests {
         let route_resolver = MockResolver {
             signed: Some(sign(p, &s)),
         };
-        let nroute = quote_inner(
-            &route_resolver,
-            "c@d.e",
-            500_000,
-            Some(expensive_fees()),
-            false,
-        )
-        .await;
+        let nroute = quote_inner(&route_resolver, "c@d.e", 500_000, Some(expensive_fees())).await;
         assert!(serde_json::to_string(&nroute)
             .unwrap()
             .contains("\"status\":\"no_route\""));
@@ -745,7 +679,7 @@ mod tests {
         let inv_resolver = MockResolver {
             signed: Some(tampered),
         };
-        let inv = quote_inner(&inv_resolver, "evil@x.y", 1000, Some(cheap_fees()), false).await;
+        let inv = quote_inner(&inv_resolver, "evil@x.y", 1000, Some(cheap_fees())).await;
         assert!(serde_json::to_string(&inv)
             .unwrap()
             .contains("\"status\":\"invalid_signature\""));
@@ -754,21 +688,21 @@ mod tests {
     // Success JSON embeds PaymentMethod with its `type` tag, unchanged.
     #[tokio::test]
     async fn ok_json_embeds_selected_method_with_type_tag() {
-        let resolver = lightning_resolver("rodrigo@satspath.dev", "rodrigo@getalby.com");
+        let resolver =
+            onchain_resolver("rodrigo@satspath.dev", "1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
         let ok = quote_inner(
             &resolver,
             "rodrigo@satspath.dev",
-            1000,
+            21_000,
             Some(cheap_fees()),
-            false,
         )
         .await;
         let v: serde_json::Value = serde_json::to_value(&ok).unwrap();
         assert_eq!(v["status"], "ok");
-        assert_eq!(v["selected_method"]["type"], "Lightning");
+        assert_eq!(v["selected_method"]["type"], "Onchain");
         assert_eq!(
-            v["selected_method"]["lightning_address"],
-            "rodrigo@getalby.com"
+            v["selected_method"]["address"],
+            "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
         );
         assert_eq!(v["recipient"]["verified"], true);
         assert_eq!(v["recipient"]["profile_signature_verified"], true);

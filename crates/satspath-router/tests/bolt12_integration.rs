@@ -351,6 +351,67 @@ async fn test_bolt12_amount_availability_and_route_selection() {
 }
 
 #[tokio::test]
+async fn profile_bolt12_expiry_is_enforced_before_route_selection() {
+    let offer = encode_offer(&[issuer_id_record()]);
+    let now = chrono::Utc::now().timestamp();
+    let fallback = PaymentMethod::Lightning {
+        label: "Fallback LNURL".into(),
+        lightning_address: None,
+        lnurl: Some("https://example.com/lnurl".into()),
+        bolt12: None,
+        receiver_pubkey: None,
+    };
+    let fees = FeeEstimate {
+        fastest_fee: 1,
+        half_hour_fee: 1,
+        hour_fee: 1,
+        economy_fee: 1,
+        minimum_fee: 1,
+    };
+
+    for (expires_at, expected) in [
+        (Some(now - 1), false),
+        (Some(now), false),
+        (Some(now + 3_600), true),
+        (None, true),
+    ] {
+        let method = PaymentMethod::Bolt12(CoreBolt12Offer {
+            label: "BOLT12".into(),
+            offer: offer.clone(),
+            network: BitcoinNetwork::Mainnet,
+            minimum_amount_sats: None,
+            expires_at,
+            issuer_pubkey: hex::encode(issuer_id_record().value),
+        });
+        assert_eq!(
+            is_lightning_available_for_amount_sync(&method, 5_000),
+            expected
+        );
+        assert_eq!(
+            is_lightning_available_for_amount(&method, 5_000).await,
+            expected
+        );
+        let req = RouteRequest {
+            alias: "alice@example.com".into(),
+            amount_sats: 5_000,
+            signed_profile: dummy_signed_profile(
+                "alice@example.com",
+                vec![method.clone(), fallback.clone()],
+            ),
+            urgency: PaymentUrgency::Normal,
+            max_fee_sats: None,
+            max_fee_percent: None,
+        };
+        let selected = if expected { &method } else { &fallback };
+        assert_eq!(
+            &select_route_with_fees(&req, &fees).unwrap().selected_method,
+            selected
+        );
+        assert_eq!(&select_route(&req).await.unwrap().selected_method, selected);
+    }
+}
+
+#[tokio::test]
 async fn test_bolt12_amount_availability_overflow() {
     let amountless = encode_offer(&[issuer_id_record()]);
     let fixed_amount = encode_offer(&[

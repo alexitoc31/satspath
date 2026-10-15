@@ -6,18 +6,23 @@ use satspath_core::{
     validation::{assert_no_private_material, validate_amount_sats},
     PaymentMethod, ProfileResolver, SatsPathError,
 };
-use satspath_router::{fees::fetch_fee_estimate, select_priority_route};
+use satspath_router::{
+    fees::fetch_fee_estimate,
+    handoff::{fmt_btc, validate_payload},
+    select_priority_route,
+};
 
 use crate::config::AppState;
 use crate::handlers::profile::ensure_signed_profile;
 use crate::handlers::resolve::resolver_chain;
 use crate::handlers::wallet::load_wallet;
 use crate::types::{
-    build_methods, fmt_btc, pct, safety_status, EmailInvite, ReceiveRequest, ReceiveView,
-    SendRequest, SendResponse,
+    build_methods, pct, safety_status, EmailInvite, ReceiveRequest, ReceiveView, SendRequest,
+    SendResponse,
 };
 use crate::ui::qr_svg;
 
+/// Choose a configured receive rail and validate its final public QR payload.
 pub(crate) fn receive_view(state: &AppState, req: ReceiveRequest) -> Result<ReceiveView> {
     let wallet = load_wallet(&state.home)?;
     let alias = wallet
@@ -38,23 +43,26 @@ pub(crate) fn receive_view(state: &AppState, req: ReceiveRequest) -> Result<Rece
                 )
             })?
     } else {
-        methods
+        let onchain = methods
             .iter()
-            .find(|m| matches!(m, PaymentMethod::Lightning { .. }))
-            .or_else(|| {
-                methods
-                    .iter()
-                    .find(|m| matches!(m, PaymentMethod::Onchain { .. }))
-            })
-            .or_else(|| {
-                methods
-                    .iter()
-                    .find(|m| matches!(m, PaymentMethod::Ark { .. }))
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!("no receive methods -- add one via POST /v1/profile/methods")
-            })?
-            .clone()
+            .find(|m| matches!(m, PaymentMethod::Onchain { .. }));
+        let lightning = methods
+            .iter()
+            .find(|m| matches!(m, PaymentMethod::Lightning { .. }));
+        (if req.amount_sats.is_some() {
+            onchain.or(lightning)
+        } else {
+            lightning.or(onchain)
+        })
+        .or_else(|| {
+            methods
+                .iter()
+                .find(|m| matches!(m, PaymentMethod::Ark { .. }))
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("no receive methods -- add one via POST /v1/profile/methods")
+        })?
+        .clone()
     };
 
     let mut payload = receive_payload_for(&method)?;
@@ -68,6 +76,8 @@ pub(crate) fn receive_view(state: &AppState, req: ReceiveRequest) -> Result<Rece
         }
         // Note: Lightning Address/LNURL doesn't support amount in the static string.
     }
+
+    validate_payload(&method, &payload, &state.network, req.amount_sats)?;
 
     Ok(ReceiveView {
         alias: mask_identifier(&alias),
@@ -118,11 +128,17 @@ pub(crate) async fn send_response(state: &AppState, body: SendRequest) -> SendRe
     send_response_with_resolver(state, body, &resolver).await
 }
 
+/// Resolve a recipient through the supplied resolver and gate its payable QR.
 pub(crate) async fn send_response_with_resolver(
     state: &AppState,
     body: SendRequest,
     resolver: &(impl ProfileResolver + Sync),
 ) -> SendResponse {
+    if let Err(e) = validate_amount_sats(body.amount_sats) {
+        return SendResponse::NoRoute {
+            reason: e.to_string(),
+        };
+    }
     match resolver.resolve_alias(&body.recipient).await {
         Ok(signed) => {
             if !matches!(
@@ -135,14 +151,25 @@ pub(crate) async fn send_response_with_resolver(
             }
             let fee = fetch_fee_estimate().await;
             let routing_ok = body.routing_ok.unwrap_or(true);
+            let payable_methods =
+                payable_methods(&signed.profile.methods, body.amount_sats, &state.network);
             match select_priority_route(
                 body.amount_sats,
                 &fee.unwrap_or_default(),
-                &signed.profile.methods,
+                &payable_methods,
                 routing_ok,
             ) {
                 Some(decision) => {
-                    let payload = match send_payload_for(&decision.method, body.amount_sats) {
+                    let payload = match send_payload_for(&decision.method, body.amount_sats)
+                        .and_then(|payload| {
+                            validate_payload(
+                                &decision.method,
+                                &payload,
+                                &state.network,
+                                Some(body.amount_sats),
+                            )?;
+                            Ok(payload)
+                        }) {
                         Ok(p) => p,
                         Err(e) => {
                             return SendResponse::NoRoute {
@@ -174,7 +201,7 @@ pub(crate) async fn send_response_with_resolver(
                     }
                 }
                 None => SendResponse::NoRoute {
-                    reason: "recipient exposes no usable rail".to_string(),
+                    reason: "recipient exposes no safely payable rail".to_string(),
                 },
             }
         }
@@ -233,6 +260,24 @@ pub(crate) async fn send_response_with_resolver(
     }
 }
 
+/// Retain only signed-profile methods that can produce a validated payable QR.
+fn payable_methods(
+    methods: &[PaymentMethod],
+    amount_sats: u64,
+    network: &str,
+) -> Vec<PaymentMethod> {
+    methods
+        .iter()
+        .filter(|method| {
+            send_payload_for(method, amount_sats)
+                .and_then(|payload| validate_payload(method, &payload, network, Some(amount_sats)))
+                .is_ok()
+        })
+        .cloned()
+        .collect()
+}
+
+/// Build an experimental invite for an alias without a usable signed profile.
 pub(crate) fn build_email_invite(
     recipient: &str,
     amount_sats: u64,
@@ -300,4 +345,76 @@ pub(crate) fn broadcast(state: &AppState) -> Result<serde_json::Value> {
     Ok(
         serde_json::json!({ "broadcasting": false, "status": "Profile saved. Enabled transports manage publication; saving is not proof of network availability." }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use satspath_core::BitcoinNetwork;
+    use satspath_router::fees::FeeEstimate;
+
+    fn onchain(address: &str) -> PaymentMethod {
+        PaymentMethod::Onchain {
+            label: "On-chain".into(),
+            network: BitcoinNetwork::Mainnet,
+            address: Some(address.into()),
+            silent_payment_pubkey: None,
+            pubkey_hint: None,
+            descriptor_hint: None,
+            address_list: vec![],
+        }
+    }
+
+    #[test]
+    fn send_skips_unpayable_preferred_rails_before_selecting_route() {
+        let good = onchain("1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
+        let methods = vec![
+            onchain("invalid-address"),
+            PaymentMethod::Lightning {
+                label: "Lightning".into(),
+                lightning_address: Some("alice@example.com".into()),
+                lnurl: None,
+                bolt12: None,
+                receiver_pubkey: None,
+            },
+            good.clone(),
+        ];
+        let payable = payable_methods(&methods, 21_000, "mainnet");
+        assert_eq!(payable, vec![good.clone()]);
+
+        // High fees would pick Lightning first, but its static pointer has no
+        // amount-bound invoice. The router's last resort is the valid on-chain QR.
+        let high_fee = FeeEstimate {
+            fastest_fee: 40,
+            ..FeeEstimate::default()
+        };
+        let selected = select_priority_route(21_000, &high_fee, &payable, true).unwrap();
+        assert_eq!(selected.rail, "onchain");
+        assert_eq!(selected.method, good);
+        assert!(validate_payload(
+            &selected.method,
+            &send_payload_for(&selected.method, 21_000).unwrap(),
+            "mainnet",
+            Some(21_000)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn send_has_no_route_when_every_method_is_unpayable() {
+        let methods = [PaymentMethod::Lightning {
+            label: "Lightning".into(),
+            lightning_address: Some("alice@example.com".into()),
+            lnurl: None,
+            bolt12: None,
+            receiver_pubkey: None,
+        }];
+        assert!(payable_methods(&methods, 21_000, "mainnet").is_empty());
+        assert!(payable_methods(
+            &[onchain("1BoatSLRHtKNngkdXEeobR76b53LETtpyT")],
+            21_000,
+            "devnet"
+        )
+        .is_empty());
+    }
 }

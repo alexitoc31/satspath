@@ -54,18 +54,7 @@ pub async fn is_lightning_available_for_amount(method: &PaymentMethod, amount_sa
             })
             .unwrap_or(false),
         PaymentMethod::Bolt12(offer_data) => {
-            if let Some(min_sats) = offer_data.minimum_amount_sats {
-                if amount_sats < min_sats {
-                    return false;
-                }
-            }
-            crate::bolt12::parse_bolt12_offer(&offer_data.offer)
-                .map(|offer| {
-                    amount_sats
-                        .checked_mul(1_000)
-                        .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
-                })
-                .unwrap_or(false)
+            bolt12_profile_offer_available(offer_data, amount_sats)
         }
         _ => false,
     }
@@ -108,21 +97,32 @@ pub fn is_lightning_available_for_amount_sync(method: &PaymentMethod, amount_sat
             })
             .unwrap_or(false),
         PaymentMethod::Bolt12(offer_data) => {
-            if let Some(min_sats) = offer_data.minimum_amount_sats {
-                if amount_sats < min_sats {
-                    return false;
-                }
-            }
-            crate::bolt12::parse_bolt12_offer(&offer_data.offer)
-                .map(|offer| {
-                    amount_sats
-                        .checked_mul(1_000)
-                        .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
-                })
-                .unwrap_or(false)
+            bolt12_profile_offer_available(offer_data, amount_sats)
         }
         _ => false,
     }
+}
+
+fn bolt12_profile_offer_available(
+    offer_data: &satspath_core::Bolt12Offer,
+    amount_sats: u64,
+) -> bool {
+    if offer_data
+        .expires_at
+        .is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp())
+        || offer_data
+            .minimum_amount_sats
+            .is_some_and(|minimum| amount_sats < minimum)
+    {
+        return false;
+    }
+    crate::bolt12::parse_bolt12_offer(&offer_data.offer)
+        .map(|offer| {
+            amount_sats
+                .checked_mul(1_000)
+                .is_some_and(|amount_msats| offer.is_amount_valid(amount_msats))
+        })
+        .unwrap_or(false)
 }
 
 pub fn estimate_lightning_fee_sats(amount_sats: u64) -> u64 {

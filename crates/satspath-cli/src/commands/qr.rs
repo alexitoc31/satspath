@@ -1,7 +1,9 @@
 use anyhow::Result;
 use qrcode::render::unicode;
 use qrcode::QrCode;
+use satspath_router::handoff::fmt_btc;
 
+/// Render a caller-validated public payment payload as a terminal QR.
 pub fn print_qr(data: &str) -> Result<()> {
     let code =
         QrCode::new(data.as_bytes()).map_err(|e| anyhow::anyhow!("QR encode error: {}", e))?;
@@ -17,6 +19,5 @@ pub fn print_qr(data: &str) -> Result<()> {
 
 /// BIP-21 Bitcoin URI: `bitcoin:<address>?amount=<btc>`
 pub fn bitcoin_uri(address: &str, amount_sats: u64) -> String {
-    let btc = amount_sats as f64 / 100_000_000.0;
-    format!("bitcoin:{}?amount={:.8}", address, btc)
+    format!("bitcoin:{address}?amount={}", fmt_btc(amount_sats))
 }

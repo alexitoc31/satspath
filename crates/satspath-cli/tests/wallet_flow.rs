@@ -88,7 +88,12 @@ fn wallet_init_add_show_receive_end_to_end() {
     let v: serde_json::Value = serde_json::from_str(json.trim()).expect("receive must emit JSON");
     assert_eq!(v["mode"], "preview_only");
     assert_eq!(v["alias"], alias);
-    assert!(v["qr"].is_string(), "json output was: {}", json);
+    assert_eq!(v["status"], "ok", "unexpected preview status: {json}");
+    assert_eq!(
+        v["qr"],
+        format!("bitcoin:{ONCHAIN}?amount=0.00100000"),
+        "unexpected handoff: {json}"
+    );
     let warnings = v["warnings"].as_array().unwrap();
     assert!(warnings.iter().any(|w| w == "No funds moved by SatsPath"));
     assert!(warnings

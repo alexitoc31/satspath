@@ -20,6 +20,7 @@ const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.primal.net",
 ];
 const NOSTR_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_NIP05_BYTES: usize = 50 * 1024;
 
 /// Resolver for SatsPath profiles announced over Nostr.
 ///
@@ -48,6 +49,31 @@ struct Nip05Document {
 struct Nip05Resolution {
     pubkey: String,
     relays: Vec<String>,
+}
+
+async fn fetch_nip05_document(client: &reqwest::Client, url: &str) -> Result<Nip05Document> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 fetch failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 HTTP error: {e}")))?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 response read failed: {e}")))?
+    {
+        if chunk.len() > MAX_NIP05_BYTES - bytes.len() {
+            return Err(SatsPathError::NetworkError(
+                "NIP-05 payload exceeded size limit of 50 KiB".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| SatsPathError::SerializationError(format!("NIP-05 JSON: {e}")))
 }
 
 impl Default for NostrResolver {
@@ -88,17 +114,7 @@ impl NostrResolver {
             .split_once('@')
             .ok_or_else(|| SatsPathError::AliasNotFound(alias.to_string()))?;
         let url = format!("https://{domain}/.well-known/nostr.json?name={name}");
-        let document: Nip05Document = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 fetch failed: {e}")))?
-            .error_for_status()
-            .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 HTTP error: {e}")))?
-            .json()
-            .await
-            .map_err(|e| SatsPathError::SerializationError(format!("NIP-05 JSON: {e}")))?;
+        let document = fetch_nip05_document(&self.client, &url).await?;
 
         let pubkey = document
             .names
@@ -445,6 +461,59 @@ mod tests {
     use super::*;
     use crate::crypto::{generate_identity_keypair, sign_profile};
     use crate::{PaymentMethod, PaymentProfile};
+    use mockito::Server;
+
+    #[tokio::test]
+    async fn nip05_limits_body_before_json_deserialization() {
+        let mut server = Server::new_async().await;
+        let valid = r#"{"names":{}}"#;
+        let body = format!("{valid}{}", " ".repeat(MAX_NIP05_BYTES - valid.len()));
+        let _within_limit = server
+            .mock("GET", "/within-limit")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+        let _too_large = server
+            .mock("GET", "/too-large")
+            .with_status(200)
+            .with_body(format!(
+                "{valid}{}",
+                " ".repeat(MAX_NIP05_BYTES + 1 - valid.len())
+            ))
+            .create_async()
+            .await;
+        let _invalid_json = server
+            .mock("GET", "/invalid-json")
+            .with_status(200)
+            .with_body("{")
+            .create_async()
+            .await;
+        let _http_error = server
+            .mock("GET", "/http-error")
+            .with_status(404)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+
+        assert!(
+            fetch_nip05_document(&client, &format!("{}/within-limit", server.url()))
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            fetch_nip05_document(&client, &format!("{}/too-large", server.url())).await,
+            Err(SatsPathError::NetworkError(reason)) if reason.contains("size limit")
+        ));
+        assert!(matches!(
+            fetch_nip05_document(&client, &format!("{}/invalid-json", server.url())).await,
+            Err(SatsPathError::SerializationError(reason)) if reason.contains("NIP-05 JSON")
+        ));
+        assert!(matches!(
+            fetch_nip05_document(&client, &format!("{}/http-error", server.url())).await,
+            Err(SatsPathError::NetworkError(reason)) if reason.contains("NIP-05 HTTP error")
+        ));
+    }
 
     fn signed(alias: &str) -> SignedPaymentProfile {
         let kp = generate_identity_keypair();
