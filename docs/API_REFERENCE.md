@@ -140,10 +140,13 @@ such as `max_bytes` or `retry_after`:
 
 ### CORS
 
-Responses carry `Access-Control-Allow-Origin` set to the **first** entry of
+Responses built by the JSON, text, and empty-response helpers carry
+`Access-Control-Allow-Origin` set to the **first** entry of
 `SATSPATHD_CORS_ORIGIN` (default `http://localhost:5173`), plus
 `Access-Control-Allow-Methods: GET, POST, OPTIONS` and
 `Access-Control-Allow-Headers: Content-Type, Authorization, X-Request-Id`.
+The HTML UI (`GET /` and `/claim`) sends only `Access-Control-Allow-Origin`;
+`GET /dashboard-auth.mjs` sends none of these CORS headers.
 After Host validation, the declared body-size check, and rate limiting pass,
 `OPTIONS` on any path returns `204`. Because `PUT` is not in the allowed methods,
 browsers cannot call `PUT /v1/profile` cross-origin; use `POST /v1/profile`
@@ -157,15 +160,16 @@ the HTTP status is **200**. Always check for an `error` key before parsing a
 success payload on these operations:
 
 * `GET /v1/status`, `/v1/node`, `/v1/profile`
-* `POST /v1/receive`, `POST /v1/broadcast`
+* `POST /v1/receive` after a successful body read and parse, `POST /v1/broadcast`
 * `GET /v1/transparency/status`, `/checkpoints`, `/checkpoints/{hash}`,
   `/events`, `/events/{hash}`, `/identifiers/{id}`, `/inclusion/{hash}`,
   `/consistency`, `/anchors`, `/anchors/{txid}`, `/catena/chain`
-* `GET /v1/claim`, `GET /v1/claim/{id}`, `GET /v1/invites`,
+* `GET /v1/claim?invite_id=...`, `GET /v1/claim/{id}`, `GET /v1/invites`,
   `GET /v1/invites/notifications`
 * `POST /v1/invites/notifications/read-all` and `.../{id}/read`
 
 The OpenAPI file models these as `oneOf [success schema, Error]`.
+`GET /v1/claim` without an invite ID instead returns HTTP 400.
 
 ### Status-code conventions for the other operations
 
@@ -175,7 +179,7 @@ The OpenAPI file models these as `oneOf [success schema, Error]`.
 | `POST /v1/resolve` | **Any** failure, including a bad body, returns `404`. |
 | `GET`/`POST /v2/resolve` | `404` when the error message contains "not found", otherwise `400`. |
 | `POST /v1/claim` | `404` unknown invite, `409` already claimed, `400` otherwise. |
-| `POST /v1/p2p/resolve` | Every failure is a generic `400`. |
+| `POST /v1/p2p/resolve` | Candidate-resolution failures return a generic `400`; body-read failures return `400`, or `413` for an oversized body. |
 | `GET /v1/health` | `200` for `healthy`/`degraded`, `503` for `unhealthy`. |
 | `GET /v2/health` | `200` for `healthy`, `503` for `degraded`. |
 
@@ -406,13 +410,14 @@ names differ:
 | :--- | :--- |
 | `GET /v1/status`, `/v1/node` | Implemented as listed. |
 | `POST /v1/resolve`, `/quote`, `/preview`, `/pay`, `/send` | Implemented. First four need the Bearer token; `/v1/send` is public. |
-| `POST /v1/register` | **Does not exist.** Profiles are created through `/v1/profile/challenge`, `/verify`, then `PUT /v1/profile`. `POST /v1/receive` builds a receive payload and does not register anything. |
+| `POST /v1/register` | **Does not exist.** Unauthenticated requests return `401`; authenticated requests reach the `404` fallback. Profiles are created through `/v1/profile/challenge`, `/verify`, then `PUT /v1/profile`. `POST /v1/receive` builds a receive payload and does not register anything. |
 | `GET /v1/transparency/events`, `/checkpoints` | Implemented, paginated. |
 | `POST /v1/transparency/anchors` | Implemented, Bearer, regtest only. |
 
 ### Declared but not served
 
-These appear in code or older docs but have no working handler. Both return `404`:
+These appear in code or older docs but have no working handler. GET requests
+return `404`; protected mutation requests pass through authentication first:
 
 * `GET /v2/checkpoint/latest` is listed in [`s2s/server-v2.md`](s2s/server-v2.md)
   and defined as a route constant, but the router does not dispatch it. Use

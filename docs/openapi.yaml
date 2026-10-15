@@ -4265,6 +4265,7 @@ components:
       description: Protocol quote contract. Always returned with HTTP 200; branch on `status`.
     QuoteOk:
       type: object
+      description: The router filters methods through `build_qr_payload` before selection; amount-less Lightning pointers are not payable quotes. The daemon validates the final payload again.
       properties:
         status:
           type: string
@@ -4413,6 +4414,7 @@ components:
       description: Wallet handoff decision. Never moves funds. Always HTTP 200; branch on `status`.
     PayWalletHandoff:
       type: object
+      description: Only a validated `QuoteOk` can become a wallet handoff; `/v1/pay` copies its amount-bound BIP-21 QR into `payment_payload`.
       properties:
         status:
           type: string
