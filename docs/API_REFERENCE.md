@@ -97,7 +97,7 @@ The rule is method-based, not route-based:
    `POST /v1/receive`, `POST /v1/send`, `POST /v1/claim`, `POST /v1/dns/resolve`,
    `POST /v1/transparency/verify/inclusion`, `POST /v1/transparency/verify/catena`,
    `POST /v1/profile/recover`, and `POST /v2/resolve`.
-2. `GET` and `OPTIONS` requests are never authenticated.
+2. `GET`, `HEAD`, and `OPTIONS` requests are never authenticated.
 
 Consequences worth knowing:
 
@@ -351,8 +351,8 @@ tagged by `status`:
 
 | `status` | Meaning |
 | :--- | :--- |
-| `ok` | Route selected; `qr` holds the public payload for the wallet. |
-| `no_route` | Profile resolution failed (including lookup or signature verification), or no usable route was found (see below). Resolution failures have a `reason` starting with `transparency verification failed:`. |
+| `ok` | Route selected; `qr` holds a validated, amount-bound on-chain BIP-21 URI for the configured network. |
+| `no_route` | Profile resolution failed (including lookup or signature verification), no usable route was found, or the selected payload failed handoff validation. Resolution failures have a `reason` starting with `transparency verification failed:`. |
 
 `/v1/quote`, `/v1/preview`, and `/v1/pay` route only through the mandatory
 transparency composition (signature, identifier history, key continuity,
@@ -361,6 +361,17 @@ payment methods that carry a valid ownership proof**; self-asserted methods are
 dropped, so a profile with no proofs yields `no_route`. `/v1/send` uses the legacy
 resolver chain and does not apply that filter, so the two can disagree for the
 same recipient.
+
+After the wallet-handoff gate in [#159](https://github.com/satspath/satspath/pull/159),
+`/v1/quote`, `/v1/preview`, `/v1/pay`, and successful `/v1/send` responses emit
+only on-chain BIP-21 payloads whose address, network, and exact amount pass
+final validation. A BOLT11 invoice can be validated against its payee, network,
+amount, and expiry, but these quote paths do not generate one. Lightning
+Addresses and LNURL links remain **amount-less receive pointers**; BOLT12, Ark,
+and Silent Payment handoffs return `no_route` or an explicit receive error until
+protocol-aware validation is available. On `/v1/receive`, an omitted rail
+prefers on-chain when `amount_sats` is set and Lightning otherwise; explicitly
+selecting an unsupported rail does not bypass validation.
 
 `POST /v1/pay` wraps an `ok` quote as `status: wallet_handoff` with
 `payment_payload`, `qr_svg`, and `handoff.daemon_executes_payment: false`.

@@ -11,9 +11,9 @@ info:
     Bitcoin transactions, broadcasts payments or stores seeds/spending keys. `POST /v1/pay` returns a
     wallet-handoff payload only.
 
-    **Authentication.** Every non-`GET` request except a small public allow-list requires
+    **Authentication.** Requests other than `GET`, `HEAD` and `OPTIONS`, except a small public allow-list, require
     `Authorization: Bearer <token>`, where the token is the 64-hex content of `<home>/admin.macaroon`
-    (or `SATSPATHD_AUTH_TOKEN`). `GET` routes are not authenticated.
+    (or `SATSPATHD_AUTH_TOKEN`). `GET`, `HEAD` and `OPTIONS` are not authenticated.
 
     **Pipeline order.** Host allow-list (400) → body size (413) → per-IP rate limit (429) → auth (401) → route (404).
 
@@ -1038,7 +1038,9 @@ paths:
       - Resolution & Routing
       summary: Quote the best rail
       description: Resolves transparently, keeps only methods with a valid ownership proof, then selects
-        a route. **Requires Bearer.** Protocol outcomes are `status` values in an HTTP 200 body.
+        a route. A payable `ok` quote currently requires a validated on-chain BIP-21 URI bound to the
+        configured network and exact requested amount; unsupported rails return `no_route`.
+        **Requires Bearer.** Protocol outcomes are `status` values in an HTTP 200 body.
       operationId: quote
       requestBody:
         required: true
@@ -1065,16 +1067,14 @@ paths:
                   identifier_verification: identifier-only; no inbox/domain ownership proof in this response
                   fingerprint: a8fdac91
                 selected_method:
-                  type: Lightning
-                  label: Lightning Address
-                  lightning_address: alice@getalby.com
-                  lnurl: null
-                  bolt12: null
-                  receiver_pubkey: null
-                fee_sats: 1
-                eta: instant
-                reason: Amount is below Lightning threshold and Lightning is available.
-                qr: alice@getalby.com
+                  type: Onchain
+                  label: Bitcoin (devnet)
+                  network: Testnet
+                  address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                fee_sats: 700
+                eta: next block
+                reason: Validated on-chain route selected.
+                qr: bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx?amount=0.00050000
                 execution: manual_wallet
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -1125,16 +1125,14 @@ paths:
                       response
                     fingerprint: a8fdac91
                   selected_method:
-                    type: Lightning
-                    label: Lightning Address
-                    lightning_address: alice@getalby.com
-                    lnurl: null
-                    bolt12: null
-                    receiver_pubkey: null
-                  fee_sats: 1
-                  eta: instant
-                  reason: Amount is below Lightning threshold and Lightning is available.
-                  qr: alice@getalby.com
+                    type: Onchain
+                    label: Bitcoin (devnet)
+                    network: Testnet
+                    address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                  fee_sats: 700
+                  eta: next block
+                  reason: Validated on-chain route selected.
+                  qr: bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx?amount=0.00050000
                   execution: manual_wallet
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -1149,8 +1147,8 @@ paths:
       tags:
       - Resolution & Routing
       summary: Wallet handoff (never executes payment)
-      description: Returns a payment payload and QR for an external wallet. The daemon never moves funds.
-        **Requires Bearer.**
+      description: Returns a validated, amount-bound on-chain BIP-21 payload and QR for an external
+        wallet, or `no_route`. The daemon never moves funds. **Requires Bearer.**
       operationId: pay
       requestBody:
         required: true
@@ -1183,18 +1181,16 @@ paths:
                       response
                     fingerprint: a8fdac91
                   selected_method:
-                    type: Lightning
-                    label: Lightning Address
-                    lightning_address: alice@getalby.com
-                    lnurl: null
-                    bolt12: null
-                    receiver_pubkey: null
-                  fee_sats: 1
-                  eta: instant
-                  reason: Amount is below Lightning threshold and Lightning is available.
-                  qr: alice@getalby.com
+                    type: Onchain
+                    label: Bitcoin (devnet)
+                    network: Testnet
+                    address: tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+                  fee_sats: 700
+                  eta: next block
+                  reason: Validated on-chain route selected.
+                  qr: bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx?amount=0.00021000
                   execution: manual_wallet
-                payment_payload: alice@getalby.com
+                payment_payload: bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx?amount=0.00021000
                 qr_svg: <svg xmlns='http://www.w3.org/2000/svg'/>
                 handoff:
                   mode: external_wallet
@@ -1221,8 +1217,9 @@ paths:
       - Resolution & Routing
       summary: Preview send via the legacy resolver chain
       description: '**Public.** Resolves through registry, BIP-353, HTTPS and Nostr, picks a rail and
-        returns a payload and QR (`mode: preview_only`). If the recipient is unknown it creates a persisted
-        invite (EXPERIMENTAL). Unlike `/v1/quote` it does not apply transparency verification.'
+        returns a validated on-chain payload and QR (`mode: preview_only`) or `no_route` for an unsafe
+        rail. If the recipient is unknown it creates a persisted invite (EXPERIMENTAL). Unlike
+        `/v1/quote` it does not apply transparency verification.'
       operationId: send
       requestBody:
         required: true
@@ -1241,14 +1238,14 @@ paths:
               example:
                 status: ok
                 mode: preview_only
-                rail: lightning
-                reason: Lightning preferred for small amounts
+                rail: onchain
+                reason: Validated on-chain route selected.
                 recipient: a***@example.com
                 profile_signature_verified: true
                 identifier_verified: false
                 identifier_verification: identifier-only; no inbox/domain ownership proof in this response
                 amount_sats: 21000
-                payload: alice@getalby.com
+                payload: bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx?amount=0.00021000
                 qr_svg: <svg xmlns='http://www.w3.org/2000/svg'/>
                 safety:
                   moves_funds: false
@@ -1267,8 +1264,10 @@ paths:
       tags:
       - Resolution & Routing
       summary: Receive payload and QR for own profile
-      description: '**Public.** Builds a public receive pointer from the local wallet''s configured methods.
-        Errors return HTTP 200 with an `Error` body.'
+      description: '**Public.** Builds a validated public receive pointer from the local wallet''s configured
+        methods. An amount-less Lightning Address or LNURL remains receive-only; amount-bound payloads
+        use a validated on-chain BIP-21 URI. Experimental rails fail closed. Errors return HTTP 200
+        with an `Error` body.'
       operationId: receive
       requestBody:
         required: true
@@ -2848,7 +2847,7 @@ components:
       required:
       - type
       - label
-      description: At least one of `lightning_address`, `lnurl` or `bolt12` must be set to be routable.
+      description: At least one of `lightning_address`, `lnurl` or `bolt12` advertises a receive capability; none is an amount-bound payable QR in the current quote paths.
     ArkMethod:
       type: object
       properties:
@@ -2911,6 +2910,127 @@ components:
       - label
       - offer
       - issuer_pubkey
+    PayableOnchainMethod:
+      oneOf:
+      - $ref: '#/components/schemas/MainnetPayableMethod'
+      - $ref: '#/components/schemas/TestnetPayableMethod'
+      - $ref: '#/components/schemas/RegtestPayableMethod'
+      discriminator:
+        propertyName: network
+        mapping:
+          Mainnet: '#/components/schemas/MainnetPayableMethod'
+          Testnet: '#/components/schemas/TestnetPayableMethod'
+          Regtest: '#/components/schemas/RegtestPayableMethod'
+      description: Only an on-chain method with a decoded address on the configured network can yield a payable quote.
+    MainnetPayableMethod:
+      allOf:
+      - $ref: '#/components/schemas/OnchainMethod'
+      - type: object
+        properties:
+          network:
+            type: string
+            enum: [Mainnet]
+          address:
+            $ref: '#/components/schemas/MainnetAddress'
+        required: [network, address]
+        not:
+          properties:
+            silent_payment_pubkey: {}
+          required: [silent_payment_pubkey]
+    TestnetPayableMethod:
+      allOf:
+      - $ref: '#/components/schemas/OnchainMethod'
+      - type: object
+        properties:
+          network:
+            type: string
+            enum: [Testnet]
+          address:
+            $ref: '#/components/schemas/TestnetAddress'
+        required: [network, address]
+        not:
+          properties:
+            silent_payment_pubkey: {}
+          required: [silent_payment_pubkey]
+    RegtestPayableMethod:
+      allOf:
+      - $ref: '#/components/schemas/OnchainMethod'
+      - type: object
+        properties:
+          network:
+            type: string
+            enum: [Regtest]
+          address:
+            $ref: '#/components/schemas/RegtestAddress'
+        required: [network, address]
+        not:
+          properties:
+            silent_payment_pubkey: {}
+          required: [silent_payment_pubkey]
+    MainnetAddress:
+      type: string
+      minLength: 26
+      maxLength: 90
+      pattern: '^(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|(?:bc1|BC1)[A-Za-z0-9]{8,87})$'
+      description: Shape only; the runtime decodes the Bitcoin checksum and validates the network.
+    TestnetAddress:
+      type: string
+      minLength: 14
+      maxLength: 90
+      pattern: '^(?:tb1|TB1)[A-Za-z0-9]{8,87}$'
+      description: Testnet SegWit. Ambiguous testnet/regtest legacy Base58 addresses are rejected at handoff.
+    RegtestAddress:
+      type: string
+      minLength: 16
+      maxLength: 90
+      pattern: '^(?:bcrt1|BCRT1)[A-Za-z0-9]{8,87}$'
+      description: Regtest SegWit. Ambiguous testnet/regtest legacy Base58 addresses are rejected at handoff.
+    PayableBip21Payload:
+      oneOf:
+      - $ref: '#/components/schemas/MainnetPayableUri'
+      - $ref: '#/components/schemas/TestnetPayableUri'
+      - $ref: '#/components/schemas/RegtestPayableUri'
+      description: |
+        A canonical `bitcoin:<address>?amount=<BTC>` URI for an on-chain handoff. The network is
+        identified by the address prefix. The daemon checks the address checksum and configured
+        network, exact satoshi amount (1 to 2,100,000,000,000,000), and rejects duplicate or
+        conflicting parameters. OpenAPI 3.0 cannot express equality with the request amount or
+        with `selected_method.address`; the runtime enforces both before output.
+    MainnetPayableUri:
+      type: string
+      maxLength: 160
+      pattern: '^bitcoin:(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|(?:bc1|BC1)[A-Za-z0-9]{8,87})\?amount=(?:0|[1-9][0-9]{0,7})\.[0-9]{8}$'
+    TestnetPayableUri:
+      type: string
+      maxLength: 160
+      pattern: '^bitcoin:(?:tb1|TB1)[A-Za-z0-9]{8,87}\?amount=(?:0|[1-9][0-9]{0,7})\.[0-9]{8}$'
+    RegtestPayableUri:
+      type: string
+      maxLength: 160
+      pattern: '^bitcoin:(?:bcrt1|BCRT1)[A-Za-z0-9]{8,87}\?amount=(?:0|[1-9][0-9]{0,7})\.[0-9]{8}$'
+    ReceivePayload:
+      oneOf:
+      - $ref: '#/components/schemas/PayableBip21Payload'
+      - $ref: '#/components/schemas/OnchainReceivePointer'
+      - $ref: '#/components/schemas/LightningReceivePointer'
+      - $ref: '#/components/schemas/LnurlReceivePointer'
+      description: Amount-less Lightning pointers are receive-only, not payable handoffs. Ark, BOLT12 and Silent Payments fail closed.
+    OnchainReceivePointer:
+      type: string
+      maxLength: 100
+      pattern: '^bitcoin:(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|(?:bc1|BC1|tb1|TB1|bcrt1|BCRT1)[A-Za-z0-9]{8,87})$'
+      description: A decoded on-chain address without an amount; validated against the configured network.
+    LightningReceivePointer:
+      type: string
+      maxLength: 4096
+      pattern: '^[A-Za-z0-9._+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z0-9.\-]+$'
+      description: Lightning Address, amount-less and receive-only.
+    LnurlReceivePointer:
+      type: string
+      format: uri
+      maxLength: 4096
+      pattern: '^https://[^/?#@ ]+(?:/[^?#]*)?$'
+      description: HTTPS LNURL pointer without credentials, query or fragment; amount-less and receive-only.
     KeyRotation:
       type: object
       properties:
@@ -4040,6 +4160,7 @@ components:
           type: integer
           format: int64
           minimum: 1
+          maximum: 2100000000000000
       required:
       - recipient
       - amount_sats
@@ -4055,6 +4176,7 @@ components:
           type: integer
           format: int64
           minimum: 1
+          maximum: 2100000000000000
         memo:
           type: string
           description: Screened for private material.
@@ -4151,7 +4273,7 @@ components:
         recipient:
           $ref: '#/components/schemas/QuoteRecipient'
         selected_method:
-          $ref: '#/components/schemas/PaymentMethod'
+          $ref: '#/components/schemas/PayableOnchainMethod'
         fee_sats:
           type: integer
           format: int64
@@ -4163,8 +4285,7 @@ components:
         reason:
           type: string
         qr:
-          type: string
-          description: Public payment payload for the wallet (BIP-21, LN address/LNURL, Ark pointer).
+          $ref: '#/components/schemas/PayableBip21Payload'
         execution:
           $ref: '#/components/schemas/ExecutionMode'
         wallet_hint:
@@ -4304,14 +4425,16 @@ components:
         safety:
           $ref: '#/components/schemas/SafetyStatus'
         quote:
-          $ref: '#/components/schemas/QuoteResponse'
+          $ref: '#/components/schemas/QuoteOk'
         recipient:
           type: string
         amount_sats:
           type: integer
           format: int64
+          minimum: 1
+          maximum: 2100000000000000
         payment_payload:
-          type: string
+          $ref: '#/components/schemas/PayableBip21Payload'
         qr_svg:
           type: string
           description: Self-contained SVG QR.
@@ -4435,6 +4558,7 @@ components:
           $ref: '#/components/schemas/Bip353Name'
         bitcoin_uri:
           type: string
+          description: Raw DNS-record instruction; DNSSEC authenticity alone does not make it a validated wallet handoff.
         dnssec_validated:
           type: boolean
         ttl_seconds:
@@ -4469,6 +4593,10 @@ components:
           bolt12_offer: '#/components/schemas/Bip321Bolt12'
           silent_payment: '#/components/schemas/Bip321SilentPayment'
           unknown: '#/components/schemas/Bip321Unknown'
+      description: |
+        Inert parser output, NOT a validated wallet handoff. The parser intentionally preserves
+        untrusted BIP-321 instructions, even malformed or unsupported rails; do not render these
+        fields as a payment QR. Payable outputs use `PayableBip21Payload` after strict validation.
     Bip321Onchain:
       type: object
       properties:
@@ -4478,9 +4606,11 @@ components:
           - onchain
         address:
           type: string
+          description: Raw URI address; this inert parser does not decode its checksum or network.
         amount_btc:
           type: string
           nullable: true
+          description: Raw amount text, potentially malformed or duplicated in the input; not a validated satoshi amount.
       required:
       - kind
       - address
@@ -4493,6 +4623,7 @@ components:
           - lightning_bolt11
         invoice:
           type: string
+          description: Raw invoice parameter, not verified for signature, network, amount, payee or expiry here.
       required:
       - kind
       - invoice
@@ -4505,6 +4636,7 @@ components:
           - bolt12_offer
         offer:
           type: string
+          description: Raw experimental offer parameter; never a payable handoff from this parser.
       required:
       - kind
       - offer
@@ -4517,6 +4649,7 @@ components:
           - silent_payment
         address:
           type: string
+          description: Raw experimental Silent Payment parameter; never a payable handoff from this parser.
       required:
       - kind
       - address
@@ -4540,6 +4673,7 @@ components:
       - required
     ParsedBip321Uri:
       type: object
+      description: Inert, untrusted BIP-321 parse result; not a validated wallet-handoff payload.
       properties:
         raw:
           type: string
@@ -4610,12 +4744,14 @@ components:
       properties:
         rail:
           type: string
-          description: '`lightning`, `onchain` or `ark` (case-insensitive). Default: first configured
-            in that order.'
+          description: '`lightning`, `onchain` or `ark` (case-insensitive). Without a rail, Lightning
+            is preferred for amount-less requests, on-chain for amount-bound requests. An unsupported
+            selected rail returns an error.'
         amount_sats:
           type: integer
           format: int64
           minimum: 1
+          maximum: 2100000000000000
       example:
         rail: onchain
         amount_sats: 25000
@@ -4630,10 +4766,8 @@ components:
           enum:
           - Lightning
           - Onchain
-          - Ark
-          - Bolt12
         payload:
-          type: string
+          $ref: '#/components/schemas/ReceivePayload'
         qr_svg:
           type: string
       required:
@@ -4650,6 +4784,7 @@ components:
           type: integer
           format: int64
           minimum: 1
+          maximum: 2100000000000000
         routing_ok:
           type: boolean
           description: Model Lightning routing health (default true).
@@ -4702,6 +4837,8 @@ components:
           - preview_only
         rail:
           type: string
+          enum:
+          - onchain
         reason:
           type: string
         recipient:
@@ -4716,8 +4853,10 @@ components:
         amount_sats:
           type: integer
           format: int64
+          minimum: 1
+          maximum: 2100000000000000
         payload:
-          type: string
+          $ref: '#/components/schemas/PayableBip21Payload'
         qr_svg:
           type: string
         safety:
