@@ -1,0 +1,272 @@
+{
+  "measured_at_utc": "2026-10-16T00:19:25.397022+00:00",
+  "measured_revision": "80d9c20dbea6a36bee2ade168598400414709334",
+  "working_tree": "Measured crypto/topic production sources and manifests match this revision. Added artifact runners/fixture and router pre-timing assertions are uncommitted; router is not part of this comparison.",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.90GHz",
+    "architecture": "x86_64",
+    "logical_cpus": 4,
+    "cores_per_socket": 2,
+    "threads_per_core": 2,
+    "virtualization": "KVM",
+    "os": "Amazon Linux 2023.12.20260817",
+    "memory_total_kib": 8605868,
+    "cpu_pinning": false
+  },
+  "browser_build": {
+    "architecture": "x86",
+    "bitness": "64",
+    "brands": [
+      {
+        "brand": "Not=A?Brand",
+        "version": "24"
+      },
+      {
+        "brand": "Chromium",
+        "version": "140"
+      }
+    ],
+    "fullVersionList": [
+      {
+        "brand": "Not=A?Brand",
+        "version": "24.0.0.0"
+      },
+      {
+        "brand": "Chromium",
+        "version": "140.0.7339.16"
+      }
+    ],
+    "mobile": false,
+    "platform": "Linux",
+    "platformVersion": ""
+  },
+  "build": {
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1",
+    "cargo": "1.99.1 (5f94df478 2026-08-27)",
+    "clang": "15.0.7 (AWS 15.0.7-3.amzn2023.0.4)",
+    "wasm_bindgen_cli": "0.2.129",
+    "profile": "release (Cargo defaults)",
+    "native_target": "x86_64-unknown-linux-gnu",
+    "wasm_target": "wasm32-unknown-unknown",
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "lowmemory_enabled": false,
+    "wasm_opt": false,
+    "resolved_dependencies": {
+      "canonical_json": [
+        "0.5.0"
+      ],
+      "getrandom": [
+        "0.2.17",
+        "0.3.4",
+        "0.4.3"
+      ],
+      "js-sys": [
+        "0.3.106"
+      ],
+      "rand_core": [
+        "0.6.4",
+        "0.9.5",
+        "0.10.1"
+      ],
+      "secp256k1": [
+        "0.29.1"
+      ],
+      "secp256k1-sys": [
+        "0.10.1"
+      ],
+      "serde": [
+        "1.0.229"
+      ],
+      "serde_json": [
+        "1.0.154"
+      ],
+      "sha2": [
+        "0.10.9"
+      ],
+      "wasm-bindgen": [
+        "0.2.129"
+      ],
+      "web-sys": [
+        "0.3.106"
+      ]
+    }
+  },
+  "sha256": {
+    "Cargo.lock": "7bbddfa0d0fc7691d8ae33a66722e8994e4f5c57b10c4487576bbe1829b604de",
+    "Cargo.toml": "94b7bed511ea2334fc2cb949c471efd15d358d9e997fba3b6fb28aef2fe1d63b",
+    "crates/satspath-pqc/Cargo.toml": "52694fb6bb1b8c67c243ebc421f5a80137b1176191cbf703dce80c42ebbb1e48",
+    "crates/satspath-wasm/Cargo.toml": "6e8b08dec3329747d8a949ec4865ad2cec2ffce6007b11ff2473459ba65a7e40",
+    "crates/satspath-wasm/pkg/satspath_wasm.js": "46054c40b140578216e531ad780ddf821ad0751266ae930a9260e98ba2201bad",
+    "crates/satspath-wasm/pkg/satspath_wasm_bg.wasm": "d980bb60e3aac14d2bc014e4b20b85648c8a5a2d80d8d0edde94be8e18bbe343",
+    "crates/satspath-wasm/src/crypto.rs": "f9cd14dd80e640f34692f757d8a2e31bdff854cc13d27358e815c16e0f61d878",
+    "crates/satspath-wasm/src/topic.rs": "5d4c6d3f91c6568e3bd902470235f0145059666649ffae87733d96bd6e518c0a",
+    "docs/benchmark-results/2026-10-16/browser.html": "5c799519d774809d0f3b96e7bb080c110bdaffd15f190252453f34efa487afe1",
+    "docs/benchmark-results/2026-10-16/fixture.json": "64f6d5462ca41e23dcdc144378f43eaddfea7dcc53cb6d8cc0a83d8a7cb6a270",
+    "docs/benchmark-results/2026-10-16/native.rs": "cc059428211b6fc3d9c76f2d957fa5568148bf3396b89c69e06ad5cf310d8d27",
+    "target/wasm32-unknown-unknown/release/satspath_wasm.wasm": "22d8fca96f64785f0dd12f72ba4e433f07c2385af9dcf062b1092fe6b4a96f1c"
+  },
+  "method": "Seven batch averages per operation after 20 warmup calls. Median of batch averages. Browser includes JS/WASM conversions. No samples removed; build processes finished before timing. Commands and reproduction harnesses in README.md.",
+  "native": {
+    "correctness_checks": "passed: canonical bytes, sign/verify round trip, tampered and malformed rejection, SHA-256 topic vector",
+    "operations": {
+      "canonical_profile_json": {
+        "elapsed_ns": [
+          47703960,
+          47431044,
+          47420529,
+          47573534,
+          47574048,
+          47295164,
+          47594730
+        ],
+        "iterations_per_sample": 2000
+      },
+      "sign_profile_json": {
+        "elapsed_ns": [
+          113599014,
+          113053200,
+          113142533,
+          117085106,
+          114174786,
+          113662704,
+          105307495
+        ],
+        "iterations_per_sample": 500
+      },
+      "topic_for_alias": {
+        "elapsed_ns": [
+          829409,
+          851725,
+          803182,
+          794046,
+          817876,
+          821534,
+          793049
+        ],
+        "iterations_per_sample": 5000
+      },
+      "verify_signed_profile": {
+        "elapsed_ns": [
+          42642966,
+          42243875,
+          42442196,
+          43544622,
+          41929914,
+          42310111,
+          42161684
+        ],
+        "iterations_per_sample": 500
+      }
+    },
+    "warmup_iterations_per_operation": 20
+  },
+  "wasm": {
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "correctness_checks": "passed: canonical bytes, sign/verify round trip, tampered and malformed rejection, SHA-256 topic vector",
+    "warmup_iterations_per_operation": 20,
+    "operations": {
+      "canonical_profile_json": {
+        "iterations_per_sample": 2000,
+        "elapsed_ms": [
+          81.29999999998836,
+          70.59999999997672,
+          70.30000000004657,
+          68.79999999998836,
+          69.20000000001164,
+          68.79999999998836,
+          68.5
+        ]
+      },
+      "sign_profile_json": {
+        "iterations_per_sample": 500,
+        "elapsed_ms": [
+          280.5999999999767,
+          277.20000000001164,
+          273.20000000001164,
+          270.29999999998836,
+          268.79999999998836,
+          268.80000000004657,
+          268.29999999998836
+        ]
+      },
+      "verify_signed_profile": {
+        "iterations_per_sample": 500,
+        "elapsed_ms": [
+          306.69999999995343,
+          308.20000000001164,
+          379.79999999998836,
+          205.80000000004657,
+          265.8999999999651,
+          302.29999999998836,
+          305.70000000001164
+        ]
+      },
+      "topic_for_alias": {
+        "iterations_per_sample": 5000,
+        "elapsed_ms": [
+          11.399999999965075,
+          8.400000000023283,
+          8.099999999976717,
+          8.300000000046566,
+          7.699999999953434,
+          7.400000000023283,
+          7.2999999999883585
+        ]
+      }
+    }
+  },
+  "summary": {
+    "canonical_profile_json": {
+      "native_median_us": 23.786767,
+      "wasm_median_us": 34.60000000000582,
+      "wasm_divided_by_native": 1.4545902770227588
+    },
+    "sign_profile_json": {
+      "native_median_us": 227.198028,
+      "wasm_median_us": 540.5999999999767,
+      "wasm_divided_by_native": 2.3794220608287002
+    },
+    "topic_for_alias": {
+      "native_median_us": 0.1635752,
+      "wasm_median_us": 1.6199999999953434,
+      "wasm_divided_by_native": 9.903701783615997
+    },
+    "verify_signed_profile": {
+      "native_median_us": 84.620222,
+      "wasm_median_us": 611.4000000000233,
+      "wasm_divided_by_native": 7.225223304188724
+    }
+  },
+  "original_table": {
+    "source_revision": "80d9c20dbea6a36bee2ade168598400414709334",
+    "status": "unverified; this revision introduced the table but is not known to be its measured revision",
+    "measured_revision": null,
+    "hardware": null,
+    "browser_build": null,
+    "raw_samples": null,
+    "correctness_checks": "not recorded",
+    "figures_us": {
+      "canonical_profile_json": {
+        "native": 4.8,
+        "wasm": 9.5,
+        "rounded_ratio": 2.0
+      },
+      "sign_profile": {
+        "native": 38.5,
+        "wasm": 145,
+        "rounded_ratio": 3.8
+      },
+      "verify_signed_profile": {
+        "native": 44.2,
+        "wasm": 160,
+        "rounded_ratio": 3.6
+      },
+      "topic_for_alias": {
+        "native": 0.35,
+        "wasm": 0.9,
+        "rounded_ratio": 2.6
+      }
+    }
+  }
+}

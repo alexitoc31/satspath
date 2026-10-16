@@ -44,4 +44,9 @@ mockito = "1"
 secp256k1 = { workspace = true }
 bitcoin = { workspace = true }
 async-trait = "0.1"
+criterion = "0.8.2"
 proptest = "1.5"
+
+[[bench]]
+name = "router_benches"
+harness = false
