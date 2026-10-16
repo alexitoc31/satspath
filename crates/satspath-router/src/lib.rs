@@ -14,6 +14,7 @@ pub mod scoring;
 pub mod silent_payments;
 pub mod split_payments;
 pub mod urgency;
+pub mod wallet_executor;
 
 pub use ark::{
     first_ark_method, is_ark_available, verify_ark_vtxo_dag, ArkAspInfo, ArkBoardingHandoff,
@@ -47,7 +48,8 @@ pub use key_rotation::{
 };
 pub use lightning::{
     fetch_invoice, fetch_lnurl_metadata, is_lightning_available_for_amount_sync,
-    validate_bolt11_invoice, LnurlPayMetadata, ValidatedInvoice,
+    validate_bolt11_invoice, validate_bolt11_invoice_for_network, LnurlPayMetadata,
+    ValidatedInvoice,
 };
 pub use priority::{select_priority_route, PriorityDecision};
 pub use quote_response::{
@@ -75,3 +77,9 @@ pub use split_payments::{
     SplitPaymentRoutingRequest, SplitPaymentRoutingResult,
 };
 pub use urgency::PaymentUrgency;
+pub use wallet_executor::{
+    execute_quote_handoff, BdkHostWallet, BdkOnchainBridge, BdkUtxoDescriptor,
+    BoltzHostSignerBroadcaster, BoltzSwapEvidence, BoltzTestnetSwapBridge, HandoffExecutionReceipt,
+    HandoffTransparencyEvidence, HandoffTrust, HostWalletSdkBridge, LdkHostNode,
+    LdkLightningBridge,
+};

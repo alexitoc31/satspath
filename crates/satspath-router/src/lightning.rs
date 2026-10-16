@@ -351,24 +351,46 @@ async fn fetch_invoice_internal(
     Ok(bolt11)
 }
 
-/// Decode a BOLT11 invoice and validate its amount and expiry.
+/// Decode a BOLT11 invoice and validate its amount and expiry for LNURL-02 compliance on mainnet.
 ///
 /// Returns an error if:
 /// - The invoice is unparseable.
-/// - The invoice amount does not match `expected_msats`.
-/// - The invoice has expired.
+/// - The amount does not match `expected_msats`.
+/// - The invoice is expired.
+/// - Private key material is detected.
+/// - Signature is invalid (enforced by `Bolt11Invoice::from_str`).
 pub fn validate_bolt11_invoice(
     bolt11: &str,
     expected_msats: u64,
+) -> anyhow::Result<ValidatedInvoice> {
+    validate_bolt11_invoice_for_network(bolt11, expected_msats, Some(bitcoin::Network::Bitcoin))
+}
+
+/// Validate a decoded BOLT11 invoice string for a specific expected network (or any valid network if `None`).
+///
+/// Enforces:
+/// - Exact amount match with `expected_msats`
+/// - Not expired
+/// - Network match (if `expected_network` is Some)
+/// - Signature is valid (enforced by `Bolt11Invoice::from_str`)
+pub fn validate_bolt11_invoice_for_network(
+    bolt11: &str,
+    expected_msats: u64,
+    expected_network: Option<bitcoin::Network>,
 ) -> anyhow::Result<ValidatedInvoice> {
     let invoice = Bolt11Invoice::from_str(bolt11)
         .map_err(|e| anyhow::anyhow!("failed to parse BOLT11 invoice: {e:?}"))?;
 
     if expected_msats == 0
         || expected_msats > satspath_core::validation::MAX_PREVIEW_AMOUNT_SATS * 1000
-        || invoice.network() != bitcoin::Network::Bitcoin
     {
         anyhow::bail!("invoice network or amount is invalid");
+    }
+
+    if let Some(expected_net) = expected_network {
+        if invoice.network() != expected_net {
+            anyhow::bail!("invoice network or amount is invalid");
+        }
     }
     // LNURL-02: verify amount matches
     let invoice_msats = invoice

@@ -15,6 +15,7 @@ wasm = ["satspath-core/wasm", "getrandom/js", "web-sys/Request", "web-sys/Respon
 [dependencies]
 satspath-core = { path = "../satspath-core" }
 satspath-handoff = { path = "../satspath-handoff" }
+async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -38,6 +39,7 @@ getrandom = { version = "0.2", features = ["js"], optional = true }
 web-sys = { version = "0.3", features = ["Request", "Response", "Headers", "Window", "RequestInit", "RequestMode"], optional = true }
 
 [dev-dependencies]
+tempfile = "3"
 mockito = "1"
 secp256k1 = { workspace = true }
 bitcoin = { workspace = true }

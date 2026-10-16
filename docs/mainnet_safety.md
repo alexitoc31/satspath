@@ -28,6 +28,7 @@
 | **Silent Payments (BIP-352) Primitives** | **Experimental** (Public operations checked against projections of 28 official vector groups; wallet interoperability unverified) | SatsPath (public routing/detection); host wallet (ECDH, private derivation, signing) |
 | **Mainnet Ark Receive Pointer Discovery** | **Supported (Preview)** (Live ASP `/v1/info` client, VTXO DAG verification, and Boarding/Forfeit/OOR handoff builders) | SatsPath (Router) |
 | **Wallet Handoff Generation (URIs, QR codes)** | **Supported** | SatsPath (Router / CLI) |
+| **Non-Custodial Host-Wallet SDK Bridges (`WalletExecutor`)** | **Supported** for BDK/LDK; quote execution requires current local state, SMT and log proofs, a pinned checkpoint, a nonzero witness quorum, and independent gossip evidence. Legacy Boltz P2WSH claims/refunds support **Testnet/Regtest only** with authenticated host-provided swap terms and confirmed unspent lockup evidence; Mainnet, Taproot and cross-chain execution remain disabled (`crates/satspath-router/src/wallet_executor.rs`) | Host Wallet Signs & Broadcasts |
 | **Mainnet Payment Execution by SatsPath** | **Unsupported / Out of Scope** | **Host Wallet Only** |
 | **Transaction Signing (PSBT / Schnorr / ECDSA)** | **Unsupported / Out of Scope** | **Host Wallet Only** |
 | **Mempool Transaction Broadcast** | **Unsupported / Out of Scope** | **Host Wallet Only** |
@@ -44,7 +45,7 @@ SatsPath operates strictly on **public payment data** to generate wallet handoff
 2. **Verify:** Validates cryptographic signatures, sequence freshness, and expiration.
 3. **Route:** Evaluates fees and policies across available receiving methods.
 4. **Handoff:** Formats the selected method into a wallet handoff payload (`bitcoin:` URI, BOLT11 invoice, experimental BOLT12 structure, Ark pointer, or QR code), subject to the capability-specific maturity and interoperability limits documented above.
-5. **Execution:** The host wallet scans or receives the handoff payload, prompts the user for confirmation, signs with the user's spending key, and broadcasts to the Bitcoin or Lightning network.
+5. **Execution:** The host wallet scans or receives the handoff payload (or integrates via `WalletExecutor` / `HostWalletSdkBridge`), prompts the user for confirmation, signs with the user's spending key, and broadcasts to the Bitcoin or Lightning network.
 
 Safe CLI preview commands:
 
@@ -98,3 +99,9 @@ derivation, and `SilentPayment` session APIs have been removed. Integrations mus
 perform those operations within their host wallet and supply only public data to
 the router. Public ECDH points are not proofs of correct wallet computation;
 the host wallet must verify final outputs before signing.
+
+## Wallet bridge integration requirements
+
+`execute_quote_handoff` accepts host-configured `HandoffTrust` and fresh `HandoffTransparencyEvidence`. Bootstrap its `CheckpointStore` from a trusted checkpoint out of band, keep the pin directory under a single process owner, and reuse the trust instance across calls. Obtain witness and observer keys independently of the quote. Missing evidence, absent/revoked state, rollback, inconsistent extensions, and conflicting observed checkpoints fail before wallet dispatch. An observer ahead of the local log requires synchronization first. Gossip only detects views actually observed; it cannot prove that undisclosed forks do not exist.
+
+`BoltzHostSignerBroadcaster::swap_evidence` must load the wallet’s authenticated saved swap agreement and query its trusted node for the configured network, lockup confirmations, unspent status, and tip height. The bridge validates the full legacy Boltz witness script, funding transaction/output, destination and bounded fee, preimage or block-height CLTV, and the host’s low-S SIGHASH_ALL signature. Spending keys remain inside the host. A `SwapSettlement` receipt acknowledges broadcast of the verified transaction; it does not claim on-chain confirmation.
