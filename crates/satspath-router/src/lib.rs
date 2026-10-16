@@ -15,9 +15,16 @@ pub mod silent_payments;
 pub mod split_payments;
 pub mod urgency;
 
+pub use ark::{
+    first_ark_method, is_ark_available, verify_ark_vtxo_dag, ArkAspInfo, ArkBoardingHandoff,
+    ArkClient, ArkFeeSchedule, ArkForfeitHandoff, ArkIntent, ArkNetwork, ArkOorPaymentRequest,
+    ArkRegisterIntentRequest, ArkRegisterIntentResponse, ArkRoundSubmissionReceipt,
+    ArkSettlementHandoff, ArkSettlementSubmission, ArkSettlementSubmissionResponse,
+    ArkSubmitTxRequest, ArkSubmitTxResponse, ArkVtxoTreeNode, LiveArkAspClient, MockArkClient,
+    SimulatedArkIntent,
+};
 #[cfg(test)]
 mod lightning_tests;
-
 pub use ark_routes::{plan_ark_route, ArkRoutePlan, SenderCapabilities};
 pub use bip353_preview::quote_from_bip353_resolution;
 pub use bolt12::{

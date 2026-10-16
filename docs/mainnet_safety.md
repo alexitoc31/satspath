@@ -26,7 +26,7 @@
 | **BOLT12 Handling & Blinded Paths** | **Supported** (Checksumless BOLT12 decoding, all-TLV Merkle signing, BOLT #4 blinded paths, and CLN/LDK onion message `invoice_request` interoperability) | SatsPath (Router) |
 | **Mainnet On-Chain Address Discovery (BIP-21)** | **Supported** | SatsPath (Router) |
 | **Silent Payments (BIP-352) Primitives** | **Experimental** (Public operations checked against projections of 28 official vector groups; wallet interoperability unverified) | SatsPath (public routing/detection); host wallet (ECDH, private derivation, signing) |
-| **Mainnet Ark Receive Pointer Discovery** | **Supported (Preview)** | SatsPath (Router) |
+| **Mainnet Ark Receive Pointer Discovery** | **Supported (Preview)** (Live ASP `/v1/info` client, VTXO DAG verification, and Boarding/Forfeit/OOR handoff builders) | SatsPath (Router) |
 | **Wallet Handoff Generation (URIs, QR codes)** | **Supported** | SatsPath (Router / CLI) |
 | **Mainnet Payment Execution by SatsPath** | **Unsupported / Out of Scope** | **Host Wallet Only** |
 | **Transaction Signing (PSBT / Schnorr / ECDSA)** | **Unsupported / Out of Scope** | **Host Wallet Only** |
