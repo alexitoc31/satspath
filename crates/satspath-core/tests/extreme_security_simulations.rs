@@ -229,7 +229,8 @@ fn test_pqc_required_succeeds_with_valid_hybrid_signature_and_rejects_tampering(
 async fn test_attack_dns_spoofing() {
     println!("✅ SETUP: Analyzing DNS BIP-353 Resolver configuration...");
 
-    let resolver = Bip353Resolver::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let resolver = Bip353Resolver::new(tmp.path());
 
     // ATTACK 11: DNS Spoofing
     println!(

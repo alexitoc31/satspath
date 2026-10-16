@@ -66,21 +66,25 @@ malicious resolver.
 
 | Mode               | Behavior                                                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| `Strict` (default) | Require cryptographic DNSSEC chain validation; **fail closed** otherwise. Never trusts upstream DoH `AD=true` flags alone.     |
+| `Strict` (default) | Require local cryptographic DNSSEC chain validation; **fail closed** otherwise. Never trusts upstream DoH `AD=true` flags alone. |
 | `DevInsecure`      | Local testing only. Accept unvalidated records with loud warnings. Never the default; requires `--allow-insecure-dns-for-dev`. |
 
-### Current Status & Embedded DNSSEC Validator Requirements
+### Embedded Local DNSSEC Validation Engine (`HickoryDnssecTxtResolver` & `verify_dnssec_zone_chain`)
 
-Following the revert of PR #146 (which relied on unverified DoH `AD` bits), `DnssecPolicy::Strict` intentionally **fails closed** whenever full cryptographic DNSSEC chain validation is unavailable:
+SatsPath ships an embedded local DNSSEC cryptographic validation engine in `crates/satspath-core/src/resolvers/bip353.rs`:
 
-1. **No Trust in Upstream `AD` Flags:** An upstream DNS-over-HTTPS resolver setting `AD: true` in JSON is not cryptographic proof of DNSSEC validity.
-2. **No Synthetic Profile Fabrication:** A BIP-353 DNS lookup must never fabricate a synthetic `SignedPaymentProfile` signed by an ephemeral throwaway key.
-3. **Embedded DNSSEC Chain Validator Requirements (Issue #152):**
-   - Bootstrap `satspath-core` from the current official [IANA root trust anchors](https://www.iana.org/dnssec/files), authenticating the published anchor data and its detached signature against independently provisioned IANA verification material. Key tags (such as `20326` and `38696`) identify keys; they are not a permanent allowlist or sufficient authentication by themselves.
-   - Track IANA rollover announcements and refresh the authenticated anchor set regularly. Before a rollover, distribute the successor KSK through a reviewed release/configuration update, or use RFC 5011 automated trust-anchor maintenance with durable state and its required add hold-down period. Keep the current and accepted successor anchors during the overlap so either valid chain can verify.
-   - Retire a superseded anchor only after the authenticated IANA retirement schedule and rollover completion have been confirmed, or after RFC 5011 revocation/removal processing and its hold-down periods have completed. Persist accepted additions and removals across restarts, test validation through the successor before retirement, and alert on stale anchor data or failed updates. Never accept an unauthenticated replacement or disable DNSSEC on update failure; retain still-valid trusted anchors and fail closed when no valid chain remains.
-   - Perform in-process RFC 4034 / RFC 4035 verification of `DNSKEY`, `RRSIG`, and `DS` records from `.` → TLD → `<domain>` down to the target `<user>.user._bitcoin-payment.<domain>` `TXT` RRset.
-   - Verify canonical DNS wire-format RRset sorting, signature inception/expiration windows, and cryptographic signatures (RSA-SHA256 Alg 8, ECDSA P-256/P-384 Alg 13/14, Ed25519 Alg 15).
+1. **Bundled Root Trust Anchors (`root_trust_anchors()`):**
+   - Explicitly bundles and verifies the active ICANN Root KSK (key tag `38696`), while inheriting historical and standby root keys (`19036` and `20326`) from Hickory's default `TrustAnchor`.
+   - Verifies that the decoded RSA public key matches RFC 4034 key tag `38696` at initialization.
+   - Follows IANA trust-anchor guidance: key tags identify keys and are checked alongside full cryptographic key data; during rollovers both active and accepted successor anchors verify valid chains.
+2. **Cryptographic Chain Verification (`verify_dnssec_zone_chain` & `DnssecDnsHandle`):**
+   - Performs in-process RFC 4034 / RFC 4035 verification of `DNSKEY`, `RRSIG`, and `DS` records across the entire zone hierarchy (`.` → TLD → `<domain>` down to the leaf `TXT` RRset).
+   - Unsigned zones (missing `DS` or `RRSIG`) fail closed with `SatsPathError::DnssecUnavailable`.
+   - Tampered or expired `RRSIG` signatures and mismatched `DS` digests fail closed with `SatsPathError::NetworkError`.
+   - Verifies canonical DNS wire-format RRset sorting, signature inception/expiration windows, and cryptographic signatures (RSA-SHA256 Alg 8, ECDSA P-256/P-384 Alg 13/14, Ed25519 Alg 15).
+3. **Profile Resolution Separation (`Bip353Resolver::resolve_alias`):**
+   - A DNS `bitcoin:` instruction without an authenticated `sp-profile` pointer returns `SatsPathError::Bip353Unauthenticated` and never fabricates a synthetic `SignedPaymentProfile`.
+   - When an `sp-profile` pointer is present, it is fetched over an SSRF-protected, IP-pinned HTTPS connection with a 50 KB response bound and verified via `verify_bip353_ownership`.
 
 ## Direct TXT model (Option A)
 
@@ -210,3 +214,23 @@ Payment URI: bitcoin:?lno=...
 Mode: Mainnet Preview
 No funds moved.
 ```
+
+### Profile continuity
+
+`Bip353Resolver` persists authenticated `sp-profile` identities in
+`.satspath/bip353-continuity.sqlite3`. Applications with a custom data directory
+must set `with_continuity_dir`; the daemon uses its configured home. Keep this
+file across restarts to retain TOFU pins, sequence counters and revocations.
+Storage errors stop resolution. SQLite serializes concurrent profile updates.
+
+A numbered profile must advance the stored sequence on each acceptance; equal
+or lower counters and removal of an existing counter are rejected. As in the
+local registry, legacy profiles without counters remain compatible until a
+counter is adopted. Key changes require the registry's authenticated rotation or
+recovery proof. An authenticated revocation persists as a terminal tombstone,
+including when subsequent DNS or HTTP requests would fail.
+
+HTTP profile fetches validate public payment metadata and reject private material
+before it can be returned or persisted. Custom DNS server configurations reject
+private and reserved IP addresses; `HickoryDnssecTxtResolver::with_config` returns
+`Result`. Arbitrary DNS handles are available only in tests or with `test-utils`.

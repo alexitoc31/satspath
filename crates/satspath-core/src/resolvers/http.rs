@@ -31,7 +31,7 @@ pub struct HttpResolver {
 }
 
 impl HttpResolver {
-    /// Construct the resolver with its configured transport policy.
+    /// Construct an HTTP resolver with bounded requests and redirects disabled.
     pub fn new() -> Self {
         Self::with_dns_resolver(Arc::new(SystemDnsResolver))
     }
@@ -84,22 +84,38 @@ impl HttpResolver {
     /// The URL must satisfy all production SSRF constraints unconditionally.
     pub async fn resolve_from_url(&self, url: &str) -> Result<SignedPaymentProfile> {
         validate_url(url, false)?;
-        self.fetch_from_validated_url(url).await
+        let signed = self.fetch_verified_profile(url).await?;
+        if signed.profile.revoked {
+            return Err(SatsPathError::RegistryError(format!(
+                "Alias {} has been revoked",
+                signed.profile.alias
+            )));
+        }
+        Ok(signed)
     }
 
     /// Test-only resolution path for mock servers without production SSRF checks.
-    #[cfg(test)]
-    pub(crate) async fn resolve_from_mock_url(&self, url: &str) -> Result<SignedPaymentProfile> {
-        self.fetch_from_validated_url(url).await
+    #[doc(hidden)]
+    pub async fn resolve_from_mock_url(&self, url: &str) -> Result<SignedPaymentProfile> {
+        let signed = self.fetch_verified_profile(url).await?;
+        if signed.profile.revoked {
+            return Err(SatsPathError::RegistryError(format!(
+                "Alias {} has been revoked",
+                signed.profile.alias
+            )));
+        }
+        Ok(signed)
     }
 
     /// Construct a resolver with a custom HTTP client (for test dependency injection).
     #[cfg(test)]
-    pub(crate) fn with_client(client: Client) -> Self {
+    pub(crate) fn with_client(client: reqwest::Client) -> Self {
         Self { client }
     }
 
-    async fn fetch_from_validated_url(&self, url: &str) -> Result<SignedPaymentProfile> {
+    /// Fetch authenticated public metadata, retaining revocations for continuity storage.
+    /// Callers must reject revoked profiles before returning them to routing.
+    pub(crate) async fn fetch_verified_profile(&self, url: &str) -> Result<SignedPaymentProfile> {
         let mut resp = self.client.get(url).send().await.map_err(|e| {
             SatsPathError::NetworkError(format!("Failed to connect to {}: {}", url, e))
         })?;
@@ -142,13 +158,12 @@ impl HttpResolver {
         // SEC-01: enforce expiry — fail closed.
         check_profile_expiry(&signed.profile)?;
 
-        // Enforce revocation — fail closed. Revoked profiles must never be returned to callers.
-        if signed.profile.revoked {
-            return Err(SatsPathError::RegistryError(format!(
-                "Alias {} has been revoked",
-                signed.profile.alias
-            )));
-        }
+        crate::validation::validate_public_profile(&signed.profile)?;
+        let canonical = crate::crypto::canonical_profile_bytes(&signed.profile)?;
+        crate::validation::assert_no_private_material(
+            std::str::from_utf8(&canonical)
+                .map_err(|e| SatsPathError::SerializationError(e.to_string()))?,
+        )?;
 
         Ok(signed)
     }

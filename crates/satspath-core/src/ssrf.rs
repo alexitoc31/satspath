@@ -290,6 +290,100 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
     false
 }
 
+/// Builds a reqwest client pinned to the pre-validated IP address of `url`.
+#[cfg(feature = "std")]
+pub async fn build_pinned_http_client(
+    url: &str,
+    timeout: std::time::Duration,
+    allow_http: bool,
+) -> Result<reqwest::Client> {
+    validate_url(url, allow_http)?;
+    let parsed = url::Url::parse(url)
+        .map_err(|e| SatsPathError::ValidationError(format!("Invalid URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| SatsPathError::ValidationError("URL has no host".to_string()))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    let ip_str = host.trim_start_matches('[').trim_end_matches(']');
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+        if is_private_or_reserved_ip(ip) {
+            return Err(SatsPathError::ValidationError(format!(
+                "Blocked IP: {ip} (private/reserved range)"
+            )));
+        }
+    } else {
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| {
+                SatsPathError::NetworkError(format!("DNS resolution failed for {host}: {e}"))
+            })?
+            .collect();
+        if addrs.is_empty() {
+            return Err(SatsPathError::NetworkError(format!(
+                "DNS resolution returned no addresses for {host}"
+            )));
+        }
+        for addr in &addrs {
+            if is_private_or_reserved_ip(addr.ip()) {
+                return Err(SatsPathError::ValidationError(format!(
+                    "Blocked resolved IP for {host}: {} (private/reserved range)",
+                    addr.ip()
+                )));
+            }
+        }
+        builder = pin_http_host(builder, &parsed, &addrs);
+    }
+
+    builder
+        .build()
+        .map_err(|e| SatsPathError::NetworkError(e.to_string()))
+}
+
+/// Key the override by the exact URL host reqwest will resolve, including a final dot.
+#[cfg(feature = "std")]
+fn pin_http_host(
+    builder: reqwest::ClientBuilder,
+    url: &url::Url,
+    addrs: &[std::net::SocketAddr],
+) -> reqwest::ClientBuilder {
+    builder.resolve_to_addrs(url.host_str().expect("validated URL has a host"), addrs)
+}
+
+/// Read an HTTP response body up to `max_bytes`, failing closed if the stream exceeds the bound.
+#[cfg(feature = "std")]
+pub async fn read_bounded_response(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            return Err(SatsPathError::NetworkError(format!(
+                "Response content-length ({len} bytes) exceeds limit of {max_bytes} bytes"
+            )));
+        }
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| SatsPathError::NetworkError(format!("Error reading response stream: {e}")))?
+    {
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(SatsPathError::NetworkError(format!(
+                "Response payload exceeded size limit of {max_bytes} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
