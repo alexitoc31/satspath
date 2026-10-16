@@ -15,8 +15,8 @@
 | `satspath-core`   | Types, crypto, resolvers, registry, profile signing | `PaymentMethod`, `SignedPaymentProfile`, `ChainResolver`, `Registry` |
 | `satspath-router` | Rail selection logic                                | `quote()`, `select_route()`, `RouteQuote`, `FeeEstimate`             |
 | `satspath-cli`    | CLI: `init`, `register`, `quote`, `pay`, `preview`  | —                                                                    |
-| `satspathd`       | HTTP daemon (`/v1/quote`, `/v1/pay`, `/v1/resolve`) | —                                                                    |
-| `satspath-wasm`   | WASM bindings (crypto only today)                   | `verify_signed_profile`, `canonical_profile_json`, `topic_for_alias` |
+| `satspathd`       | Authoritative HTTP/TLS daemon (`/v2/resolve`, `/v1/quote`, `/metrics`, `/health`) | `handlers/`, `rate_limit`, `telemetry/`, `p2p.rs` |
+| `satspath-wasm`   | Browser/PWA WASM bindings (crypto + resolver chain + multi-rail router) | `quote`, `ChainResolver.resolve_alias`, `verify_signed_profile`, `canonical_profile_json`, `topic_for_alias` |
 
 ### Arkade SDK (TypeScript) — Existing Components
 
@@ -29,7 +29,7 @@
 
 ## Integration Strategy: WASM Bindings
 
-Extend `satspath-wasm` to expose **resolver chain + router** to TypeScript. Arkade wallet calls:
+`satspath-wasm` already exposes **resolver chain + router** to TypeScript via `quote` and `ChainResolver.resolve_alias` (a class method, not a free function). Arkade wallet calls:
 
 ```typescript
 const quote = await satspath.quote("Truja@sexo.ya", 21000n);
@@ -50,8 +50,8 @@ const quote = await satspath.quote("Truja@sexo.ya", 21000n);
 
 1. Add `wasm` feature flags to `satspath-core` and `satspath-router` (remove `tokio`/`reqwest` dependencies)
 2. Create WASM-compatible resolver implementations using `web-sys` fetch
-3. Export `quote()`, `verify_signed_profile()`, `ChainResolver`, `Registry` from `satspath-wasm`
-4. Add `fingerprint_pubkey()`, `mask_identifier()` helpers
+3. **Completed:** Export `quote()`, `verify_signed_profile()`, and `ChainResolver` with `resolve_alias()`. The registry export is `LocalRegistry`, not `Registry`.
+4. **Completed:** Add `fingerprint_pubkey()` and `mask_identifier()` helpers
 
 **Files to modify**:
 
@@ -347,7 +347,7 @@ arkade-wallet/
 1. **Approve plan** → proceed to implementation
 2. **Phase 1**: Add `wasm` feature flags to `satspath-core` and `satspath-router`
 3. **Phase 1**: Implement `WasmChainResolver` in `satspath-wasm`
-4. **Phase 1**: Export `quote()` and router types from `satspath-wasm`
+4. **Phase 1 (completed)**: Export `quote()`, `ChainResolver.resolve_alias()`, and router types from `satspath-wasm`
 5. **Phase 2**: `wasm-pack build` → verify TypeScript imports
 6. **Phase 3**: Build Arkade wallet `satspath.ts` service
 7. **Phase 4**: Wire UI components

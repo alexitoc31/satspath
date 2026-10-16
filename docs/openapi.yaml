@@ -1,0 +1,654 @@
+openapi: 3.0.3
+info:
+  title: SatsPath Daemon API (satspathd)
+  version: 0.2.0
+  description: >-
+    Non-custodial Bitcoin payment discovery, S2S v2 Key Transparency, Sparse
+    Merkle state map proofs, and multi-rail routing API.
+servers:
+  - url: https://localhost:9737
+    description: Local or TLS-terminated satspathd instance
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    Offset:
+      name: offset
+      in: query
+      schema: {type: integer, minimum: 0, default: 0}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+  headers:
+    X-Request-ID:
+      description: Correlation UUID for structured request tracing
+      schema:
+        type: string
+    Retry-After:
+      description: Seconds to wait before retrying after HTTP 429
+      schema:
+        type: integer
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    QuoteRequest:
+      type: object
+      required: [recipient, amount_sats]
+      properties:
+        recipient:
+          type: string
+          example: alice@satspath.dev
+        amount_sats:
+          type: integer
+          minimum: 1
+          example: 21000
+    QuoteResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, not_registered, no_route, invalid_signature]
+        qr:
+          type: string
+        fee_sats:
+          type: integer
+          nullable: true
+        eta:
+          type: string
+          nullable: true
+        reason:
+          type: string
+    ResolutionRequest:
+      type: object
+      required: [identifier]
+      properties:
+        identifier: {type: string}
+        pinned_tree_size: {type: integer, minimum: 0, description: Currently ignored by the handler}
+        include_history: {type: boolean, default: false, description: Currently ignored by the handler}
+    AliasRequest:
+      type: object
+      required: [alias]
+      properties:
+        alias: {type: string, example: alice@example.com}
+    DnsResolveRequest:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, example: "₿alice@example.com"}
+        allow_insecure_dns_for_dev: {type: boolean, default: false}
+    VerifyRequest:
+      type: object
+      required: [alias, token]
+      properties:
+        alias: {type: string}
+        token: {type: string}
+    ProfileUpdateRequest:
+      type: object
+      description: >-
+        Local profile registration/update after alias verification. The daemon signs
+        the profile; this operation does not accept a SignedPaymentProfile.
+        ark_server and ark_pubkey must be supplied together.
+      properties:
+        alias: {type: string}
+        lightning_address: {type: string}
+        onchain_address: {type: string}
+        onchain_pubkey: {type: string}
+        ark_server: {type: string}
+        ark_pubkey: {type: string}
+        remove_methods:
+          type: array
+          items: {type: string, enum: [lightning, onchain, ark]}
+        recovery_policy:
+          $ref: "#/components/schemas/RecoveryPolicy"
+    RecoveryPolicy:
+      type: object
+      required: [threshold, guardians]
+      properties:
+        version: {type: integer, enum: [1], default: 1}
+        threshold: {type: integer, minimum: 1, maximum: 32}
+        guardians:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items: {type: string, description: Compressed secp256k1 public key hex}
+    KeyRotation:
+      type: object
+      description: Generated locally by the bodyless rotate-key operation.
+      required: [version, identifier_hash, previous_pubkey, new_pubkey, previous_event_hash, sequence, rotated_at, authorization_signature, acceptance_signature]
+      properties:
+        version: {type: integer, enum: [1]}
+        identifier_hash: {type: string}
+        previous_pubkey: {type: string}
+        new_pubkey: {type: string}
+        previous_event_hash: {type: string}
+        sequence: {type: integer, minimum: 1}
+        rotated_at: {type: integer, format: int64}
+        authorization_signature: {type: string, description: Old key Schnorr authorization signature hex}
+        acceptance_signature: {type: string, description: New key Schnorr acceptance signature hex}
+    KeyRecoveryProof:
+      type: object
+      required: [identifier_hash, previous_pubkey, new_pubkey, previous_event_hash, sequence, guardian_signatures, acceptance_signature, recovered_at]
+      properties:
+        version: {type: integer, enum: [1], default: 1}
+        identifier_hash: {type: string}
+        previous_pubkey: {type: string}
+        new_pubkey: {type: string}
+        previous_event_hash: {type: string}
+        sequence: {type: integer, minimum: 1}
+        recovered_at: {type: integer, format: int64}
+        guardian_signatures:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [guardian_pubkey, signature]
+            properties:
+              guardian_pubkey: {type: string}
+              signature: {type: string, description: Guardian Schnorr authorization signature hex}
+        acceptance_signature: {type: string, description: New key Schnorr acceptance signature hex}
+    PaymentProfile:
+      type: object
+      required: [alias, identity_pubkey, methods, updated_at]
+      properties:
+        alias: {type: string}
+        identity_pubkey: {type: string, description: Compressed secp256k1 public key hex}
+        methods:
+          type: array
+          items:
+            type: object
+            required: [type, label]
+            description: PaymentMethod from satspath-core/src/profile.rs; variant-specific public receive fields.
+            properties:
+              type: {type: string, enum: [Lightning, Onchain, Ark, Bolt12]}
+              label: {type: string}
+        updated_at: {type: integer, format: int64}
+        expires_at: {type: integer, format: int64}
+        sequence: {type: integer, minimum: 1}
+        preferences: {type: array, items: {type: string}}
+        nonce: {type: string}
+        rotation:
+          $ref: "#/components/schemas/KeyRotation"
+        method_verifications: {type: array, items: {type: object}}
+        hybrid_pubkey: {type: object}
+        pqc_required: {type: boolean, default: false}
+        revoked: {type: boolean, default: false}
+        recovery_policy:
+          $ref: "#/components/schemas/RecoveryPolicy"
+        recovery:
+          $ref: "#/components/schemas/KeyRecoveryProof"
+    SignedPaymentProfile:
+      type: object
+      required: [profile, signature]
+      properties:
+        profile:
+          $ref: "#/components/schemas/PaymentProfile"
+        signature:
+          type: string
+          description: BIP-340 hex signature over SHA256(SatsPathProfileV1 || RFC8785(profile)).
+        hybrid_signature: {type: object}
+    ProfileRecoverRequest:
+      type: object
+      required: [alias, proof, signed_profile]
+      description: >-
+        proof must equal signed_profile.profile.recovery. The recovered profile
+        retains a recovery_policy, has no rotation, and is signed by the new key.
+        Guardian signatures must satisfy the previously committed policy.
+      properties:
+        alias: {type: string}
+        proof:
+          $ref: "#/components/schemas/KeyRecoveryProof"
+        signed_profile:
+          $ref: "#/components/schemas/SignedPaymentProfile"
+        event_created_at:
+          type: integer
+          format: int64
+          description: Required with event_signature; within 300 seconds of server time.
+        event_signature:
+          type: string
+          description: New key signature over the recover_key NameEvent; required if key is not in the local keystore.
+    NamespaceDescriptor:
+      type: object
+      required: [version, domain, log_id, authority_pubkey, endpoint_urls, witness_quorum, witness_pubkeys, valid_from, expires_at, signature]
+      properties:
+        version: {type: integer}
+        domain: {type: string}
+        log_id: {type: string}
+        authority_pubkey: {type: string}
+        endpoint_urls: {type: array, items: {type: string}}
+        witness_quorum: {type: integer}
+        witness_pubkeys: {type: array, items: {type: string}}
+        valid_from: {type: integer, format: int64}
+        expires_at: {type: integer, format: int64}
+        signature: {type: string}
+    NameEvent:
+      type: object
+      required: [version, identifier_hash, action, identity_pubkey, profile_hash, sequence, created_at, owner_signature]
+      properties:
+        version: {type: integer}
+        identifier_hash: {type: string}
+        action: {type: string, enum: [register, update_profile, rotate_key, revoke, recover_key]}
+        identity_pubkey: {type: string}
+        profile_hash: {type: string}
+        sequence: {type: integer, minimum: 1}
+        previous_event_hash: {type: string, nullable: true}
+        created_at: {type: integer, format: int64}
+        identifier_attestation_hash: {type: string, nullable: true}
+        removed_method_hashes: {type: array, items: {type: string}}
+        rotation:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/KeyRotation"
+        recovery_policy:
+          $ref: "#/components/schemas/RecoveryPolicy"
+        recovery:
+          $ref: "#/components/schemas/KeyRecoveryProof"
+        owner_signature: {type: string}
+    MerkleInclusionProof:
+      type: object
+      required: [leaf_index, tree_size, leaf_hash, audit_path, root_hash]
+      properties:
+        leaf_index: {type: integer, minimum: 0}
+        tree_size: {type: integer, minimum: 0}
+        leaf_hash: {type: string}
+        audit_path: {type: array, items: {type: string}}
+        root_hash: {type: string}
+    MerkleConsistencyProof:
+      type: object
+      nullable: true
+      required: [version, old_tree_size, new_tree_size, old_root, new_root, audit_path]
+      properties:
+        version: {type: integer, enum: [1, 2]}
+        old_tree_size: {type: integer, minimum: 0}
+        new_tree_size: {type: integer, minimum: 0}
+        old_root: {type: string}
+        new_root: {type: string}
+        audit_path: {type: array, items: {type: string}}
+    StateMapProof:
+      type: object
+      nullable: true
+      required: [key_hash, value, audit_path]
+      properties:
+        key_hash: {type: string}
+        value:
+          type: object
+          nullable: true
+          required: [latest_event_hash, sequence, status]
+          properties:
+            latest_event_hash: {type: string}
+            sequence: {type: integer, minimum: 1}
+            status: {type: string, enum: [Registered, Revoked]}
+        audit_path: {type: array, items: {type: string}}
+    TransparencyCheckpoint:
+      type: object
+      required: [version, log_id, log_size, log_root, created_at, operator_pubkey, operator_sequence, operator_signature]
+      properties:
+        version: {type: integer}
+        log_id: {type: string}
+        log_size: {type: integer, minimum: 0}
+        log_root: {type: string}
+        map_root: {type: string, nullable: true}
+        previous_checkpoint_hash: {type: string, nullable: true}
+        created_at: {type: integer, format: int64}
+        operator_pubkey: {type: string}
+        operator_sequence: {type: integer, minimum: 0}
+        operator_rotation: {type: object, nullable: true}
+        operator_signature: {type: string}
+        bitcoin_anchor: {type: object, nullable: true}
+    WitnessCosignature:
+      type: object
+      required: [version, witness_id, witness_pubkey, checkpoint_hash, tree_size, timestamp, signature]
+      properties:
+        version: {type: integer}
+        witness_id: {type: string}
+        witness_pubkey: {type: string}
+        checkpoint_hash: {type: string}
+        tree_size: {type: integer, minimum: 0}
+        timestamp: {type: integer, format: int64}
+        signature: {type: string}
+    ResolutionEnvelope:
+      type: object
+      required: [version, identifier, namespace_descriptor, signed_profile, name_events, inclusion_proof, checkpoint, witness_cosignatures, served_at]
+      properties:
+        version: {type: integer}
+        identifier: {type: string}
+        namespace_descriptor:
+          $ref: "#/components/schemas/NamespaceDescriptor"
+        signed_profile:
+          $ref: "#/components/schemas/SignedPaymentProfile"
+        name_events:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameEvent"
+        inclusion_proof:
+          $ref: "#/components/schemas/MerkleInclusionProof"
+        checkpoint:
+          $ref: "#/components/schemas/TransparencyCheckpoint"
+        consistency_proof:
+          $ref: "#/components/schemas/MerkleConsistencyProof"
+        current_state_proof:
+          $ref: "#/components/schemas/StateMapProof"
+        witness_cosignatures:
+          type: array
+          items:
+            $ref: "#/components/schemas/WitnessCosignature"
+        served_at: {type: integer, format: int64}
+security: []
+paths:
+  /health:
+    get:
+      summary: Deep dependency health check
+      responses:
+        "200":
+          description: All critical dependencies healthy
+        "503":
+          description: One or more critical dependencies unhealthy
+  /metrics:
+    get:
+      summary: Prometheus text exposition metrics
+      responses:
+        "200":
+          description: Prometheus metrics payload
+          content:
+            text/plain:
+              schema:
+                type: string
+  /.well-known/satspath-authority:
+    get:
+      summary: S2S v2 Namespace Authority Descriptor
+      responses:
+        "200":
+          description: Signed NamespaceDescriptor JSON
+  /v2/resolve:
+    get:
+      summary: Authoritative S2S v2 identifier resolution with Merkle & StateMap proofs
+      parameters:
+        - name: identifier
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ResolutionEnvelope containing profile, event, inclusion proof, StateMapProof, and checkpoint
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolutionEnvelope"
+        "429":
+          description: Rate limited
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/Retry-After"
+    post:
+      summary: Authoritative S2S v2 identifier resolution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolutionRequest"
+      responses:
+        "200":
+          description: ResolutionEnvelope JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolutionEnvelope"
+  /v1/quote:
+    post:
+      summary: Resolve recipient, verify proofs, and compute optimal payment route handoff
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuoteRequest"
+      responses:
+        "200":
+          description: QuoteResponse JSON contract
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteResponse"
+        "413":
+          description: Payload exceeds 64 KB limit
+        "429":
+          description: Rate limited
+  /v1/transparency/status:
+    get:
+      summary: Current Merkle transparency log and Sparse Merkle state map status
+      responses:
+        "200":
+          description: TransparencyStatus JSON
+  /v1/transparency/catena/chain:
+    get:
+      summary: Catena-style Bitcoin OP_RETURN anchor chain proof
+      responses:
+        "200":
+          description: CatenaChainProof JSON
+  /v1/profile:
+    post:
+      summary: Update local profile methods and sign into the transparency log
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProfileUpdateRequest"
+      responses:
+        "200":
+          description: Profile updated and committed to transparency log
+        "401":
+          description: Missing or invalid Bearer token
+  /v1/resolve:
+    post:
+      summary: Resolve alias through transparency and ownership verification
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AliasRequest"
+      responses:
+        "200":
+          description: ResolvedTransparentProfile JSON
+        "404":
+          description: Alias unavailable or resolution failed
+        "401":
+          description: Missing or invalid Bearer token
+  /v1/preview:
+    post:
+      summary: Preview routing and handoff without moving funds
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuoteRequest"
+      responses:
+        "200":
+          description: PreviewResponse with mode, warnings, and quote
+        "401":
+          description: Missing or invalid Bearer token
+  /v1/dns/resolve:
+    post:
+      summary: Resolve BIP-353 DNS payment instructions under Strict policy by default
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsResolveRequest"
+      responses:
+        "200":
+          description: DnsResolveResponse tagged with status ok or error
+  /v1/profile/rotate-key:
+    post:
+      summary: Generate and dual-sign a key rotation locally
+      description: No request body. The daemon creates the KeyRotation proof and signs the new profile and NameEvent using its local keystore.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: KeyRotationResponse with alias, sequence, fingerprints, event_hash, and checkpoint_hash
+        "401":
+          description: Missing or invalid Bearer token
+  /v1/profile/recover:
+    post:
+      summary: Submit a guardian-authorized key recovery
+      description: Public operation authorized by the committed guardian policy and signed recovery proof.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProfileRecoverRequest"
+      responses:
+        "200":
+          description: KeyRecoveryResponse with alias, sequence, fingerprints, event_hash, and checkpoint_hash
+        "400":
+          description: Invalid recovery proof, signatures, or continuity
+  /v1/health:
+    get:
+      summary: Deep dependency health check
+      responses:
+        "200":
+          description: Dependencies healthy or degraded
+        "503":
+          description: Critical dependency unhealthy
+  /v2/health:
+    get:
+      summary: S2S v2 namespace and transparency health
+      responses:
+        "200":
+          description: Namespace, checkpoint age, log size, and health state
+        "503":
+          description: Transparency log unhealthy
+  /v2/namespace:
+    get:
+      summary: Alias for the well-known namespace authority descriptor
+      responses:
+        "200":
+          description: Signed NamespaceDescriptor JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceDescriptor"
+  /v1/diagnostics/rate_limit:
+    get:
+      summary: RateLimiterStats including tracked_ips, total_allowed, and total_blocked
+      responses:
+        "200":
+          description: Rate limiter statistics JSON
+  /v1/transparency/checkpoints:
+    get:
+      summary: Paginated signed operator checkpoints
+      parameters:
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Object containing items, offset, limit, and total
+  /v1/transparency/events:
+    get:
+      summary: Paginated append-only NameEvent entries
+      parameters:
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Object containing items, offset, limit, and total
+  /v1/transparency/inclusion/{hash}:
+    get:
+      summary: RFC 6962 inclusion proof for an event hash
+      parameters:
+        - name: hash
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: MerkleInclusionProof JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MerkleInclusionProof"
+  /v1/transparency/consistency:
+    get:
+      summary: RFC 6962 consistency proof between two tree sizes
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: {type: integer, minimum: 0}
+        - name: to
+          in: query
+          required: true
+          schema: {type: integer, minimum: 0}
+      responses:
+        "200":
+          description: MerkleConsistencyProof JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MerkleConsistencyProof"
+  /v1/transparency/anchors:
+    post:
+      summary: Anchor latest checkpoint on Bitcoin Core regtest
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Bitcoin anchor receipt
+        "401":
+          description: Missing or invalid Bearer token
+  /v1/control:
+    get:
+      summary: Public local P2P control status
+      responses:
+        "200":
+          description: Identity, Hyperswarm, HTTP, and Nostr status
+  /v1/profile/challenge:
+    post:
+      summary: Create a development mock alias verification challenge
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AliasRequest"
+      responses:
+        "200":
+          description: Challenge ID and mock verification instructions
+  /v1/profile/verify:
+    post:
+      summary: Verify an alias using the development mock verifier
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyRequest"
+      responses:
+        "200":
+          description: ProfileResponse after alias verification

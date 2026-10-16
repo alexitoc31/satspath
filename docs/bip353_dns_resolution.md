@@ -66,14 +66,21 @@ malicious resolver.
 
 | Mode               | Behavior                                                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| `Strict` (default) | Require real DNSSEC validation; **fail closed** otherwise.                                                                     |
+| `Strict` (default) | Require cryptographic DNSSEC chain validation; **fail closed** otherwise. Never trusts upstream DoH `AD=true` flags alone.     |
 | `DevInsecure`      | Local testing only. Accept unvalidated records with loud warnings. Never the default; requires `--allow-insecure-dns-for-dev`. |
 
-This build does not ship a local DNSSEC validator, so `Strict` resolution **fails
-closed** with a clear message (option C of the BIP-353 DNSSEC guidance). A future
-release can plug in a validating resolver without changing the contract. The
-`--allow-insecure-dns-for-dev` flag prints a scary warning and must never be used
-on mainnet.
+### Current Status & Embedded DNSSEC Validator Requirements
+
+Following the revert of PR #146 (which relied on unverified DoH `AD` bits), `DnssecPolicy::Strict` intentionally **fails closed** whenever full cryptographic DNSSEC chain validation is unavailable:
+
+1. **No Trust in Upstream `AD` Flags:** An upstream DNS-over-HTTPS resolver setting `AD: true` in JSON is not cryptographic proof of DNSSEC validity.
+2. **No Synthetic Profile Fabrication:** A BIP-353 DNS lookup must never fabricate a synthetic `SignedPaymentProfile` signed by an ephemeral throwaway key.
+3. **Embedded DNSSEC Chain Validator Requirements (Issue #152):**
+   - Bootstrap `satspath-core` from the current official [IANA root trust anchors](https://www.iana.org/dnssec/files), authenticating the published anchor data and its detached signature against independently provisioned IANA verification material. Key tags (such as `20326` and `38696`) identify keys; they are not a permanent allowlist or sufficient authentication by themselves.
+   - Track IANA rollover announcements and refresh the authenticated anchor set regularly. Before a rollover, distribute the successor KSK through a reviewed release/configuration update, or use RFC 5011 automated trust-anchor maintenance with durable state and its required add hold-down period. Keep the current and accepted successor anchors during the overlap so either valid chain can verify.
+   - Retire a superseded anchor only after the authenticated IANA retirement schedule and rollover completion have been confirmed, or after RFC 5011 revocation/removal processing and its hold-down periods have completed. Persist accepted additions and removals across restarts, test validation through the successor before retirement, and alert on stale anchor data or failed updates. Never accept an unauthenticated replacement or disable DNSSEC on update failure; retain still-valid trusted anchors and fail closed when no valid chain remains.
+   - Perform in-process RFC 4034 / RFC 4035 verification of `DNSKEY`, `RRSIG`, and `DS` records from `.` → TLD → `<domain>` down to the target `<user>.user._bitcoin-payment.<domain>` `TXT` RRset.
+   - Verify canonical DNS wire-format RRset sorting, signature inception/expiration windows, and cryptographic signatures (RSA-SHA256 Alg 8, ECDSA P-256/P-384 Alg 13/14, Ed25519 Alg 15).
 
 ## Direct TXT model (Option A)
 

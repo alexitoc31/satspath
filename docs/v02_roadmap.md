@@ -1,6 +1,6 @@
 # SatsPath: Current Architecture & Roadmap v0.2
 
-This document summarizes the verified implementation status of SatsPath and outlines the engineering roadmap for the v0.2 milestone and future production readiness.
+This document summarizes the verified implementation status of SatsPath on `main` and outlines the remaining engineering milestones for v0.2 production readiness.
 
 ---
 
@@ -8,47 +8,49 @@ This document summarizes the verified implementation status of SatsPath and outl
 
 The current codebase (`crates/`) implements and tests the following capabilities:
 
-* **Core Protocol Specification & Cryptography (IMPLEMENTED):** Canonical JSON serialization (RFC 8785), domain-separated `secp256k1` Schnorr signatures (BIP-340), monotonic sequence tracking, and dual-signed key rotation.
-* **Multi-Transport Resolver Chain (IMPLEMENTED):** Local registry, HTTPS `.well-known/satspath-authority`, and Nostr (NIP-05 and kind 30078).
-* **BIP-353 DNS Resolution (PREVIEW):** Record parsing and strict DNSSEC policy enforcement are implemented. The default DoH backend does not independently validate the DNSSEC chain; Strict mode therefore requires authenticated DNSSEC results and fails closed otherwise.
-* **BOLT12 Handling (EXPERIMENTAL / PARTIAL):** Prototype TLV, offer-handling, and blinded-path primitives exist (`crates/satspath-router/src/bolt12.rs`), but standards-conformant checksumless BOLT12 string decoding, invoice-request construction, Merkle signing, and interoperability with implementations such as Core Lightning and LDK remain incomplete.
-* **Silent Payments BIP-352 (EXPERIMENTAL):** Experimental BIP-352 primitives and address/output construction are implemented (`crates/satspath-router/src/silent_payments.rs`). Standards conformance and mainnet interoperability are not claimed until the official BIP-352 test vectors pass.
-* **Multi-Source Fee Estimation (IMPLEMENTED):** Concurrent queries to Bitcoin Core RPC, Esplora, and Mempool.space with median consensus filtering and decaying cache fallback (`crates/satspath-router/src/fees.rs`).
-* **S2S v2 Transparency & State Map (IMPLEMENTED):** Append-only RFC 6962 Merkle log, signed operator checkpoints, client pin store, and Sparse Merkle state map for non-inclusion proofs (`crates/satspath-core/src/state_map.rs`).
+* **Core Protocol Specification & Cryptography (IMPLEMENTED):** Canonical JSON serialization (RFC 8785), domain-separated `secp256k1` Schnorr signatures (BIP-340), monotonic sequence tracking, dual-signed key rotation, and $M$-of-$N$ guardian key recovery (`crates/satspath-core/src/recovery.rs`).
+* **Multi-Transport Resolver Chain (IMPLEMENTED):** Local registry, HTTPS `.well-known/satspath-authority` (`v2`), and Nostr (NIP-05 and kind `30078`).
+* **S2S v2 Transparency, Sparse Merkle State Map & Catena Anchoring (IMPLEMENTED):**
+  * Append-only RFC 6962 Merkle log with compact `O(log n)` v2 consistency proofs (`crates/satspath-core/src/transparency/tree.rs`).
+  * 256-bit Sparse Merkle Tree (`SparseMerkleTree` in `crates/satspath-core/src/transparency/state_map.rs`) committed via `map_root` in signed checkpoints for cryptographic inclusion and non-inclusion proofs.
+  * Catena-style Bitcoin `OP_RETURN` UTXO anchor chains (`SatsPathCatenaAnchorV1` in `crates/satspath-core/src/transparency/catena.rs`) verified against Bitcoin Core regtest.
+  * Checkpoint gossip and split-view equivocation detection (`crates/satspath-core/src/transparency/gossip.rs`).
+* **Modular Authoritative Daemon & Observability (IMPLEMENTED):**
+  * Refactored `satspathd` architecture (`crates/satspathd/src/handlers/`, `router.rs`, `server.rs`, `rate_limit.rs`, `telemetry/`).
+  * Per-IP token-bucket rate limiting (`HTTP 429` + `Retry-After`) and `64 KB` payload caps (`HTTP 413`).
+  * Prometheus metrics (`/metrics`), structured JSON/pretty request tracing (`X-Request-ID`), and deep dependency health probes (`/health`, `/v1/health`, `/v2/health`).
 * **Witness Quorum Cosigning (IMPLEMENTED):** Standalone witness node daemon (`crates/satspath-witness`) performing $K$-of-$N$ Schnorr cosigning, consistency proof verification, and local rollback/equivocation detection.
-* **Ark Payment Routing (PREVIEW):** Receive pointer parsing and route scoring exist; live Ark ASP VTXO round execution is simulated (`crates/satspath-router/src/ark.rs`).
+* **Multi-Source Fee Estimation (IMPLEMENTED):** Concurrent queries to Bitcoin Core RPC, Esplora, and Mempool.space with median consensus filtering and decaying cache fallback (`crates/satspath-router/src/fees.rs`).
+* **BIP-353 DNS Resolution (PREVIEW):** Record parsing and strict DNSSEC policy enforcement (`DnssecPolicy::Strict`) are implemented, failing closed whenever cryptographic DNSSEC validation is unavailable.
+* **BOLT12 Handling (EXPERIMENTAL / PARTIAL):** TLV, offer-handling, and blinded-path primitives exist (`crates/satspath-router/src/bolt12.rs`).
+* **Silent Payments BIP-352 (EXPERIMENTAL):** BIP-352 ECDH shared-secret and output derivation primitives (`crates/satspath-router/src/silent_payments.rs`).
+* **Ark Payment Routing (PREVIEW):** Receive pointer parsing, ownership proofs, and route scoring (`crates/satspath-router/src/ark.rs`, `ark_routes.rs`).
 * **Submarine / Reverse Swaps (EXPERIMENTAL):** Boltz Exchange v2 client, encrypted store (AES-256-GCM), and claim/refund tx builders for testnet/regtest only (`crates/satspath-swaps`).
-* **Post-Quantum Cryptography (RESEARCH):** Hybrid signature research module (`secp256k1` + ML-DSA-65) in `crates/satspath-pqc`.
-* **Containerized Daemons & CLI (IMPLEMENTED):** Reference binaries for development and testing (`satspath-cli`, `satspathd`, `satspath-witness`).
+* **Post-Quantum Cryptography (RESEARCH):** Feature-gated hybrid signature and KEM research module (`secp256k1` + ML-DSA-65 / X25519 + ML-KEM-768) in `crates/satspath-pqc`.
 
 ---
 
-## 2. Engineering Roadmap (v0.2 Milestone)
+## 2. Completed vs Pending v0.2 Milestones
 
-The v0.2 milestone focuses on external validation, production hardening, and wallet integration surfaces:
+### Completed in Recent Releases
 
-### A. Security Review & Cryptographic Auditing (P0 Release Gate)
-* Independent third-party cryptographic review of canonical serialization, Merkle proof verifiers, key rotation, and domain-separated signing schemes.
-* Independent threat modeling and penetration testing of `satspathd` reverse proxy and SSRF defenses.
+- [x] **Authenticated Current-State Map (`SparseMerkleTree`):** 256-bit Sparse Merkle Tree inclusion/non-inclusion proofs bound to `TransparencyCheckpoint.map_root`.
+- [x] **Catena-Style Bitcoin On-Chain Anchoring:** UTXO-chained `OP_RETURN` commitments (`SatsPathCatenaAnchorV1`) with equivocation detection and bounded chain verification.
+- [x] **Checkpoint Gossip Protocol:** Nostr/P2P gossip observation comparison (`GOSSIP_KIND = 3978`) and `SplitViewEvidence` generation.
+- [x] **Modular `satspathd` Refactor, Rate Limiting & Telemetry:** Split daemon into `handlers/`, `rate_limit.rs`, `server.rs`, and `telemetry/` with Prometheus `/metrics` and deep health checks.
+- [x] **Protocol Parser Fuzzing Suite:** `cargo-fuzz` targets for profiles, BIP-321 URIs, BOLT12 TLVs, and Merkle proofs (`.github/workflows/fuzz.yml`).
 
-### B. Decentralized Infrastructure & Protocol Conformance
-* **Official BOLT12 Conformance:** Implement standards-conformant checksumless string decoding, all-TLV Merkle tree root hashing, invoice-request construction, and execute conformance suites against Core Lightning and LDK test vectors.
-* **Official BIP-352 Conformance:** Import and validate the standard BIP-352 test vectors into `satspath-router`.
-* **Cross-Witness Gossip:** Implement public alert and gossip mechanisms between independent witness nodes to broadcast detected equivocation or split-view checkpoints in real-time.
-* **Embedded DNSSEC Validator:** Integrate a lightweight local DNSSEC validator into `satspath-core` to enable `DnssecPolicy::Strict` without relying on external system resolvers.
+### Active / Pending v0.2 Targets
 
-### C. Wallet Integration & Mobile SDKs
-* **TypeScript & WebAssembly SDK:** Production packaging of `@satspath/wasm` and `@satspath/router` for browser and React Native wallets.
-* **Standardized Wallet Handoff Bridges:** Reference plugins for major open-source Bitcoin wallets to consume SatsPath BIP-21 and BOLT12 handoff payloads seamlessly.
-* **Native Rust FFI:** C/Swift/Kotlin bindings for embedded mobile integration.
-
-### D. Advanced Payment Rails
-* **Live Ark ASP Settlement:** Integrate real Ark Service Provider VTXO round negotiation and DAG verification once Ark client implementations mature on testnet.
-* **Multi-Recipient Batching:** Recursive resolution and route optimization for split or batched payments.
-* **Encrypted Profile Metadata:** Optional ECDH-encrypted profile fields for recipients who wish to restrict address disclosure to authorized senders.
+- [ ] **Embedded Cryptographic DNSSEC Validator (#152):** Perform in-process RFC 4034/4035 `DNSKEY`/`RRSIG`/`DS` chain verification anchored to the root KSK in `satspath-core`.
+- [ ] **Standards-Compliant BOLT12 & CLN/LDK Interoperability (#153):** Full checksumless Bech32 decoding, all-TLV Merkle root signing, and Onion Message invoice requests.
+- [ ] **Official BIP-352 Test Vector Conformance (#154):** Validate full input filtering, Taproot parity, NUMS exclusion, and label derivation against the official BIP-352 JSON test vectors.
+- [ ] **Live Ark ASP Connector & Settlement Handoffs (#155):** Connect `satspath-router` to live `arkd` `/v1/info` endpoints, VTXO tree DAG verification, and Boarding/Forfeit/OOR handoff payloads.
+- [ ] **Standardized Non-Custodial `WalletExecutor` Bridges (#156):** Provide reference BDK, LDK, and Boltz testnet swap execution bridges.
+- [ ] **External Third-Party Cryptographic Audit:** Independent review per [`docs/audit/EXTERNAL_CRYPTO_REVIEW_SPEC.md`](audit/EXTERNAL_CRYPTO_REVIEW_SPEC.md).
 
 ---
 
 ## 3. Architectural Boundary Reminder
 
-SatsPath remains firmly committed to a **non-custodial, wallet-agnostic architecture**. SatsPath will not become a custodial wallet, will not store seed phrases, and will not take custody of funds. Payment execution and transaction signing remain sovereign responsibilities of the user's host wallet.
+SatsPath remains firmly committed to a **non-custodial, wallet-agnostic architecture**. SatsPath never stores seed phrases, never requests private spending keys (`xprv`/`tprv`), and never takes custody of user funds. Payment execution and transaction signing remain sovereign responsibilities of the host wallet.

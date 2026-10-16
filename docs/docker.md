@@ -155,6 +155,17 @@ When `satspathd` binds to a non-loopback interface (such as `0.0.0.0`, `::`, or 
 
 Localhost / loopback bindings (`127.0.0.1`, `::1`) remain allowed for zero-friction local development.
 
+### Production Configuration Flags & Environment Variables
+
+| Flag / Environment Variable | Default | Production Requirement |
+| :--- | :--- | :--- |
+| `--behind-proxy` / `SATSPATHD_BEHIND_PROXY=1` | `false` | Enable when running behind Caddy/Nginx so `satspathd` trusts `X-Forwarded-For` / `X-Real-IP`. |
+| `--require-tls-or-proxy` / `SATSPATHD_REQUIRE_TLS_OR_PROXY=1` | `false` | **Recommended in production.** Fails closed on startup if bound to a non-loopback address without TLS or `--behind-proxy`. |
+| `SATSPATH_AUTHORITY_DOMAIN` | *(none)* | Set to your public domain (e.g. `node.example.com`) to allow incoming `Host` headers and prevent DNS rebinding. |
+| `SATSPATH_API_TOKEN` | *(none)* | Required Bearer token for admin/mutating `/v1/*` endpoints. |
+| `SATSPATH_LOG_FORMAT` | `pretty` | Set to `json` for structured JSON logs in Docker/Kubernetes. |
+| `GET /health` & `GET /metrics` | Enabled | Deep dependency health probe (`/health`) and Prometheus scrape endpoint (`/metrics`). |
+
 ---
 
 ## Make targets

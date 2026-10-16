@@ -1,9 +1,9 @@
 # SatsPath P2P Wire Transport v1 (Deprecated/Archived)
 
 > **WARNING:**
-> **This transport has been deprecated and retired from the canonical SatsPath architecture.**
-> SatsPath has fully transitioned to authoritative S2S resolution (v2). P2P discovery is no longer required or supported by default.
-> This document remains solely for historical reference.
+> **This v1 P2P wire transport has been superseded by the S2S v2 Authoritative Resolution Protocol ([`docs/s2s/protocol-v2.md`](s2s/protocol-v2.md)).**
+> In current `satspathd` builds, authoritative resolution runs over HTTPS (`/v2/resolve`, `/.well-known/satspath-authority`) backed by the RFC 6962 Merkle transparency log and 256-bit Sparse Merkle state map.
+> Optional Hyperswarm sidecar supervision remains available in [`crates/satspathd/src/p2p.rs`](../crates/satspathd/src/p2p.rs) (`satspathd --p2p`, `/v1/p2p/resolve`, and `/v1/control`) strictly as an opt-in secondary transport.
 
 Pear/Holepunch is an optional transport for SatsPath protocol objects. It is not the SatsPath protocol.
 
