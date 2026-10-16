@@ -199,7 +199,7 @@ fn verify_rrset_signatures(
 /// Enforces:
 /// - Root `DNSKEY` membership in `trust_anchor` and self-signature verification.
 /// - Non-empty `DS` delegation records for every child zone, signed by the parent zone's `DNSKEY`.
-/// - Cryptographic `DS::covers` digest matching (SHA-256 / SHA-384) against child `DNSKEY`s.
+/// - Cryptographic `DS::covers` digest matching against child `DNSKEY`s.
 /// - `RRSIG` validity window (`sig_inception <= now <= sig_expiration`) and signature verification
 ///   for every `DNSKEY`, `DS`, and leaf `TXT` RRset.
 ///
