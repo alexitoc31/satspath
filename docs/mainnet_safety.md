@@ -25,7 +25,7 @@
 | **Mainnet Lightning Discovery (LNURL/LN Address)** | **Supported** | SatsPath (Router) |
 | **BOLT12 Handling & Blinded Paths** | **Prototype / Experimental (Partial)** (Prototype primitives; standards-conformant string parsing & CLN/LDK interop unverified) | SatsPath (Router) |
 | **Mainnet On-Chain Address Discovery (BIP-21)** | **Supported** | SatsPath (Router) |
-| **Silent Payments (BIP-352) Primitives** | **Prototype / Experimental** (Address/output construction implemented; standards conformance & mainnet interop unverified until official vectors pass) | SatsPath (Router) |
+| **Silent Payments (BIP-352) Primitives** | **Experimental** (Public operations checked against projections of 28 official vector groups; wallet interoperability unverified) | SatsPath (public routing/detection); host wallet (ECDH, private derivation, signing) |
 | **Mainnet Ark Receive Pointer Discovery** | **Supported (Preview)** | SatsPath (Router) |
 | **Wallet Handoff Generation (URIs, QR codes)** | **Supported** | SatsPath (Router / CLI) |
 | **Mainnet Payment Execution by SatsPath** | **Unsupported / Out of Scope** | **Host Wallet Only** |
@@ -77,3 +77,24 @@ BIP-353 resolution is a preview layer: SatsPath resolves and displays DNSSEC-bac
 * **Exclusion from Production Safety Claim:** Production mainnet profile resolution and validation rely exclusively on classical, battle-tested `secp256k1` BIP-340 Schnorr signatures. PQC is not part of the production mainnet safety claim.
 * **Fail-Closed Default:** When the `pqc` feature is not enabled (the default for production builds), any profile specifying `pqc_required: true` or supplying `hybrid_pubkey` or `hybrid_signature` (even when `pqc_required` is false) is rejected (`Ok(false)`). In builds with the `pqc` feature disabled, this guarantees that verifiers never accept unverified post-quantum assertions, unverified hybrid extensions, or false security guarantees.
 
+## BIP-352 wallet boundary
+
+The router accepts public prevout data, scan/spend public keys, labeled spend
+public keys, and ECDH curve points computed by the host wallet. The host wallet
+must derive each ECDH point from the exact transaction inputs and recipient scan
+key. Sender points use `input_hash * a * B_scan`; receiver points use
+`b_scan * input_hash * A`. `bip352_input_context` exposes the public input hash,
+aggregate public key, and receiver tweak point. Prevouts must be authenticated by
+the wallet; the router does not execute scripts or verify transaction signatures.
+
+`create_bip352_outputs` and `scan_bip352_transaction` require an explicit network.
+Regtest uses `sprt`; Testnet, Testnet4, and Signet share `tsp`. Scanning returns
+public output keys, derivation indices, and optional label identifiers. The wallet
+retains private label derivation, output spending-key derivation, transaction
+construction, amount/destination confirmation, signing, and broadcasting.
+
+The former router key generation, private-key extraction/aggregation, spending-key
+derivation, and `SilentPayment` session APIs have been removed. Integrations must
+perform those operations within their host wallet and supply only public data to
+the router. Public ECDH points are not proofs of correct wallet computation;
+the host wallet must verify final outputs before signing.

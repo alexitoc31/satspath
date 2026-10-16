@@ -426,6 +426,8 @@ mod tests {
         assert!(validate_claim_policy(&policy).is_ok());
     }
 
+    /// Accept valid Silent Payment encodings on their expected networks and
+    /// reject network mismatches, empty/private material, truncation, and versions.
     #[test]
     /// Verify that silent payment address validation.
     fn silent_payment_address_validation() {
@@ -436,10 +438,20 @@ mod tests {
         payload.extend([key.clone(), key].concat().to_base32());
         let mainnet_sp = bech32::encode("sp", &payload, bech32::Variant::Bech32m).unwrap();
         let testnet_sp = bech32::encode("tsp", &payload, bech32::Variant::Bech32m).unwrap();
+        let regtest_sp = bech32::encode("sprt", &payload, bech32::Variant::Bech32m).unwrap();
 
         // Valid addresses
         assert!(validate_silent_payment_address(&mainnet_sp, BitcoinNetwork::Mainnet).is_ok());
         assert!(validate_silent_payment_address(&testnet_sp, BitcoinNetwork::Testnet).is_ok());
+        assert!(validate_silent_payment_address(&regtest_sp, BitcoinNetwork::Regtest).is_ok());
+
+        // Official BIP-352 mainnet test vector address
+        assert!(validate_silent_payment_address(
+            "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv",
+            BitcoinNetwork::Mainnet
+        )
+        .is_ok());
+
         assert!(validate_silent_payment_address(
             &format!(" \t{mainnet_sp}\n"),
             BitcoinNetwork::Mainnet
