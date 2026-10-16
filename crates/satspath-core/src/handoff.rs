@@ -17,6 +17,7 @@ pub fn validate_method_for_network(
     let network = match network {
         crate::BitcoinNetwork::Mainnet => Network::Bitcoin,
         crate::BitcoinNetwork::Testnet => Network::Testnet,
+        crate::BitcoinNetwork::Signet => Network::Signet,
         crate::BitcoinNetwork::Regtest => Network::Regtest,
     };
     validate(method, sats, chrono::Utc::now().timestamp(), Some(network))
@@ -32,6 +33,7 @@ pub fn validate_invoice_for_network(
     let network = match network {
         crate::BitcoinNetwork::Mainnet => Network::Bitcoin,
         crate::BitcoinNetwork::Testnet => Network::Testnet,
+        crate::BitcoinNetwork::Signet => Network::Signet,
         crate::BitcoinNetwork::Regtest => Network::Regtest,
     };
     check::bolt11(
@@ -71,6 +73,7 @@ impl<'a> From<&'a crate::PaymentMethod> for check::PaymentMethod<'a> {
                 network: match network {
                     crate::BitcoinNetwork::Mainnet => Network::Bitcoin,
                     crate::BitcoinNetwork::Testnet => Network::Testnet,
+                    crate::BitcoinNetwork::Signet => Network::Signet,
                     crate::BitcoinNetwork::Regtest => Network::Regtest,
                 },
                 address: address.as_deref(),
@@ -107,6 +110,7 @@ impl<'a> From<&'a crate::PaymentMethod> for check::PaymentMethod<'a> {
                 Some(match offer.network {
                     crate::BitcoinNetwork::Mainnet => Network::Bitcoin,
                     crate::BitcoinNetwork::Testnet => Network::Testnet,
+                    crate::BitcoinNetwork::Signet => Network::Signet,
                     crate::BitcoinNetwork::Regtest => Network::Regtest,
                 }),
             ),

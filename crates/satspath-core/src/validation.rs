@@ -64,16 +64,21 @@ pub fn validate_lightning_address(address: &str) -> Result<()> {
 
 /// Validate a BOLT12 offer string using the shared handoff validator.
 pub fn validate_bolt12_offer(offer: &str) -> Result<()> {
-    validate_bolt12_offer_for_network(offer, None)
+    validate_bolt12_offer_internal(offer, None)
 }
 
-fn validate_bolt12_offer_for_network(offer: &str, network: Option<BitcoinNetwork>) -> Result<()> {
+pub fn validate_bolt12_offer_for_network(offer: &str, network: BitcoinNetwork) -> Result<()> {
+    validate_bolt12_offer_internal(offer, Some(network))
+}
+
+fn validate_bolt12_offer_internal(offer: &str, network: Option<BitcoinNetwork>) -> Result<()> {
     let trimmed = offer.trim();
     assert_no_private_material(trimmed)?;
     let network = network.map(|net| match net {
         BitcoinNetwork::Mainnet => Network::Bitcoin,
         BitcoinNetwork::Testnet => Network::Testnet,
         BitcoinNetwork::Regtest => Network::Regtest,
+        BitcoinNetwork::Signet => Network::Signet,
     });
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     satspath_handoff::bolt12(trimmed, network, now).map_err(SatsPathError::InvalidPaymentPointer)
@@ -87,6 +92,7 @@ pub fn validate_bitcoin_address(address: &str, network: BitcoinNetwork) -> Resul
         BitcoinNetwork::Mainnet => Network::Bitcoin,
         BitcoinNetwork::Testnet => Network::Testnet,
         BitcoinNetwork::Regtest => Network::Regtest,
+        BitcoinNetwork::Signet => Network::Signet,
     };
     parsed
         .require_network(expected)
@@ -102,6 +108,7 @@ pub fn validate_silent_payment_address(address: &str, network: BitcoinNetwork) -
         BitcoinNetwork::Mainnet => Network::Bitcoin,
         BitcoinNetwork::Testnet => Network::Testnet,
         BitcoinNetwork::Regtest => Network::Regtest,
+        BitcoinNetwork::Signet => Network::Signet,
     };
     satspath_handoff::silent(address, network).map_err(SatsPathError::InvalidPaymentPointer)
 }
@@ -290,8 +297,9 @@ pub fn validate_public_profile(profile: &PaymentProfile) -> Result<()> {
                 }
             }
             PaymentMethod::Bolt12(offer) => {
-                validate_bolt12_offer_for_network(&offer.offer, Some(offer.network))?;
+                validate_bolt12_offer_for_network(&offer.offer, offer.network)?;
             }
+
             PaymentMethod::Ark {
                 server,
                 pubkey,

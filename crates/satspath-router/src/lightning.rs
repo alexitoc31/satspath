@@ -131,6 +131,14 @@ fn bolt12_profile_offer_available(
     offer_data: &satspath_core::Bolt12Offer,
     amount_sats: u64,
 ) -> bool {
+    if satspath_core::validation::validate_bolt12_offer_for_network(
+        &offer_data.offer,
+        offer_data.network,
+    )
+    .is_err()
+    {
+        return false;
+    }
     if offer_data
         .expires_at
         .is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp())

@@ -10,6 +10,7 @@ pub enum BitcoinNetwork {
     Mainnet,
     Testnet,
     Regtest,
+    Signet,
 }
 
 /// Public payment pointer data only.
@@ -76,6 +77,7 @@ fn validate_handoff(pointer: &PaymentPointer, sats: u64) -> Result<()> {
             let network = match network {
                 BitcoinNetwork::Mainnet => bitcoin::Network::Bitcoin,
                 BitcoinNetwork::Testnet => bitcoin::Network::Testnet,
+                BitcoinNetwork::Signet => bitcoin::Network::Signet,
                 BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
             };
             let is_silent = bech32::decode(address)

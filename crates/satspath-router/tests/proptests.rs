@@ -72,6 +72,7 @@ fn bitcoin_network(network: BitcoinNetwork) -> Network {
     match network {
         BitcoinNetwork::Mainnet => Network::Bitcoin,
         BitcoinNetwork::Testnet => Network::Testnet,
+        BitcoinNetwork::Signet => Network::Signet,
         BitcoinNetwork::Regtest => Network::Regtest,
     }
 }

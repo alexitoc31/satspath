@@ -744,6 +744,7 @@ fn map_network(network: BitcoinNetwork) -> Network {
         BitcoinNetwork::Mainnet => Network::Bitcoin,
         BitcoinNetwork::Testnet => Network::Testnet,
         BitcoinNetwork::Regtest => Network::Regtest,
+        BitcoinNetwork::Signet => Network::Signet,
     }
 }
 

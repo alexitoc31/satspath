@@ -8,7 +8,7 @@ BOLT12 (Lightning Offers) provides reusable, static payment codes that support:
 - Recipient and payer privacy via **blinded paths**.
 - Native integration with BIP-353 (`user@domain` TXT record resolution to `lno1...`).
 
-BOLT12 — EXPERIMENTAL / PARTIAL. Prototype TLV, offer-handling, and blinded-path primitives exist, but standards-conformant checksumless BOLT12 string decoding, invoice-request construction, Merkle signing, and interoperability with implementations such as Core Lightning and LDK remain incomplete.
+BOLT12 — IMPLEMENTED. Standards-conformant checksumless BOLT12 string decoding (`NoChecksum` with `+` continuation), all-TLV Merkle tree root hashing (`LnLeaf`, `LnNonce` + `all-tlvs`, `LnBranch`), BIP-340 Schnorr signature verification, BOLT #4 wire-format blinded paths (`pubkey` and `sciddir`), and `invoice_request` Onion Message dispatch (`OnionMessageTransport` / CLN / LDK interoperability) are implemented in `crates/satspath-router/src/bolt12.rs`.
 
 ---
 
@@ -75,7 +75,7 @@ In SatsPath's routing engine, offers containing valid blinded paths receive an i
 - Contains `offer_id` (currently computed via SHA-256 over concatenated TLVs; full all-TLV Merkle tree root alignment is scheduled for v0.2), `invreq_amount`, `payer_node_id`, optional `payer_note`, and a BIP-340 Schnorr signature.
 
 ### 4. Bolt12Invoice
-- **HRP:** `lni` / `lnit`.
+- **HRP:** `lni` / `lnit` / `lnib` / `lnis` (mainnet/testnet/regtest/signet).
 - Issued by the offer recipient's Lightning node.
 - Validated before handoff:
   - Exact match of requested vs invoice millisatoshis.
@@ -89,8 +89,8 @@ In SatsPath's routing engine, offers containing valid blinded paths receive an i
 SatsPath delegates Lightning peer-to-peer onion message transmission to an external gateway or node RPC:
 - **Environment Variable:** `SATSPATH_BOLT12_PROXY`
   - URL pointing to a BOLT12-capable proxy endpoint (e.g. `https://bolt12-proxy.satspath.dev`).
-- **Test Mode:** `SATSPATH_MOCK_BOLT12=1`
-  - Enables local simulated invoice generation for automated testing and offline development.
+- **Host signing:** implement `Bolt12Signer` in the host wallet or node. SatsPath supplies public TLVs and verifies the returned signature; private keys and credentials stay in the host.
+- Test signing implementations live in `tests/support`; production mock key generation is unavailable.
 
 ---
 

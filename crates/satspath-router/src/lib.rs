@@ -20,7 +20,15 @@ mod lightning_tests;
 
 pub use ark_routes::{plan_ark_route, ArkRoutePlan, SenderCapabilities};
 pub use bip353_preview::quote_from_bip353_resolution;
-pub use bolt12::{parse_bolt12_offer, Bolt12Invoice, Bolt12InvoiceRequest, Bolt12Offer};
+pub use bolt12::{
+    bolt12_merkle_branch, bolt12_signature_digest, bolt12_tagged_hash,
+    build_invoice_request_onion_envelope, compute_bolt12_merkle_root, decode_bolt12_bech32,
+    encode_bolt12_bech32_checksumless, fetch_bolt12_invoice_via_transport,
+    normalize_bolt12_bech32_str, parse_bolt12_offer, resolve_offer_onion_route,
+    sign_bolt12_tlv_stream, verify_bolt12_tlv_signature, Bolt12Invoice, Bolt12InvoiceRequest,
+    Bolt12Offer, Bolt12Signer, IntroductionNode, OnionMessageEnvelope, OnionMessageTransport,
+    ReferenceNodeOnionTransport, ResolvedOnionRoute,
+};
 pub use fees::{
     compute_median_fee, decay_estimate, fallback_fees, fetch_fee_estimate,
     fetch_fee_estimate_with_config, ConsensusFeeReport, EsploraFeeEstimate, FeeEstimate,

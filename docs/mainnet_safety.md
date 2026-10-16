@@ -23,7 +23,7 @@
 | :--- | :--- | :--- |
 | **Mainnet Profile Resolution** | **Supported** | SatsPath (Core / Resolvers) |
 | **Mainnet Lightning Discovery (LNURL/LN Address)** | **Supported** | SatsPath (Router) |
-| **BOLT12 Handling & Blinded Paths** | **Prototype / Experimental (Partial)** (Prototype primitives; standards-conformant string parsing & CLN/LDK interop unverified) | SatsPath (Router) |
+| **BOLT12 Handling & Blinded Paths** | **Supported** (Checksumless BOLT12 decoding, all-TLV Merkle signing, BOLT #4 blinded paths, and CLN/LDK onion message `invoice_request` interoperability) | SatsPath (Router) |
 | **Mainnet On-Chain Address Discovery (BIP-21)** | **Supported** | SatsPath (Router) |
 | **Silent Payments (BIP-352) Primitives** | **Experimental** (Public operations checked against projections of 28 official vector groups; wallet interoperability unverified) | SatsPath (public routing/detection); host wallet (ECDH, private derivation, signing) |
 | **Mainnet Ark Receive Pointer Discovery** | **Supported (Preview)** | SatsPath (Router) |

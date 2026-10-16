@@ -103,7 +103,7 @@ impl ExecutionGatePolicy {
                 }
                 Ok(())
             }
-            BitcoinNetwork::Testnet | BitcoinNetwork::Regtest => {
+            BitcoinNetwork::Testnet | BitcoinNetwork::Regtest | BitcoinNetwork::Signet => {
                 if !self.allow_testnet_execution {
                     return Err(SatsPathError::ValidationError(
                         "Testnet execution disabled by policy".into(),

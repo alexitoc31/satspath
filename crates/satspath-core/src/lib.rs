@@ -2,6 +2,7 @@ pub mod ark;
 pub mod bip321;
 pub mod bip353;
 pub mod bip353_publish;
+pub mod bolt12;
 pub mod codec;
 pub mod crypto;
 pub mod dns;

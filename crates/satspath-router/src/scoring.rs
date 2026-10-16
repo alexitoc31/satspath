@@ -102,7 +102,8 @@ pub fn score_routes(
                 let fee = fee_snapshot
                     .lightning_fee_sats_estimate
                     .unwrap_or_else(|| std::cmp::max(1, amount_sats / 10_000));
-                let available = lightning_address.is_some() || lnurl.is_some() || bolt12.is_some();
+                let mut available =
+                    lightning_address.is_some() || lnurl.is_some() || bolt12.is_some();
                 let mut privacy_score = 7;
                 let pointer = if let Some(address) = lightning_address {
                     PaymentPointer::LightningAddress {
@@ -120,6 +121,10 @@ pub fn score_routes(
                         amount_sats: Some(amount_sats),
                     }
                 } else if let Some(offer_str) = bolt12.as_deref() {
+                    available = crate::lightning::is_lightning_available_for_amount_sync(
+                        method,
+                        amount_sats,
+                    );
                     let parsed = crate::bolt12::parse_bolt12_offer(offer_str).ok();
                     let has_blinded = parsed
                         .as_ref()
@@ -203,7 +208,10 @@ pub fn score_routes(
                     privacy_score,
                     reliability_score: 9,
                     requires_user_action: true,
-                    available: true,
+                    available: crate::lightning::is_lightning_available_for_amount_sync(
+                        method,
+                        amount_sats,
+                    ),
                     reason: "BOLT12 offer available for Lightning payment.".into(),
                 });
                 pointers.push(PaymentPointer::Bolt12Offer {

@@ -193,6 +193,7 @@ pub fn build_qr_payload(method: &PaymentMethod, amount_sats: u64) -> satspath_co
             let network = match network {
                 BitcoinNetwork::Mainnet => "mainnet",
                 BitcoinNetwork::Testnet => "testnet",
+                BitcoinNetwork::Signet => "signet",
                 BitcoinNetwork::Regtest => "regtest",
             };
             (
