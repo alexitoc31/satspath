@@ -14,6 +14,8 @@ satspath-router = { path = "../crates/satspath-router" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 canonical_json = { version = "0.5", default-features = false }
+hex = "0.4"
+secp256k1 = { version = "0.29", features = ["rand-std"] }
 
 # Use independent workspace for fuzzers
 [workspace]
@@ -57,6 +59,34 @@ bench = false
 [[bin]]
 name = "fuzz_ownership_proof"
 path = "fuzz_targets/fuzz_ownership_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_nostr_event"
+path = "fuzz_targets/fuzz_nostr_event.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_merkle_proof"
+path = "fuzz_targets/fuzz_merkle_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_capability_handoff"
+path = "fuzz_targets/fuzz_capability_handoff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_schnorr_profile"
+path = "fuzz_targets/fuzz_schnorr_profile.rs"
 test = false
 doc = false
 bench = false

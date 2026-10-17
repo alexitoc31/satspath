@@ -204,47 +204,63 @@ impl ProfileResolver for NostrResolver {
             .collect();
 
         let results = futures_util::future::join_all(futures).await;
-
-        let mut best_profile: Option<SignedPaymentProfile> = None;
-        let mut last_error = None;
-
-        for result in results {
-            match result {
-                Ok(signed) => {
-                    let current_best_seq = best_profile
-                        .as_ref()
-                        .and_then(|p| p.profile.sequence)
-                        .unwrap_or(0);
-                    let new_seq = signed.profile.sequence.unwrap_or(0);
-
-                    if best_profile.is_none() || new_seq > current_best_seq {
-                        best_profile = Some(signed);
-                    }
-                }
-                Err(e) => last_error = Some(e),
-            }
-        }
-
-        match best_profile {
-            Some(profile) => {
-                if profile.profile.revoked {
-                    Err(SatsPathError::RegistryError(format!(
-                        "Alias {} has been revoked",
-                        alias
-                    )))
-                } else {
-                    Ok(profile)
-                }
-            }
-            None => match last_error {
-                Some(e) => Err(e),
-                None => Err(SatsPathError::AliasNotFound(alias.to_string())),
-            },
-        }
+        select_relay_profile(results, alias)
     }
 }
 
-fn signed_profile_from_event(
+/// A malformed relay event cannot veto a separately authenticated profile;
+/// a signed revocation still halts resolution, even if other relays disagree.
+fn select_relay_profile(
+    results: Vec<Result<SignedPaymentProfile>>,
+    alias: &str,
+) -> Result<SignedPaymentProfile> {
+    let mut best_profile: Option<SignedPaymentProfile> = None;
+    let mut last_error = None;
+
+    for result in results {
+        match result {
+            Ok(signed) => {
+                let current_best_seq = best_profile
+                    .as_ref()
+                    .and_then(|p| p.profile.sequence)
+                    .unwrap_or(0);
+                let new_seq = signed.profile.sequence.unwrap_or(0);
+
+                if best_profile.is_none() || new_seq > current_best_seq {
+                    best_profile = Some(signed);
+                }
+            }
+            Err(e @ SatsPathError::RegistryError(_)) => return Err(e),
+            Err(e @ SatsPathError::InvalidSignature) => last_error = Some(e),
+            Err(e) => {
+                if !matches!(last_error, Some(SatsPathError::InvalidSignature)) {
+                    last_error = Some(e);
+                }
+            }
+        }
+    }
+
+    match best_profile {
+        Some(profile) => {
+            if profile.profile.revoked {
+                Err(SatsPathError::RegistryError(format!(
+                    "Alias {} has been revoked",
+                    alias
+                )))
+            } else {
+                Ok(profile)
+            }
+        }
+        None => match last_error {
+            Some(e) => Err(e),
+            None => Err(SatsPathError::AliasNotFound(alias.to_string())),
+        },
+    }
+}
+
+/// Parse an untrusted relay frame without network calls. The same parser is
+/// exercised by the live resolver and by CI's adversarial corpus.
+pub fn signed_profile_from_event(
     raw: &str,
     sub_id: &str,
     expected_pubkey: &str,
@@ -296,6 +312,12 @@ fn signed_profile_from_event(
     }
     if !verify_signed_profile(&signed)? {
         return Err(SatsPathError::InvalidSignature);
+    }
+    if signed.profile.revoked {
+        return Err(SatsPathError::RegistryError(format!(
+            "Alias {} has been revoked",
+            signed.profile.alias
+        )));
     }
     check_profile_expiry(&signed.profile)?;
     Ok(Some(signed))
@@ -577,5 +599,74 @@ mod tests {
 
         let parsed = signed_profile_from_event(&raw, "sub", nostr_pk, "alice@example.com");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn revoked_signed_event_is_not_a_fallback_candidate() {
+        let mut profile = signed("alice@example.com");
+        profile.profile.revoked = true;
+        let key = secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        profile.profile.identity_pubkey =
+            secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &key).to_string();
+        // Revocation remains fatal even after its expiry timestamp.
+        profile.profile.expires_at = Some(1);
+        let profile = crate::crypto::sign_profile(profile.profile, &key).unwrap();
+        let nostr_pk = &profile.profile.identity_pubkey[2..];
+        let raw = json!(["EVENT", "sub", {
+            "kind": SATSPATH_PROFILE_KIND,
+            "pubkey": nostr_pk,
+            "tags": [["d", "satspath-profile:alice@example.com"]],
+            "content": serde_json::to_string(&profile).unwrap()
+        }])
+        .to_string();
+        assert!(matches!(
+            signed_profile_from_event(&raw, "sub", nostr_pk, "alice@example.com"),
+            Err(SatsPathError::RegistryError(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_relay_signature_cannot_veto_a_valid_relay() {
+        let profile = signed("alice@example.com");
+        assert!(select_relay_profile(
+            vec![Err(SatsPathError::InvalidSignature), Ok(profile.clone())],
+            "alice@example.com",
+        )
+        .is_ok());
+        assert!(select_relay_profile(
+            vec![Ok(profile), Err(SatsPathError::InvalidSignature)],
+            "alice@example.com",
+        )
+        .is_ok());
+        assert!(matches!(
+            select_relay_profile(
+                vec![
+                    Err(SatsPathError::InvalidSignature),
+                    Err(SatsPathError::AliasNotFound("alice@example.com".into()))
+                ],
+                "alice@example.com",
+            ),
+            Err(SatsPathError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn signed_revocation_vetoes_stale_relay_profile_in_any_order() {
+        let stale = signed("alice@example.com");
+        let revoked = || SatsPathError::RegistryError("signed revocation".into());
+        for results in [
+            vec![Ok(stale.clone()), Err(revoked())],
+            vec![Err(revoked()), Ok(stale.clone())],
+            vec![
+                Err(SatsPathError::InvalidSignature),
+                Err(revoked()),
+                Ok(stale.clone()),
+            ],
+        ] {
+            assert!(matches!(
+                select_relay_profile(results, "alice@example.com"),
+                Err(SatsPathError::RegistryError(_))
+            ));
+        }
     }
 }
