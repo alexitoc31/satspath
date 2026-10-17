@@ -265,6 +265,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+### Development Git hook
+
+Run `npm ci` once from the repository root to install Husky's pre-commit hook.
+The hook checks Rust formatting with `cargo fmt --all -- --check`, matching CI;
+it does not modify staged files. Node.js 18+ and Rust with `rustfmt` are required.
+
 ### CLI Preview Usage
 
 ```bash
