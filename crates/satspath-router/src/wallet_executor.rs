@@ -32,8 +32,10 @@ use satspath_core::validation::{
 use satspath_core::PaymentMethod;
 use satspath_core::{Result as CoreResult, SatsPathError};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::quote_response::{build_qr_payload, QuoteResponse};
+use satspath_core::resolver::ResolverSource;
 
 /// Unified receipt returned after a host wallet executes a validated SatsPath handoff payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -428,6 +430,99 @@ impl<W: BdkHostWallet, L: LdkHostNode> WalletExecutor for HostWalletSdkBridge<W,
         }
         Ok(txid)
     }
+
+    async fn send_onchain_with_max_fee(
+        &self,
+        destination: &str,
+        amount_sats: u64,
+        max_fee_sats: u64,
+    ) -> CoreResult<OnchainReceipt> {
+        let (psbt, _) = self
+            .bdk
+            .build_unsigned_psbt(destination, amount_sats, None)
+            .await?;
+        let total_in = psbt.inputs.iter().try_fold(0u64, |sum, input| {
+            sum.checked_add(
+                input
+                    .witness_utxo
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SatsPathError::ValidationError("missing PSBT funding evidence".into())
+                    })?
+                    .value
+                    .to_sat(),
+            )
+            .ok_or_else(|| SatsPathError::ValidationError("UTXO sum overflow".into()))
+        })?;
+        let total_out = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .try_fold(0u64, |sum, output| {
+                sum.checked_add(output.value.to_sat())
+                    .ok_or_else(|| SatsPathError::ValidationError("output sum overflow".into()))
+            })?;
+        let fee_sats = total_in
+            .checked_sub(total_out)
+            .ok_or_else(|| SatsPathError::ValidationError("negative PSBT fee".into()))?;
+        if fee_sats > max_fee_sats {
+            return Err(SatsPathError::ValidationError(
+                "PSBT fee exceeds approved maximum".into(),
+            ));
+        }
+        let expected_txid = psbt.unsigned_tx.compute_txid().to_string();
+        let txid = self
+            .sign_and_broadcast_psbt(&base64_encode_psbt(&psbt))
+            .await?;
+        if txid != expected_txid {
+            return Err(SatsPathError::ValidationError(
+                "host broadcast txid does not match approved PSBT".into(),
+            ));
+        }
+        Ok(OnchainReceipt {
+            txid,
+            amount_sats,
+            fee_sats,
+            destination: destination.into(),
+            timestamp: chrono::Utc::now().timestamp(),
+        })
+    }
+
+    async fn pay_bolt11_with_max_fee(
+        &self,
+        invoice: &str,
+        amount_msats: u64,
+        max_fee_msats: u64,
+    ) -> CoreResult<PaymentReceipt> {
+        if !amount_msats.is_multiple_of(1_000) || max_fee_msats == 0 {
+            return Err(SatsPathError::ValidationError(
+                "invalid fee-bound invoice amount".into(),
+            ));
+        }
+        let validated = validate_handoff_bolt11(invoice, amount_msats / 1_000, self.network)?;
+        let adapter_cap = (amount_msats.saturating_mul(self.ldk.max_fee_bps) / 10_000).max(1_000);
+        let cap = max_fee_msats.min(adapter_cap);
+        if cap == 0 {
+            return Err(SatsPathError::ValidationError(
+                "Lightning fee cap is zero".into(),
+            ));
+        }
+        let receipt = self
+            .ldk
+            .host_node
+            .send_bolt11_payment(invoice, amount_msats, cap)
+            .await
+            .map_err(|e| SatsPathError::NetworkError(format!("LDK payment failed: {e}")))?;
+        if receipt.amount_msats != amount_msats
+            || receipt.fee_msats > cap
+            || receipt.payment_hash != validated.payment_hash().to_string()
+        {
+            return Err(SatsPathError::ValidationError(
+                "host Lightning receipt does not match approved intent".into(),
+            ));
+        }
+        Ok(receipt)
+    }
 }
 
 /// Encode a [`Psbt`] to hex using its consensus serialization.
@@ -767,6 +862,231 @@ fn boltz_witness_script(terms: &BoltzSwapEvidence, reverse: bool) -> ScriptBuf {
 // 5. End-to-End QuoteResponse -> WalletExecutor Dispatcher
 // ============================================================================
 
+/// Public, canonical, inspectable description of a *single* proposed payment.
+/// This is not an authorization to spend. The host must show it to the payer
+/// and call [`PaymentIntent::approve`] before dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaymentIntent {
+    pub recipient_identity: String,
+    pub verified_identity_key: String,
+    pub selected_capability: PaymentMethod,
+    pub network: BitcoinNetwork,
+    pub amount_sats: u64,
+    pub destination: String,
+    pub estimated_fee_sats: Option<u64>,
+    pub max_fee_sats: u64,
+    pub expiry: Option<i64>,
+    pub resolver_sources: Vec<ResolverSource>,
+    pub verification_status: IntentVerification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntentVerification {
+    pub profile_signature_verified: bool,
+    pub identifier_verified: bool,
+    pub key_continuity_verified: bool,
+    pub transparency_verified: bool,
+}
+
+impl PaymentIntent {
+    /// RFC 8785 serialization. Reject numbers that cannot be represented exactly
+    /// by JCS/ECMAScript so distinct approved intents cannot share a digest.
+    pub fn canonical_bytes(&self) -> CoreResult<Vec<u8>> {
+        let value = serde_json::to_value(self)
+            .map_err(|e| SatsPathError::SerializationError(e.to_string()))?;
+        ensure_jcs_exact_numbers(&value)?;
+        serde_json_canonicalizer::to_vec(&value)
+            .map_err(|e| SatsPathError::SerializationError(e.to_string()))
+    }
+
+    /// Explicit host approval binds every displayed field to the eventual dispatch.
+    /// `user_confirmed` must be obtained from the host UI, never from a resolver.
+    pub fn approve(self, user_confirmed: bool) -> CoreResult<ApprovedPaymentIntent> {
+        if !user_confirmed {
+            return Err(SatsPathError::ValidationError(
+                "payment intent requires explicit host-wallet approval".into(),
+            ));
+        }
+        if self.resolver_sources.is_empty() || self.max_fee_sats == 0 {
+            return Err(SatsPathError::ValidationError(
+                "payment intent requires resolver provenance and a maximum fee".into(),
+            ));
+        }
+        if let Some(expiry) = self.expiry {
+            if chrono::Utc::now().timestamp() >= expiry {
+                return Err(SatsPathError::ValidationError(
+                    "payment intent expired".into(),
+                ));
+            }
+        }
+        let digest = Sha256::digest(self.canonical_bytes()?);
+        Ok(ApprovedPaymentIntent {
+            intent: self,
+            digest: digest.into(),
+        })
+    }
+}
+
+fn ensure_jcs_exact_numbers(value: &serde_json::Value) -> CoreResult<()> {
+    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+    match value {
+        serde_json::Value::Number(number) => {
+            let exact = number.as_u64().is_some_and(|n| n <= MAX_SAFE_INTEGER)
+                || number.as_i64().is_some_and(|n| {
+                    n >= -(MAX_SAFE_INTEGER as i64) && n <= MAX_SAFE_INTEGER as i64
+                });
+            if !exact {
+                return Err(SatsPathError::ValidationError(
+                    "payment intent contains a number outside the exact JCS integer range".into(),
+                ));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                ensure_jcs_exact_numbers(item)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values() {
+                ensure_jcs_exact_numbers(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Non-deserializable, single-use approval. Its fields cannot be edited after
+/// approval; the dispatcher also reconstructs the intent from fresh signed state.
+pub struct ApprovedPaymentIntent {
+    intent: PaymentIntent,
+    digest: [u8; 32],
+}
+
+impl ApprovedPaymentIntent {
+    pub fn intent(&self) -> &PaymentIntent {
+        &self.intent
+    }
+}
+
+/// Prepare a payment for host inspection using *current* identity, witness,
+/// gossip and checkpoint evidence. Resolver provenance is supplied by the
+/// caller that actually performed resolution, not inferred from quote flags.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_payment_intent(
+    profile_store: &TransactionalTransparencyStore,
+    trust: &HandoffTrust,
+    transparency: &HandoffTransparencyEvidence,
+    quote_response: &QuoteResponse,
+    network: BitcoinNetwork,
+    amount_sats: u64,
+    max_fee_sats: u64,
+    resolver_sources: Vec<ResolverSource>,
+) -> CoreResult<PaymentIntent> {
+    validate_amount_sats(amount_sats)?;
+    if resolver_sources.is_empty() || max_fee_sats == 0 {
+        return Err(SatsPathError::ValidationError(
+            "resolver provenance and a positive maximum fee are required".into(),
+        ));
+    }
+    let QuoteResponse::Ok {
+        recipient,
+        selected_method,
+        qr,
+        fee_sats,
+        ..
+    } = quote_response
+    else {
+        return Err(SatsPathError::ValidationError(
+            "cannot prepare a non-Ok quote".into(),
+        ));
+    };
+    if !recipient.profile_signature_verified {
+        return Err(SatsPathError::InvalidSignature);
+    }
+    if fee_sats.is_some_and(|fee| fee > max_fee_sats) {
+        return Err(SatsPathError::ValidationError(
+            "estimated fee exceeds the host maximum fee".into(),
+        ));
+    }
+    verify_current_handoff_profile(
+        profile_store,
+        trust,
+        transparency,
+        recipient,
+        selected_method,
+    )?;
+    let signed = profile_store
+        .profile(&recipient.alias)?
+        .ok_or_else(|| SatsPathError::AliasNotFound(recipient.alias.clone()))?;
+    let mut expiry = signed.profile.expires_at;
+    if expiry.is_some_and(|end| chrono::Utc::now().timestamp() >= end) {
+        return Err(SatsPathError::ValidationError(
+            "payment profile expired".into(),
+        ));
+    }
+    assert_no_private_material(qr)?;
+    let destination = match selected_method {
+        PaymentMethod::Onchain {
+            network: method_network,
+            silent_payment_pubkey: None,
+            ..
+        } if *method_network == network
+            && build_qr_payload(selected_method, amount_sats)? == *qr =>
+        {
+            let address = parse_bip321(qr)?.address.ok_or_else(|| {
+                SatsPathError::InvalidPaymentUri("on-chain handoff has no address".into())
+            })?;
+            validate_bitcoin_address(&address, network)?;
+            address
+        }
+        PaymentMethod::Lightning {
+            lightning_address,
+            receiver_pubkey,
+            ..
+        } => {
+            let invoice = validate_handoff_bolt11(qr, amount_sats, network)?;
+            let payee = invoice.recover_payee_pub_key().to_string();
+            if lightning_address.as_deref() != Some(qr.as_str())
+                && receiver_pubkey.as_deref() != Some(payee.as_str())
+            {
+                return Err(SatsPathError::ValidationError(
+                    "invoice payee is not bound to the signed method".into(),
+                ));
+            }
+            let invoice_end = invoice
+                .expires_at()
+                .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+                .ok_or_else(|| SatsPathError::ValidationError("invalid invoice expiry".into()))?;
+            expiry = Some(expiry.map_or(invoice_end, |end| end.min(invoice_end)));
+            qr.clone()
+        }
+        _ => {
+            return Err(SatsPathError::ValidationError(
+                "unsupported or network-mismatched payment intent".into(),
+            ));
+        }
+    };
+    Ok(PaymentIntent {
+        recipient_identity: signed.profile.alias,
+        verified_identity_key: signed.profile.identity_pubkey,
+        selected_capability: selected_method.clone(),
+        network,
+        amount_sats,
+        destination,
+        estimated_fee_sats: *fee_sats,
+        max_fee_sats,
+        expiry,
+        resolver_sources,
+        verification_status: IntentVerification {
+            profile_signature_verified: true,
+            identifier_verified: recipient.identifier_verified,
+            key_continuity_verified: true,
+            transparency_verified: true,
+        },
+    })
+}
+
 /// Host-configured trust anchors, kept outside serialized quotes. Bootstrap the
 /// checkpoint store out of band from a trusted checkpoint before executing. Reuse
 /// this instance across calls and give its pin directory a single process owner.
@@ -779,6 +1099,7 @@ pub struct HandoffTrust {
 
 /// Required evidence fetched from witnesses and independent observers for this
 /// resolution. Serialized status flags are never used as proof of verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffTransparencyEvidence {
     pub current_state_proof: satspath_core::transparency::StateMapProof,
     pub witness_cosignatures: Vec<satspath_core::transparency::WitnessCosignature>,
@@ -931,12 +1252,29 @@ pub async fn execute_quote_handoff(
     trust: &HandoffTrust,
     transparency: &HandoffTransparencyEvidence,
     quote_response: &QuoteResponse,
-    expected_amount_sats: u64,
+    approved: ApprovedPaymentIntent,
     policy: &ExecutionGatePolicy,
-    user_confirmed: bool,
 ) -> CoreResult<HandoffExecutionReceipt> {
+    let expected_amount_sats = approved.intent.amount_sats;
     validate_amount_sats(expected_amount_sats)?;
-    policy.check_execution_safety(executor.network(), expected_amount_sats, user_confirmed)?;
+    policy.check_execution_safety(executor.network(), expected_amount_sats, true)?;
+    let refreshed = prepare_payment_intent(
+        profile_store,
+        trust,
+        transparency,
+        quote_response,
+        executor.network(),
+        expected_amount_sats,
+        approved.intent.max_fee_sats,
+        approved.intent.resolver_sources.clone(),
+    )?;
+    if refreshed != approved.intent
+        || Sha256::digest(refreshed.canonical_bytes()?).as_slice() != approved.digest
+    {
+        return Err(SatsPathError::ValidationError(
+            "approved payment intent changed before dispatch".into(),
+        ));
+    }
 
     let QuoteResponse::Ok {
         recipient,
@@ -993,7 +1331,7 @@ pub async fn execute_quote_handoff(
             }
         }
         let receipt = executor
-            .send_onchain(&addr, expected_amount_sats, None)
+            .send_onchain_with_max_fee(&addr, expected_amount_sats, approved.intent.max_fee_sats)
             .await?;
         return Ok(HandoffExecutionReceipt::Onchain(receipt));
     }
@@ -1018,7 +1356,17 @@ pub async fn execute_quote_handoff(
             ));
         }
         let receipt = executor
-            .pay_bolt11(trimmed, invoice.amount_milli_satoshis())
+            .pay_bolt11_with_max_fee(
+                trimmed,
+                invoice
+                    .amount_milli_satoshis()
+                    .expect("validated invoice amount"),
+                approved
+                    .intent
+                    .max_fee_sats
+                    .checked_mul(1_000)
+                    .ok_or_else(|| SatsPathError::ValidationError("fee cap overflow".into()))?,
+            )
             .await?;
         return Ok(HandoffExecutionReceipt::Lightning(receipt));
     }

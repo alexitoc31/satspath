@@ -138,6 +138,32 @@ pub trait WalletExecutor: Send + Sync {
 
     /// Sign and broadcast an on-chain PSBT (partially signed bitcoin transaction), returning the txid.
     async fn sign_and_broadcast_psbt(&self, psbt_base64: &str) -> Result<String>;
+
+    /// Fee-bound handoff. Implementations MUST enforce the cap before signing
+    /// or dispatching; the default is intentionally disabled.
+    async fn send_onchain_with_max_fee(
+        &self,
+        _destination: &str,
+        _amount_sats: u64,
+        _max_fee_sats: u64,
+    ) -> Result<OnchainReceipt> {
+        Err(SatsPathError::ValidationError(
+            "wallet does not implement fee-bound on-chain handoff".into(),
+        ))
+    }
+
+    /// Fee-bound Lightning handoff. Implementations MUST send the fee cap to
+    /// the host node, not merely check the receipt after payment.
+    async fn pay_bolt11_with_max_fee(
+        &self,
+        _invoice: &str,
+        _amount_msats: u64,
+        _max_fee_msats: u64,
+    ) -> Result<PaymentReceipt> {
+        Err(SatsPathError::ValidationError(
+            "wallet does not implement fee-bound Lightning handoff".into(),
+        ))
+    }
 }
 
 /// Reference in-memory mock wallet executor for testnet/regtest test suites and simulations.
