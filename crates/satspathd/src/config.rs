@@ -63,6 +63,10 @@ pub(crate) struct Cli {
     /// Log output format: "text" (default) or "json" (structured JSON with correlation IDs).
     #[arg(long)]
     pub(crate) log_format: Option<String>,
+    /// Enable the insecure mock alias verifier (development only). Fails closed
+    /// when unset. Refused when the daemon network is mainnet.
+    #[arg(long)]
+    pub(crate) dev_mock_alias_verification: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -98,6 +102,9 @@ pub(crate) struct AppState {
     pub(crate) network: String,
     pub(crate) open_ui: bool,
     pub(crate) auth_token: String,
+    /// Development-only opt-in for the mock alias verifier. When false, the
+    /// `/v1/profile/challenge` and `/v1/profile/verify` endpoints fail closed.
+    pub(crate) allow_mock_alias_verification: bool,
     pub(crate) mutation_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) anchor_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) rate_limiter: Arc<rate_limit::RateLimiter>,

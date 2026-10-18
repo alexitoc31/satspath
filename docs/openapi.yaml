@@ -626,7 +626,8 @@ paths:
           description: Identity, Hyperswarm, HTTP, and Nostr status
   /v1/profile/challenge:
     post:
-      summary: Create a development mock alias verification challenge
+      summary: Create a development mock alias verification challenge (disabled by default)
+      description: Fails closed with 400 unless the daemon was started with the development-only `--dev-mock-alias-verification` opt-in. Refused when the daemon network is mainnet.
       security:
         - bearerAuth: []
       requestBody:
@@ -638,9 +639,12 @@ paths:
       responses:
         "200":
           description: Challenge ID and mock verification instructions
+        "400":
+          description: Alias verification is disabled (no development opt-in) or refused on mainnet
   /v1/profile/verify:
     post:
-      summary: Verify an alias using the development mock verifier
+      summary: Verify an alias using the development mock verifier (disabled by default)
+      description: Fails closed with 400 unless the daemon was started with the development-only `--dev-mock-alias-verification` opt-in. Refused when the daemon network is mainnet.
       security:
         - bearerAuth: []
       requestBody:
@@ -652,3 +656,5 @@ paths:
       responses:
         "200":
           description: ProfileResponse after alias verification
+        "400":
+          description: Alias verification is disabled (no development opt-in) or refused on mainnet

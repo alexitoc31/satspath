@@ -34,6 +34,9 @@ pub trait ProfilePublisher {
     fn publish_profile(&self, profile: &SignedPaymentProfile) -> Result<PublishReceipt>;
 }
 
+/// Development-only mock. It proves nothing about the identifier, so the
+/// `satspathd` daemon gates it behind an explicit operator opt-in and refuses
+/// it when the daemon serves mainnet.
 pub struct MockEmailVerifier {
     pub now: i64,
     pub ttl_seconds: i64,

@@ -72,7 +72,11 @@ This reference documents the HTTP endpoints served by `satspathd` (`crates/satsp
 
 `POST /v1/profile` accepts `ProfileUpdateRequest`, not a client-signed profile.
 First verify the alias using `/v1/profile/challenge` and `/v1/profile/verify`
-(Bearer auth required; the current verifier is a development mock).
+(Bearer auth required). The daemon ships no production alias verifier yet, so
+these endpoints fail closed (HTTP 400) unless it is started with
+`--dev-mock-alias-verification` (or `SATSPATH_DEV_MOCK_ALIAS_VERIFICATION=1`)
+for local development; the insecure mock is refused when the daemon network is
+mainnet.
 The daemon signs with its local identity key and appends a `register` or
 `update_profile` event. Optional request fields are `alias`, `lightning_address`,
 `onchain_address`, `onchain_pubkey`, `ark_server`, `ark_pubkey`, `remove_methods`

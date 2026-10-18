@@ -53,6 +53,20 @@ async fn run() -> Result<()> {
         .network
         .or_else(|| std::env::var("SATSPATH_NETWORK").ok())
         .unwrap_or_else(|| DEFAULT_NETWORK.to_string());
+    let allow_mock_alias_verification = cli.dev_mock_alias_verification
+        || std::env::var("SATSPATH_DEV_MOCK_ALIAS_VERIFICATION")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false);
+    if allow_mock_alias_verification {
+        tracing::warn!(
+            "--dev-mock-alias-verification is enabled: alias verification is insecure and development-only"
+        );
+    }
     let home = cli
         .home
         .or_else(|| std::env::var_os("SATSPATH_HOME").map(std::path::PathBuf::from))
@@ -177,6 +191,7 @@ async fn run() -> Result<()> {
         network,
         open_ui: !cli.no_open,
         auth_token,
+        allow_mock_alias_verification,
         mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         anchor_lock: Arc::new(tokio::sync::Mutex::new(())),
         rate_limiter,
@@ -240,6 +255,7 @@ mod tests {
             network: "devnet".into(),
             open_ui: false,
             auth_token: "test_auth_token".into(),
+            allow_mock_alias_verification: false,
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             anchor_lock: Arc::new(tokio::sync::Mutex::new(())),
             rate_limiter: Arc::new(rate_limit::RateLimiter::new(
@@ -1074,12 +1090,13 @@ mod tests {
     async fn start_test_daemon(
         config: rate_limit::RateLimiterConfig,
     ) -> (String, Arc<Server>, tokio::task::JoinHandle<()>) {
-        start_test_daemon_full(config, None).await
+        start_test_daemon_full(config, None, true).await
     }
 
     async fn start_test_daemon_full(
         config: rate_limit::RateLimiterConfig,
         ssl_config: Option<tiny_http::SslConfig>,
+        allow_mock_alias_verification: bool,
     ) -> (String, Arc<Server>, tokio::task::JoinHandle<()>) {
         let dir = tempfile::tempdir().unwrap();
         let home = Box::leak(Box::new(dir)).path().to_path_buf();
@@ -1099,6 +1116,7 @@ mod tests {
             network: "devnet".into(),
             open_ui: false,
             auth_token: "test_token".into(),
+            allow_mock_alias_verification,
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             anchor_lock: Arc::new(tokio::sync::Mutex::new(())),
             rate_limiter: Arc::new(rate_limit::RateLimiter::new(config)),
@@ -1175,6 +1193,65 @@ mod tests {
         }
         server.unblock();
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mock_alias_endpoints_fail_closed_by_default() {
+        let config = rate_limit::RateLimiterConfig::default();
+        let (base_url, server, handle) = start_test_daemon_full(config, None, false).await;
+        let client = reqwest::Client::new();
+
+        for (path, body) in [
+            (
+                "/v1/profile/challenge",
+                serde_json::json!({"alias": "alice@example.com"}),
+            ),
+            (
+                "/v1/profile/verify",
+                serde_json::json!({"alias": "alice@example.com", "token": "alice@example.com"}),
+            ),
+        ] {
+            let response = client
+                .post(format!("{base_url}{path}"))
+                .bearer_auth("test_token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{path} must fail closed when the mock verifier is not enabled"
+            );
+            let body = response.text().await.unwrap();
+            assert!(!body.contains("test_token"));
+        }
+
+        server.unblock();
+        handle.abort();
+    }
+
+    #[test]
+    fn mock_alias_verification_requires_opt_in_and_refuses_mainnet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path());
+        let alias = || crate::types::AliasRequest {
+            alias: "alice@example.com".into(),
+        };
+        let verify = || crate::types::VerifyRequest {
+            alias: "alice@example.com".into(),
+            token: "alice@example.com".into(),
+        };
+
+        assert!(crate::handlers::profile::create_challenge(&state, alias()).is_err());
+        assert!(crate::handlers::profile::verify_challenge(&state, verify()).is_err());
+
+        state.allow_mock_alias_verification = true;
+        assert!(crate::handlers::profile::create_challenge(&state, alias()).is_ok());
+
+        state.network = "mainnet".into();
+        assert!(crate::handlers::profile::create_challenge(&state, alias()).is_err());
+        assert!(crate::handlers::profile::verify_challenge(&state, verify()).is_err());
     }
 
     #[tokio::test]
@@ -1441,7 +1518,8 @@ mod tests {
         };
 
         let config = rate_limit::RateLimiterConfig::default();
-        let (base_url, server, _handle) = start_test_daemon_full(config, Some(ssl_config)).await;
+        let (base_url, server, _handle) =
+            start_test_daemon_full(config, Some(ssl_config), true).await;
         assert!(base_url.starts_with("https://"));
 
         let client = reqwest::Client::builder()

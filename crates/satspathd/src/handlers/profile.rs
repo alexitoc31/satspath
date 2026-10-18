@@ -53,7 +53,27 @@ pub(crate) fn update_profile(
     profile_response(state)
 }
 
-pub(crate) fn create_challenge(_state: &AppState, body: AliasRequest) -> Result<serde_json::Value> {
+/// The daemon does not ship a production alias verifier. The mocked verifier
+/// proves nothing, so both alias endpoints fail closed unless the operator
+/// explicitly opted into the development-only mock and the daemon is not
+/// serving mainnet.
+fn ensure_mock_alias_verification_allowed(state: &AppState) -> Result<()> {
+    if !state.allow_mock_alias_verification {
+        anyhow::bail!(
+            "alias verification is not configured on this daemon; no alias can be verified (development only: start with --dev-mock-alias-verification)"
+        );
+    }
+    if matches!(
+        state.network.trim().to_ascii_lowercase().as_str(),
+        "mainnet" | "bitcoin"
+    ) {
+        anyhow::bail!("the insecure mock alias verifier is refused on mainnet; use a test network");
+    }
+    Ok(())
+}
+
+pub(crate) fn create_challenge(state: &AppState, body: AliasRequest) -> Result<serde_json::Value> {
+    ensure_mock_alias_verification_allowed(state)?;
     use satspath_core::platform::{EmailVerifier, MockEmailVerifier};
     let verifier = MockEmailVerifier {
         now: chrono::Utc::now().timestamp(),
@@ -62,11 +82,12 @@ pub(crate) fn create_challenge(_state: &AppState, body: AliasRequest) -> Result<
     let challenge = verifier.create_challenge(&body.alias)?;
     Ok(serde_json::json!({
         "challenge_id": challenge.challenge_id,
-        "message": "A mock verification code was sent. (MOCK: use the email address itself as the token)",
+        "message": "A mock verification code was sent. (DEVELOPMENT ONLY: use the email address itself as the token)",
     }))
 }
 
 pub(crate) fn verify_challenge(state: &AppState, body: VerifyRequest) -> Result<ProfileResponse> {
+    ensure_mock_alias_verification_allowed(state)?;
     use satspath_core::platform::{EmailVerifier, MockEmailVerifier};
     let verifier = MockEmailVerifier {
         now: chrono::Utc::now().timestamp(),
