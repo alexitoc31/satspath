@@ -23,11 +23,12 @@
 | :--- | :--- | :--- |
 | **Mainnet Profile Resolution** | **Supported** | SatsPath (Core / Resolvers) |
 | **Mainnet Lightning Discovery (LNURL/LN Address)** | **Supported** | SatsPath (Router) |
-| **BOLT12 Handling & Blinded Paths** | **Prototype / Experimental (Partial)** (Prototype primitives; standards-conformant string parsing & CLN/LDK interop unverified) | SatsPath (Router) |
+| **BOLT12 Handling & Blinded Paths** | **Supported** (Checksumless BOLT12 decoding, all-TLV Merkle signing, BOLT #4 blinded paths, and CLN/LDK onion message `invoice_request` interoperability) | SatsPath (Router) |
 | **Mainnet On-Chain Address Discovery (BIP-21)** | **Supported** | SatsPath (Router) |
-| **Silent Payments (BIP-352) Primitives** | **Prototype / Experimental** (Address/output construction implemented; standards conformance & mainnet interop unverified until official vectors pass) | SatsPath (Router) |
-| **Mainnet Ark Receive Pointer Discovery** | **Supported (Preview)** | SatsPath (Router) |
+| **Silent Payments (BIP-352) Primitives** | **Experimental** (Public operations checked against projections of 28 official vector groups; wallet interoperability unverified) | SatsPath (public routing/detection); host wallet (ECDH, private derivation, signing) |
+| **Mainnet Ark Receive Pointer Discovery** | **Supported (Preview)** (Live ASP `/v1/info` client, VTXO DAG verification, and Boarding/Forfeit/OOR handoff builders) | SatsPath (Router) |
 | **Wallet Handoff Generation (URIs, QR codes)** | **Supported** | SatsPath (Router / CLI) |
+| **Non-Custodial Host-Wallet SDK Bridges (`WalletExecutor`)** | **Supported** for BDK/LDK; quote execution requires current local state, SMT and log proofs, a pinned checkpoint, a nonzero witness quorum, and independent gossip evidence. Legacy Boltz P2WSH claims/refunds support **Testnet/Regtest only** with authenticated host-provided swap terms and confirmed unspent lockup evidence; Mainnet, Taproot and cross-chain execution remain disabled (`crates/satspath-router/src/wallet_executor.rs`) | Host Wallet Signs & Broadcasts |
 | **Mainnet Payment Execution by SatsPath** | **Unsupported / Out of Scope** | **Host Wallet Only** |
 | **Transaction Signing (PSBT / Schnorr / ECDSA)** | **Unsupported / Out of Scope** | **Host Wallet Only** |
 | **Mempool Transaction Broadcast** | **Unsupported / Out of Scope** | **Host Wallet Only** |
@@ -44,7 +45,7 @@ SatsPath operates strictly on **public payment data** to generate wallet handoff
 2. **Verify:** Validates cryptographic signatures, sequence freshness, and expiration.
 3. **Route:** Evaluates fees and policies across available receiving methods.
 4. **Handoff:** Formats the selected method into a wallet handoff payload (`bitcoin:` URI, BOLT11 invoice, experimental BOLT12 structure, Ark pointer, or QR code), subject to the capability-specific maturity and interoperability limits documented above.
-5. **Execution:** The host wallet scans or receives the handoff payload, prompts the user for confirmation, signs with the user's spending key, and broadcasts to the Bitcoin or Lightning network.
+5. **Execution:** The host wallet scans or receives the handoff payload (or integrates via `WalletExecutor` / `HostWalletSdkBridge`), prompts the user for confirmation, signs with the user's spending key, and broadcasts to the Bitcoin or Lightning network.
 
 Safe CLI preview commands:
 
@@ -63,7 +64,7 @@ satspath quote alice@satspath.dev 21000 --mainnet-preview --json
 
 BIP-353 resolution is a preview layer: SatsPath resolves and displays DNSSEC-backed payment instructions but never pays, signs, or broadcasts.
 
-* **DNSSEC Policy Enforcement:** In the core `resolve_bip353` / `resolve_bip353_with` preview flow, the default `Strict` policy fails closed and does not trust an unvalidated upstream resolver's AD bit. The default DoH backend does not independently validate the DNSSEC chain; Strict mode therefore requires authenticated DNSSEC results and fails closed otherwise. `DevInsecure` mode is for local testing only, requires `--allow-insecure-dns-for-dev`, and prints a loud warning. `Bip353Resolver::resolve_alias` is a separate profile-resolution path and does not apply `DnssecPolicy`. It now returns `Bip353Unauthenticated` for otherwise valid DNS payment instructions because they do not authenticate a SatsPath profile. Its former locally signed synthetic profiles did not establish authenticated DNSSEC results or alias ownership; the preview flow’s Strict-mode guarantee must not be attributed to this resolver.
+* **DNSSEC Policy Enforcement:** In the core `resolve_bip353` / `resolve_bip353_with` preview flow, the default `Strict` policy validates the DNSSEC trust chain locally against bundled ICANN root trust anchors (`38696` bundled explicitly alongside Hickory's default `19036` and `20326`) via `HickoryDnssecTxtResolver` and fails closed (`SatsPathError::DnssecUnavailable` or `SatsPathError::NetworkError`) on unsigned or tampered zones. `DevInsecure` mode (`DohTxtResolver`) is for local testing only, requires `--allow-insecure-dns-for-dev`, and prints a loud warning. `Bip353Resolver::resolve_alias` enforces `DnssecPolicy::Strict` via `resolve_bip353_with`: if an `sp-profile` pointer is present, it fetches the signed profile over an SSRF-hardened, IP-pinned HTTPS connection and verifies ownership; otherwise it returns `SatsPathError::Bip353Unauthenticated` without synthesizing a profile.
 * **Ambiguity is Invalid:** More than one `bitcoin:` TXT record at a single name, or an unknown `req-*` parameter, causes resolution to fail closed.
 * **Zero Private Material:** No private material may ever appear in a published or resolved DNS payload (`seed`, `xprv`, `mnemonic`, `macaroon`, `cert`, `api_key`, `claim_key`, `refund_key`, `preimage`) — screened on both publish and resolve.
 * **Cryptographic Authorization:** DNSSEC cryptographically authorizes the DNS record, while the signed profile (including its `secp256k1` identity-key signature) remains strictly required for profile-based payments. Email inbox access alone never authorizes a payment-instruction change.
@@ -77,3 +78,30 @@ BIP-353 resolution is a preview layer: SatsPath resolves and displays DNSSEC-bac
 * **Exclusion from Production Safety Claim:** Production mainnet profile resolution and validation rely exclusively on classical, battle-tested `secp256k1` BIP-340 Schnorr signatures. PQC is not part of the production mainnet safety claim.
 * **Fail-Closed Default:** When the `pqc` feature is not enabled (the default for production builds), any profile specifying `pqc_required: true` or supplying `hybrid_pubkey` or `hybrid_signature` (even when `pqc_required` is false) is rejected (`Ok(false)`). In builds with the `pqc` feature disabled, this guarantees that verifiers never accept unverified post-quantum assertions, unverified hybrid extensions, or false security guarantees.
 
+## BIP-352 wallet boundary
+
+The router accepts public prevout data, scan/spend public keys, labeled spend
+public keys, and ECDH curve points computed by the host wallet. The host wallet
+must derive each ECDH point from the exact transaction inputs and recipient scan
+key. Sender points use `input_hash * a * B_scan`; receiver points use
+`b_scan * input_hash * A`. `bip352_input_context` exposes the public input hash,
+aggregate public key, and receiver tweak point. Prevouts must be authenticated by
+the wallet; the router does not execute scripts or verify transaction signatures.
+
+`create_bip352_outputs` and `scan_bip352_transaction` require an explicit network.
+Regtest uses `sprt`; Testnet, Testnet4, and Signet share `tsp`. Scanning returns
+public output keys, derivation indices, and optional label identifiers. The wallet
+retains private label derivation, output spending-key derivation, transaction
+construction, amount/destination confirmation, signing, and broadcasting.
+
+The former router key generation, private-key extraction/aggregation, spending-key
+derivation, and `SilentPayment` session APIs have been removed. Integrations must
+perform those operations within their host wallet and supply only public data to
+the router. Public ECDH points are not proofs of correct wallet computation;
+the host wallet must verify final outputs before signing.
+
+## Wallet bridge integration requirements
+
+`execute_quote_handoff` accepts host-configured `HandoffTrust` and fresh `HandoffTransparencyEvidence`. Bootstrap its `CheckpointStore` from a trusted checkpoint out of band, keep the pin directory under a single process owner, and reuse the trust instance across calls. Obtain witness and observer keys independently of the quote. Missing evidence, absent/revoked state, rollback, inconsistent extensions, and conflicting observed checkpoints fail before wallet dispatch. An observer ahead of the local log requires synchronization first. Gossip only detects views actually observed; it cannot prove that undisclosed forks do not exist.
+
+`BoltzHostSignerBroadcaster::swap_evidence` must load the wallet’s authenticated saved swap agreement and query its trusted node for the configured network, lockup confirmations, unspent status, and tip height. The bridge validates the full legacy Boltz witness script, funding transaction/output, destination and bounded fee, preimage or block-height CLTV, and the host’s low-S SIGHASH_ALL signature. Spending keys remain inside the host. A `SwapSettlement` receipt acknowledges broadcast of the verified transaction; it does not claim on-chain confirmation.

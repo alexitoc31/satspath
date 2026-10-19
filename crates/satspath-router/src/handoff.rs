@@ -14,7 +14,7 @@ use satspath_core::{
     BitcoinNetwork, PaymentMethod,
 };
 
-use crate::lightning::validate_bolt11_invoice;
+use crate::lightning::validate_bolt11_invoice_for_network;
 
 /// Format an exact on-chain amount without floating-point rounding.
 pub fn fmt_btc(sats: u64) -> String {
@@ -193,7 +193,7 @@ fn validate_bolt11(
         bail!("BOLT11 invoice payee does not match the selected method");
     }
     let amount_msats = amount_sats.checked_mul(1_000).context("amount overflow")?;
-    validate_bolt11_invoice(payload, amount_msats)?;
+    validate_bolt11_invoice_for_network(payload, amount_msats, Some(invoice.network()))?;
     Ok(())
 }
 

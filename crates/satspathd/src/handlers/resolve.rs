@@ -3,7 +3,7 @@
 use anyhow::Result;
 use satspath_core::{
     bip321::parse_bip321,
-    bip353::{resolve_bip353_with, DnssecPolicy, DohTxtResolver},
+    bip353::{resolve_bip353_with, DnssecPolicy, DohTxtResolver, HickoryDnssecTxtResolver},
     crypto::verify_signed_profile,
     resolver::ChainResolver,
     resolvers::{bip353::Bip353Resolver, http::HttpResolver, nostr::NostrResolver},
@@ -15,6 +15,8 @@ use crate::config::AppState;
 use crate::handlers::transparency::transparency_log;
 use crate::types::{now, DnsResolveRequest, DnsResolveResponse};
 
+/// Build the registry, BIP-353, HTTP, and Nostr resolver chain in that order.
+/// Skips the registry if it cannot be opened. BIP-353 continuity is stored under `home`.
 pub(crate) fn resolver_chain(home: &std::path::Path) -> ChainResolver {
     use satspath_core::registry::Registry;
     let mut chain = ChainResolver::new();
@@ -22,7 +24,7 @@ pub(crate) fn resolver_chain(home: &std::path::Path) -> ChainResolver {
         chain = chain.push(registry);
     }
     chain
-        .push(Bip353Resolver::new())
+        .push(Bip353Resolver::new(home))
         .push(HttpResolver::new())
         .push(NostrResolver::new())
 }
@@ -204,14 +206,26 @@ pub(crate) fn resolve_v2_envelope(
     })
 }
 
+static HICKORY_RESOLVER: std::sync::LazyLock<HickoryDnssecTxtResolver> =
+    std::sync::LazyLock::new(HickoryDnssecTxtResolver::new);
+
+/// Resolve a BIP-353 DNS payment instruction using `HickoryDnssecTxtResolver` in `Strict` mode
+/// or `DohTxtResolver` when `allow_insecure_dns_for_dev` is explicitly enabled.
+/// Returns the resolution and parsed instruction on success; resolution and URI
+/// parsing failures become `DnsResolveResponse::Error` with the selected policy.
 pub(crate) async fn dns_resolve_response(body: DnsResolveRequest) -> DnsResolveResponse {
     let policy = if body.allow_insecure_dns_for_dev {
         DnssecPolicy::DevInsecure
     } else {
         DnssecPolicy::Strict
     };
-    let resolver = DohTxtResolver::new();
-    match resolve_bip353_with(&resolver, &body.name, policy, now()).await {
+    let resolution_result = if body.allow_insecure_dns_for_dev {
+        let resolver = DohTxtResolver::new();
+        resolve_bip353_with(&resolver, &body.name, policy, now()).await
+    } else {
+        resolve_bip353_with(&*HICKORY_RESOLVER, &body.name, policy, now()).await
+    };
+    match resolution_result {
         Ok(resolution) => match parse_bip321(&resolution.bitcoin_uri) {
             Ok(parsed) => DnsResolveResponse::Ok { resolution, parsed },
             Err(e) => DnsResolveResponse::Error {

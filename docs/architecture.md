@@ -42,11 +42,17 @@ The SatsPath codebase is organized as a modular Rust workspace:
 satspath/
 ├── crates/
 │   ├── satspath-core/          # Protocol models, secp256k1 crypto, canonical serialization,
-│   │                           # Merkle tree transparency, state map, and resolvers (HTTP, Nostr, BIP-353)
+│   │                           # Merkle tree transparency, 256-bit Sparse Merkle state map,
+│   │                           # Catena Bitcoin OP_RETURN anchor chain, gossip, and resolvers
 │   ├── satspath-router/        # Payment capability discovery, multi-source fee consensus,
 │   │                           # BOLT12 handling, BIP-352 Silent Payments, routing heuristics, and handoff
 │   ├── satspath-cli/           # Reference command-line client for development and preview flows
-│   ├── satspathd/              # Authoritative server daemon, REST API, transparency endpoint, rate limiting
+│   ├── satspathd/              # Modular authoritative daemon:
+│   │   ├── handlers/           #   claim, profile, quote, resolve, send, status, transparency, wallet
+│   │   ├── telemetry/          #   Prometheus /metrics, deep /health probes, structured tracing
+│   │   ├── rate_limit.rs       #   Per-IP token-bucket rate limiter & 64 KB payload guard
+│   │   ├── server.rs           #   HTTP/TLS lifecycle & cleartext binding security audit
+│   │   └── v2_api.rs           #   S2S v2 authoritative resolution & witness proof envelopes
 │   ├── satspath-witness/       # Independent witness node daemon, K-of-N checkpoint cosigning,
 │   │                           # rollback and split-view detection
 │   ├── satspath-wasm/          # WebAssembly bindings for browser and web wallet integrations
@@ -102,5 +108,5 @@ flowchart LR
 1. **User Identity Keypair:** Generated locally on the user's device. Used exclusively to authorize public profile updates and key rotations. Never transmitted over the network.
 2. **Resolver Transports:** HTTPS, Nostr, DNS, and local files are treated as untrusted transports. All returned profiles must be independently verified by the local client.
 3. **Log Operator:** The log operator signs checkpoints committing to append-only history. It cannot author identity changes or key rotations without the user's private key signature.
-4. **Witness Quorum:** Independent witnesses cosign operator checkpoints only after verifying append-only consistency proofs. Quorum threshold ($K$-of-$N$) ensures single-witness compromise cannot validate a split view.
+4. **Witness Quorum & Catena Anchoring:** Independent witnesses (`satspath-witness`) cosign operator checkpoints only after verifying append-only RFC 6962 consistency proofs and `map_root` bindings. Quorum threshold ($K$-of-$N$) ensures single-witness compromise cannot validate a split view. In addition, the Catena-style Bitcoin on-chain anchor (`crates/satspath-core/src/transparency/catena.rs`) chains a 1,000-sat continuation UTXO across consecutive `OP_RETURN` commitments (`SatsPathCatenaAnchorV1`), using Bitcoin's double-spend prevention to deter equivocating checkpoint histories.
 5. **Host Wallet:** The host wallet remains the sovereign arbiter of funds. SatsPath provides the validated payment instructions; the wallet checks amounts, prompts the user, signs, and broadcasts.

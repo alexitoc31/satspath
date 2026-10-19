@@ -66,14 +66,25 @@ malicious resolver.
 
 | Mode               | Behavior                                                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| `Strict` (default) | Require real DNSSEC validation; **fail closed** otherwise.                                                                     |
+| `Strict` (default) | Require local cryptographic DNSSEC chain validation; **fail closed** otherwise. Never trusts upstream DoH `AD=true` flags alone. |
 | `DevInsecure`      | Local testing only. Accept unvalidated records with loud warnings. Never the default; requires `--allow-insecure-dns-for-dev`. |
 
-This build does not ship a local DNSSEC validator, so `Strict` resolution **fails
-closed** with a clear message (option C of the BIP-353 DNSSEC guidance). A future
-release can plug in a validating resolver without changing the contract. The
-`--allow-insecure-dns-for-dev` flag prints a scary warning and must never be used
-on mainnet.
+### Embedded Local DNSSEC Validation Engine (`HickoryDnssecTxtResolver` & `verify_dnssec_zone_chain`)
+
+SatsPath ships an embedded local DNSSEC cryptographic validation engine in `crates/satspath-core/src/resolvers/bip353.rs`:
+
+1. **Bundled Root Trust Anchors (`root_trust_anchors()`):**
+   - Explicitly bundles and verifies the active ICANN Root KSK (key tag `38696`), while inheriting historical and standby root keys (`19036` and `20326`) from Hickory's default `TrustAnchor`.
+   - Verifies that the decoded RSA public key matches RFC 4034 key tag `38696` at initialization.
+   - Follows IANA trust-anchor guidance: key tags identify keys and are checked alongside full cryptographic key data; during rollovers both active and accepted successor anchors verify valid chains.
+2. **Cryptographic Chain Verification (`verify_dnssec_zone_chain` & `DnssecDnsHandle`):**
+   - Performs in-process RFC 4034 / RFC 4035 verification of `DNSKEY`, `RRSIG`, and `DS` records across the entire zone hierarchy (`.` → TLD → `<domain>` down to the leaf `TXT` RRset).
+   - Unsigned zones (missing `DS` or `RRSIG`) fail closed with `SatsPathError::DnssecUnavailable`.
+   - Tampered or expired `RRSIG` signatures and mismatched `DS` digests fail closed with `SatsPathError::NetworkError`.
+   - Verifies canonical DNS wire-format RRset sorting, signature inception/expiration windows, and cryptographic signatures (RSA-SHA256 Alg 8, ECDSA P-256/P-384 Alg 13/14, Ed25519 Alg 15).
+3. **Profile Resolution Separation (`Bip353Resolver::resolve_alias`):**
+   - A DNS `bitcoin:` instruction without an authenticated `sp-profile` pointer returns `SatsPathError::Bip353Unauthenticated` and never fabricates a synthetic `SignedPaymentProfile`.
+   - When an `sp-profile` pointer is present, it is fetched over an SSRF-protected, IP-pinned HTTPS connection with a 50 KB response bound and verified via `verify_bip353_ownership`.
 
 ## Direct TXT model (Option A)
 
@@ -203,3 +214,23 @@ Payment URI: bitcoin:?lno=...
 Mode: Mainnet Preview
 No funds moved.
 ```
+
+### Profile continuity
+
+`Bip353Resolver` persists authenticated `sp-profile` identities in
+`.satspath/bip353-continuity.sqlite3`. Applications with a custom data directory
+must set `with_continuity_dir`; the daemon uses its configured home. Keep this
+file across restarts to retain TOFU pins, sequence counters and revocations.
+Storage errors stop resolution. SQLite serializes concurrent profile updates.
+
+A numbered profile must advance the stored sequence on each acceptance; equal
+or lower counters and removal of an existing counter are rejected. As in the
+local registry, legacy profiles without counters remain compatible until a
+counter is adopted. Key changes require the registry's authenticated rotation or
+recovery proof. An authenticated revocation persists as a terminal tombstone,
+including when subsequent DNS or HTTP requests would fail.
+
+HTTP profile fetches validate public payment metadata and reject private material
+before it can be returned or persisted. Custom DNS server configurations reject
+private and reserved IP addresses; `HickoryDnssecTxtResolver::with_config` returns
+`Result`. Arbitrary DNS handles are available only in tests or with `test-utils`.

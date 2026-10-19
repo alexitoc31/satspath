@@ -34,6 +34,10 @@ jobs:
           - fuzz_canonical_json
           - fuzz_ownership_proof
           - fuzz_profile_deser
+          - fuzz_nostr_event
+          - fuzz_merkle_proof
+          - fuzz_capability_handoff
+          - fuzz_schnorr_profile
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -78,7 +82,7 @@ jobs:
           fi
           if [ "$FUZZ_TARGET" = "fuzz_bip321" ]; then
             cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME" -max_len=65537
-          elif [ "$FUZZ_TARGET" = "fuzz_bolt12" ] || [ "$FUZZ_TARGET" = "fuzz_ownership_proof" ] || [ "$FUZZ_TARGET" = "fuzz_profile_deser" ]; then
+          elif [ -d "fuzz/corpus/$FUZZ_TARGET" ]; then
             cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"
           else
             cargo fuzz run "$FUZZ_TARGET" -- -max_total_time="$MAX_TIME"

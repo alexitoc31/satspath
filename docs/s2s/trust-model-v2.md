@@ -1,8 +1,8 @@
 # SatsPath v2 Trust Model and Malicious-Server Invariants
 
 **Status:** Draft / Normative Specification  
-**Parent Epic:** [#46](https://github.com/Truja503/satspath/issues/46)  
-**Issue:** [#47](https://github.com/Truja503/satspath/issues/47)
+**Parent Epic:** [#46](https://github.com/satspath/satspath/issues/46)  
+**Issue:** [#47](https://github.com/satspath/satspath/issues/47)
 
 ---
 

@@ -21,10 +21,15 @@ jobs:
         with:
           node-version: '20'
           cache: npm
-          cache-dependency-path: sdk/satspath-p2p/package-lock.json
+          cache-dependency-path: |
+            sdk/satspath-p2p/package-lock.json
+            proxy-workers/bolt12/package-lock.json
       - run: npm ci --prefix sdk/satspath-p2p
       - run: npm test --prefix sdk/satspath-p2p
       - run: node --test crates/satspathd/tests/dashboard-auth.test.mjs
+      - run: npm ci --prefix proxy-workers/bolt12
+      - run: npm run typecheck --prefix proxy-workers/bolt12
+      - run: npm test --prefix proxy-workers/bolt12
 
   test:
     name: Test workspace

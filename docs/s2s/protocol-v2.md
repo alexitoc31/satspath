@@ -1,8 +1,8 @@
 # SatsPath v2 Server-to-Server (S2S) Wire Protocol Specification
 
 **Status:** Draft / Normative Specification  
-**Parent Epic:** [#46](https://github.com/Truja503/satspath/issues/46)  
-**Issue:** [#48](https://github.com/Truja503/satspath/issues/48)  
+**Parent Epic:** [#46](https://github.com/satspath/satspath/issues/46)  
+**Issue:** [#48](https://github.com/satspath/satspath/issues/48)  
 **Depends On:** [trust-model-v2.md](./trust-model-v2.md)
 
 ---

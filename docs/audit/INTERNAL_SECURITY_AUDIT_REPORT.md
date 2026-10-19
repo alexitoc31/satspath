@@ -21,7 +21,7 @@ As an internal ethical hacker review, testing was conducted from an adversarial 
 6. Crashing parsers or leaking sensitive keys via malformed or private inputs.
 
 The audit established and automated a dedicated adversarial security test suite:
-📁 [`crates/satspath-core/tests/adversarial_security.rs`](file:///home/chelo/antigravity/PlanB/satspath/crates/satspath-core/tests/adversarial_security.rs)
+📁 [`crates/satspath-core/tests/adversarial_security.rs`](../../crates/satspath-core/tests/adversarial_security.rs)
 
 ### Overall Assessment & Security Posture
 The SatsPath core stack exhibits a **strict fail-closed architecture**:

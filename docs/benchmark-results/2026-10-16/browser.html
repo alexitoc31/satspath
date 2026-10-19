@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Auditable SatsPath WASM comparison</title>
+<pre id="output">Running...</pre>
+<script type="module">
+import init, {
+  canonical_profile_json, sign_profile_json, verify_signed_profile, topic_for_alias,
+} from "../../../crates/satspath-wasm/pkg/satspath_wasm.js";
+
+try {
+  await init();
+  const response = await fetch("./fixture.json");
+  if (!response.ok) throw new Error(`fixture HTTP ${response.status}`);
+  const fixture = await response.json();
+  const profile = fixture.profile_json;
+  const testKey = "1".padStart(64, "0"); // Public test scalar 1.
+  const assert = (ok, check) => { if (!ok) throw new Error(check); };
+  const signature = sign_profile_json(profile, testKey);
+  assert(/^[0-9a-f]{128}$/.test(signature), "signature encoding");
+  const signed = { profile: JSON.parse(profile), signature };
+  const signedJson = JSON.stringify(signed);
+  assert(verify_signed_profile(signedJson), "signature round trip");
+  signed.profile.sequence = 2;
+  assert(!verify_signed_profile(JSON.stringify(signed)), "tampered rejection");
+  assert(!verify_signed_profile("{}"), "malformed rejection");
+  assert(new TextDecoder().decode(canonical_profile_json(profile)) === fixture.canonical_json, "canonical bytes");
+  const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+  assert(hex(topic_for_alias(fixture.alias)) === fixture.topic_hex, "SHA-256 topic vector");
+
+  const measure = (iterations, operation) => {
+    for (let i = 0; i < 20; i++) operation();
+    const elapsedMs = [];
+    for (let sample = 0; sample < 7; sample++) {
+      const start = performance.now();
+      for (let i = 0; i < iterations; i++) operation();
+      elapsedMs.push(performance.now() - start);
+    }
+    return { iterations_per_sample: iterations, elapsed_ms: elapsedMs };
+  };
+  const result = {
+    user_agent: navigator.userAgent,
+    correctness_checks: "passed: canonical bytes, sign/verify round trip, tampered and malformed rejection, SHA-256 topic vector",
+    warmup_iterations_per_operation: 20,
+    operations: {
+      canonical_profile_json: measure(2000, () => canonical_profile_json(profile)),
+      sign_profile_json: measure(500, () => sign_profile_json(profile, testKey)),
+      verify_signed_profile: measure(500, () => verify_signed_profile(signedJson)),
+      topic_for_alias: measure(5000, () => topic_for_alias(fixture.alias)),
+    },
+  };
+  document.getElementById("output").textContent = JSON.stringify(result, null, 2);
+} catch (error) {
+  document.getElementById("output").textContent = JSON.stringify({ error: String(error), correctness_checks: "failed or incomplete" });
+}
+</script>
+</html>

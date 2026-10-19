@@ -67,7 +67,7 @@ SatsPath uses `SHA256(canonical_identifier)` for internal indexation and transpo
 | **Rollback Attacker** | Attacker serves a valid older checkpoint to un-publish a recent rotation. | Client pins highest observed log size and sequence; rejecting any `size < pinned_size`. | Client persists monotonic pin state locally across restarts. | Fresh client without local cache relies on witness quorum freshness timestamps. |
 | **Split-View / Equivocation** | Operator serves Root A to Alice and Root B to Bob for the same log size. | Checkpoint consistency proofs (RFC 6962) and witness cosigning detect distinct roots at the same sequence. | Checkpoints must be presented to common witnesses or public monitors. | Without real-time witness gossip, split views are only detected post-facto. |
 | **Malicious Replica** | Desynchronized or hostile replica serves stale/omitted records. | Clients evaluate self-contained cryptographic envelopes; Merkle inclusion must bind to signed checkpoint. | Envelope contains valid inclusion proof to a fresh, witnessed checkpoint. | Replica can delay synchronization, appearing temporarily unreachable. |
-| **DNS Manipulation / Cache Poisoning** | Attacker injects fraudulent DNS records for BIP-353 names. | `DnssecPolicy::Strict` requires authentic DNSSEC results and fails closed otherwise. | Validating resolver has correct trust anchors (DNS root `.`). | Default DoH backend does not independently validate the DNSSEC chain; Strict mode therefore fails closed without authenticated DNSSEC results. |
+| **DNS Manipulation / Cache Poisoning** | Attacker injects fraudulent DNS records for BIP-353 names. | `DnssecPolicy::Strict` validates `DNSKEY`/`RRSIG`/`DS` chains locally via `HickoryDnssecTxtResolver` anchored at ICANN root KSKs (`38696`, `20326`, `19036`) and fails closed otherwise. | Integrity of ICANN DNS root trust anchors; `DohTxtResolver` without local chain proofs fails closed in Strict mode. | First-contact BIP-353 resolution without a pinned `sp-profile` relies on DNSSEC root/TLD/zone key integrity. |
 | **Profile / Key Substitution** | Attacker self-signs a fresh profile with an attacker key for victim's alias. | Log inclusion check verifies that the identity key matches the canonical history in the append-only tree. | Attacker cannot forge the victim's private key signature authorizing rotation. | Relies on client verifying log inclusion rather than bare self-signature. |
 | **Identifier Enumeration** | Attacker iterates rainbow tables against `SHA256(alias)` topics. | Obfuscation limits casual sniffing; rate-limiting on directory daemons. | None (SHA-256 is deterministic and public). | Low-entropy aliases (short names, popular domains) can be enumerated offline. |
 | **Payment Method Substitution** | Attacker compromises a third-party LNURL endpoint listed in profile. | SatsPath verifies LNURL metadata and match bounds; method ownership proofs bind keys to profile. | Host wallet displays payment destination details before execution. | Compromise of third-party LNURL domain can redirect payments if not pinned. |
@@ -80,14 +80,14 @@ SatsPath uses `SHA256(canonical_identifier)` for internal indexation and transpo
 
 ## 6. Silent Payments (BIP-352) Security Model
 
-SatsPath implements experimental BIP-352 Silent Payments for private on-chain settlement, decoupling sender payments from public address reuse:
+SatsPath implements experimental BIP-352 Silent Payments public-key validation and output verification for private on-chain settlement, decoupling sender payments from public address reuse:
 
 ### Cryptographic Foundation
-1. **Computational Diffie-Hellman (CDH) over secp256k1:** Shared secret $S = a \cdot B_{\text{scan}} = b_{\text{scan}} \cdot A$, where $A$ is the sum of eligible input public keys and $B_{\text{scan}}$ is the recipient's scan public key.
+1. **Computational Diffie-Hellman (CDH) over secp256k1:** Shared secret $S = a \cdot B_{\text{scan}} = b_{\text{scan}} \cdot A$, where $A$ is the sum of eligible input public keys and $B_{\text{scan}}$ is the recipient's scan public key. Private-key ECDH derivation is performed exclusively by the host wallet.
 2. **Dual-Key Isolation:** Recipient advertises a scan key ($B_{\text{scan}}$) and spend key ($B_{\text{spend}}$). Online scanning nodes require only $b_{\text{scan}}$ to detect incoming funds, keeping $b_{\text{spend}}$ cold.
 3. **Tagged Hashing Domain Separation:** Hashes conform to BIP-340/352 (`BIP0352/Inputs` and `BIP0352/SharedSecret`) ensuring scalar tweaks cannot collide with Taproot script trees.
 4. **Input Outpoint Binding:** Lexicographically smallest outpoint ($outpoint_L$) is committed to prevent tweak malleability across multi-input transactions.
-5. **Conformance Status:** Experimental BIP-352 primitives and address/output construction are implemented. Standards conformance and mainnet interoperability are not claimed until the official BIP-352 test vectors pass.
+5. **Conformance Status:** Public-key address encoding, input eligibility, NUMS point exclusion, and output verification are checked against public projections of all 28 official BIP-352 test vector groups (`crates/satspath-router/src/silent_payments.rs`). Because SatsPath never holds private keys, full sender/receiver wallet execution remains delegated to the host wallet.
 
 ---
 
@@ -107,7 +107,6 @@ To defend against fee manipulation where compromised or malicious oracles report
 Before SatsPath can be recommended for mainnet real-funds settlement:
 
 1. **Independent Cryptographic Audit:** Formal third-party review of canonical serialization, Merkle proof verifiers, key rotation, and domain-separated signing schemes.
-2. **Decentralized Witness Quorum Deployment:** Production deployment of heterogeneous, multi-operator witnesses with public alert mechanisms.
-3. **Local DNSSEC Validation:** Native inclusion of an embedded validating DNSSEC resolver for BIP-353 without reliance on upstream flags.
-4. **BOLT12 Conformance & Interoperability:** Implementation of standards-conformant checksumless BOLT12 string decoding, all-TLV Merkle tree root hashing, invoice-request construction, and interoperability testing against live Core Lightning and LDK nodes.
-5. **Standardized Wallet Handoff:** Finalization of BIP-21/BOLT12 handoff specifications with major open-source Bitcoin wallets.
+2. **Decentralized Witness Quorum Deployment:** Production deployment of heterogeneous, multi-operator witnesses and gossip monitors with public alert mechanisms.
+3. **Production Alias Attestation:** Replacement of the development-only mock alias verifier (`--dev-mock-alias-verification`, disabled by default and refused on mainnet) with cryptographic domain/inbox attestations.
+4. **Live Multi-Rail Node & Wallet Interoperability:** End-to-end validation against live Core Lightning / LDK BOLT12 nodes, BIP-352 Silent Payment wallets, and `arkd` servers before enabling non-BIP-21 rails in `satspathd` payable handoff endpoints.

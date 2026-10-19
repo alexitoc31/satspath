@@ -1372,6 +1372,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "satspath-core"
 version = "0.1.0"
 dependencies = [
@@ -1390,6 +1396,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "rusqlite",
+ "satspath-handoff",
  "secp256k1",
  "serde",
  "serde_json",
@@ -1407,11 +1414,25 @@ name = "satspath-fuzz"
 version = "0.0.0"
 dependencies = [
  "canonical_json",
+ "hex",
  "libfuzzer-sys",
  "satspath-core",
  "satspath-router",
+ "secp256k1",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "satspath-handoff"
+version = "0.1.0"
+dependencies = [
+ "bech32 0.9.1",
+ "bitcoin",
+ "hex",
+ "lightning-invoice",
+ "secp256k1",
+ "url",
 ]
 
 [[package]]
@@ -1419,6 +1440,7 @@ name = "satspath-router"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bech32 0.9.1",
  "bitcoin",
  "chrono",
@@ -1427,13 +1449,16 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "satspath-core",
+ "satspath-handoff",
  "secp256k1",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
  "urlencoding",
 ]
 
@@ -1505,6 +1530,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87f7bb64f8c7e9f783fdfe883b5fe93a90bee1597c63705baa91842c5f698620"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

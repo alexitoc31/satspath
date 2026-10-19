@@ -29,9 +29,10 @@ This specification serves as the formal briefing document for external cryptogra
 * **Domain Separation Tags:**
   To prevent cross-context signature replay (e.g. an attestation being replayed as a profile signature or checkpoint), each signed object prepends a constant domain tag before hashing:
   - **Payment Profiles:** `b"SatsPathProfileV1"`
-  - **Transparency Events:** `b"SatsPathEventV1"`
-  - **Transparency Checkpoints:** `b"SatsPathCheckpointV1"`
-  - **Identity Rotation Receipts:** `b"SatsPathKeyRotationV1"`
+  - **Transparency Events (`NameEvent`):** `b"SatsPathNameEventPayloadV1"` (leaf commitment: `b"SatsPathSignedNameEventV1"`)
+  - **Transparency Checkpoints:** `b"SatsPathTransparencyCheckpointV1"`
+  - **Identity Rotation Receipts:** `b"SatsPathKeyRotationAuthorizationV1"` and `b"SatsPathKeyRotationAcceptanceV1"`
+  - **Guardian Recovery Receipts:** `b"SatsPathKeyRecoveryAuthorizationV1"` and `b"SatsPathKeyRecoveryAcceptanceV1"`
 * **Profile Signature Construction:**
   $$\text{Digest} = \text{SHA256}\Big(\text{"SatsPathProfileV1"} \mathbin{\Vert} \text{CanonicalJSON}(\text{profile})\Big)$$
   $$\sigma = \text{SchnorrSign}(\text{sk}, \text{Digest})$$
@@ -98,8 +99,8 @@ Cryptographic reviewers are invited to analyze and report on:
 
 | Component | Repository Path | Primary Functions / Types |
 |---|---|---|
-| Schnorr Signing & Derivation | [`crates/satspath-core/src/crypto.rs`](file:///home/chelo/antigravity/PlanB/satspath/crates/satspath-core/src/crypto.rs) | `sign_profile`, `verify_signed_profile`, `derive_identity_key_from_seed`, `canonical_profile_bytes` |
-| Merkle Tree Primitives | [`crates/satspath-core/src/transparency/tree.rs`](file:///home/chelo/antigravity/PlanB/satspath/crates/satspath-core/src/transparency/tree.rs) | `leaf_hash`, `node_hash`, `merkle_root`, `inclusion_proof`, `consistency_proof` |
-| Checkpoint Verification | [`crates/satspath-core/src/transparency/verifier.rs`](file:///home/chelo/antigravity/PlanB/satspath/crates/satspath-core/src/transparency/verifier.rs) | `verify_checkpoint_transition`, `verify_checkpoint_inclusion`, `verify_identifier_history` |
-| Post-Quantum Hybrid Engine | [`crates/satspath-pqc/src/`](file:///home/chelo/antigravity/PlanB/satspath/crates/satspath-pqc/src/) | `hybrid_sig::hybrid_sign`, `hybrid_sig::hybrid_verify`, `hybrid_kem` |
-| Adversarial Test Suite | [`crates/satspath-core/tests/adversarial_security.rs`](file:///home/chelo/antigravity/PlanB/satspath/crates/satspath-core/tests/adversarial_security.rs) | 12 automated adversarial test vectors |
+| Schnorr Signing & Derivation | [`crates/satspath-core/src/crypto.rs`](../../crates/satspath-core/src/crypto.rs) | `sign_profile`, `verify_signed_profile`, `derive_identity_key_from_seed`, `canonical_profile_bytes` |
+| Merkle Tree Primitives | [`crates/satspath-core/src/transparency/tree.rs`](../../crates/satspath-core/src/transparency/tree.rs) | `leaf_hash`, `node_hash`, `merkle_root`, `inclusion_proof`, `consistency_proof` |
+| Checkpoint Verification | [`crates/satspath-core/src/transparency/verifier.rs`](../../crates/satspath-core/src/transparency/verifier.rs) | `verify_checkpoint_transition`, `verify_checkpoint_inclusion`, `verify_identifier_history` |
+| Post-Quantum Hybrid Engine | [`crates/satspath-pqc/src/`](../../crates/satspath-pqc/src/) | `hybrid_sig::hybrid_sign`, `hybrid_sig::hybrid_verify`, `hybrid_kem` |
+| Adversarial Test Suite | [`crates/satspath-core/tests/adversarial_security.rs`](../../crates/satspath-core/tests/adversarial_security.rs) | 12 automated adversarial test vectors |

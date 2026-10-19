@@ -20,8 +20,10 @@ info:
     **Errors.** Failures are `{"error": "..."}`. Some read endpoints return that body with **HTTP 200**
     (documented per operation as `oneOf [Success, Error]`).
 
-    **Maturity.** BIP-353 is PREVIEW; BOLT12, Silent Payments, P2P and invites are EXPERIMENTAL; PQC fields are
-    RESEARCH. No independent security audit has been completed.
+    **Maturity.** BIP-353 and BOLT12 primitives are IMPLEMENTED; Ark routing is PREVIEW; Silent Payments,
+    P2P and invites are EXPERIMENTAL; PQC fields are RESEARCH. Note that `/v1/quote`, `/v1/preview`,
+    `/v1/pay` and `/v1/receive` still enforce strict on-chain BIP-21 handoff validation. No independent
+    security audit has been completed.
 
     Illustrative example values (hashes, signatures) are synthetic and are not cryptographically valid.
     Full prose reference: `docs/API_REFERENCE.md`.
@@ -729,9 +731,10 @@ paths:
     post:
       tags:
       - Profile
-      summary: Start alias verification (MOCK)
-      description: Creates a mock email challenge. **Not a real identifier attestation**; the token is
-        the email itself.
+      summary: Start alias verification (DEV MOCK)
+      description: 'Fails closed (`HTTP 400`) by default because no production alias verifier is configured.
+        Requires `--dev-mock-alias-verification` (or `SATSPATH_DEV_MOCK_ALIAS_VERIFICATION=1`) on a non-mainnet
+        network to enable the development-only mock verifier where the token equals the email address itself.'
       operationId: createProfileChallenge
       requestBody:
         required: true
@@ -750,7 +753,7 @@ paths:
                 $ref: '#/components/schemas/ChallengeResponse'
               example:
                 challenge_id: a129ce04cf19aeb5d2fb0c7f61f11fe7
-                message: 'A mock verification code was sent. (MOCK: use the email address itself as the
+                message: 'A mock verification code was sent. (DEVELOPMENT ONLY: use the email address itself as the
                   token)'
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -764,9 +767,10 @@ paths:
     post:
       tags:
       - Profile
-      summary: Complete alias verification (MOCK)
-      description: Binds the alias to the local identity. Signs and stores the profile if methods already
-        exist.
+      summary: Complete alias verification (DEV MOCK)
+      description: 'Binds the alias to the local identity and signs/stores the profile if methods already
+        exist. Fails closed (`HTTP 400`) by default unless `--dev-mock-alias-verification` is enabled on a
+        non-mainnet network.'
       operationId: verifyProfileChallenge
       requestBody:
         required: true
@@ -1300,9 +1304,11 @@ paths:
     post:
       tags:
       - Resolution & Routing
-      summary: Resolve a BIP-353 name (PREVIEW)
-      description: '**Public.** DoH-based; Strict DNSSEC policy fails closed because the default backend
-        cannot validate the chain locally.'
+      summary: Resolve a BIP-353 name
+      description: '**Public.** Under `DnssecPolicy::Strict` (default), resolves via the embedded local DNSSEC
+        validation engine (`HickoryDnssecTxtResolver`, anchored at ICANN root KSKs) and fails closed if the
+        cryptographic chain is missing or invalid. Setting `allow_insecure_dns_for_dev: true` switches to
+        `DohTxtResolver` under `DnssecPolicy::DevInsecure` for local testing.'
       operationId: resolveDns
       requestBody:
         required: true
@@ -2765,6 +2771,7 @@ components:
       - Mainnet
       - Testnet
       - Regtest
+      - Signet
     ArkOwnershipProof:
       type: object
       properties:
@@ -2894,7 +2901,7 @@ components:
           type: string
         offer:
           type: string
-          description: '`lno1...` offer string. EXPERIMENTAL.'
+          description: '`lno1...` offer string.'
         network:
           $ref: '#/components/schemas/BitcoinNetwork'
         minimum_amount_sats:
@@ -2914,12 +2921,14 @@ components:
       oneOf:
       - $ref: '#/components/schemas/MainnetPayableMethod'
       - $ref: '#/components/schemas/TestnetPayableMethod'
+      - $ref: '#/components/schemas/SignetPayableMethod'
       - $ref: '#/components/schemas/RegtestPayableMethod'
       discriminator:
         propertyName: network
         mapping:
           Mainnet: '#/components/schemas/MainnetPayableMethod'
           Testnet: '#/components/schemas/TestnetPayableMethod'
+          Signet: '#/components/schemas/SignetPayableMethod'
           Regtest: '#/components/schemas/RegtestPayableMethod'
       description: Only an on-chain method with a decoded address on the configured network can yield a payable quote.
     MainnetPayableMethod:
@@ -2945,6 +2954,21 @@ components:
           network:
             type: string
             enum: [Testnet]
+          address:
+            $ref: '#/components/schemas/TestnetAddress'
+        required: [network, address]
+        not:
+          properties:
+            silent_payment_pubkey: {}
+          required: [silent_payment_pubkey]
+    SignetPayableMethod:
+      allOf:
+      - $ref: '#/components/schemas/OnchainMethod'
+      - type: object
+        properties:
+          network:
+            type: string
+            enum: [Signet]
           address:
             $ref: '#/components/schemas/TestnetAddress'
         required: [network, address]
@@ -4998,7 +5022,7 @@ components:
           type: string
         network:
           type: string
-          description: '`devnet` (default), `testnet`, `regtest` or `mainnet`.'
+          description: '`devnet` (default), `testnet`, `signet`, `regtest` or `mainnet`.'
         home:
           type: string
           description: Daemon home directory (filesystem path).
@@ -5139,7 +5163,7 @@ components:
       required:
       - challenge_id
       - message
-      description: 'MOCK email verifier: the token equals the email address itself. Not a real attestation.'
+      description: 'Development-only mock email verifier (requires `--dev-mock-alias-verification` on non-mainnet): the token equals the email address itself. Not a real attestation.'
     VerifyRequest:
       type: object
       properties:

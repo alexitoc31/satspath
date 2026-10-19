@@ -7,11 +7,11 @@
 //!
 //! # DNSSEC is mandatory
 //!
-//! Per BIP-353 all payment instructions must be DNSSEC-signed. This crate does
-//! not ship a local DNSSEC validator, so the default [`resolve_bip353`] runs in
-//! [`DnssecPolicy::Strict`] and **fails closed** ([`SatsPathError::DnssecUnavailable`])
-//! rather than trusting an upstream resolver's AD bit. [`DnssecPolicy::DevInsecure`]
-//! exists for local testing only, is never the default, and emits loud warnings.
+//! Per BIP-353 all payment instructions must be DNSSEC-signed. The default
+//! [`resolve_bip353`] runs in [`DnssecPolicy::Strict`] and validates DNSSEC
+//! locally against bundled ICANN root trust anchors via [`HickoryDnssecTxtResolver`],
+//! failing closed if validation fails. [`DnssecPolicy::DevInsecure`] exists for
+//! local testing only, is never the default, and emits loud warnings.
 
 use std::collections::HashMap;
 
@@ -253,17 +253,30 @@ pub fn validated_bitcoin_record(records: &[DnsTxtRecord]) -> Result<(&DnsTxtReco
     Ok((record, uri))
 }
 
-/// Resolve a BIP-353 name with the default backend and **Strict** policy.
+/// Resolve a BIP-353 name with local cryptographic DNSSEC validation and **Strict** policy.
 ///
-/// The default backend does not perform local DNSSEC validation, so in Strict
-/// mode this fails closed with [`SatsPathError::DnssecUnavailable`]. Use
-/// [`resolve_bip353_with`] + a DNSSEC-validating resolver (or `DevInsecure` for
-/// local testing) to obtain a resolution.
+/// Validates the DNSSEC trust chain locally against bundled ICANN root trust anchors
+/// using [`HickoryDnssecTxtResolver`]. Any unsigned or tampered zone fails closed.
+/// Accepts `₿user@domain` or `user@domain` and timestamps the result with the current
+/// UTC time. Without the `std` feature, returns [`SatsPathError::DnssecUnavailable`].
+/// Name, TXT lookup, payment-record validation, and DNSSEC errors propagate from
+/// [`resolve_bip353_with`].
 pub async fn resolve_bip353(name: &str) -> Result<Bip353Resolution> {
-    let resolver = DohTxtResolver::new();
-    let now = chrono::Utc::now().timestamp();
-    resolve_bip353_with(&resolver, name, DnssecPolicy::Strict, now).await
+    #[cfg(feature = "std")]
+    {
+        let resolver = crate::resolvers::bip353::HickoryDnssecTxtResolver::new();
+        let now = chrono::Utc::now().timestamp();
+        resolve_bip353_with(&resolver, name, DnssecPolicy::Strict, now).await
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = name;
+        Err(SatsPathError::DnssecUnavailable)
+    }
 }
+
+#[cfg(feature = "std")]
+pub use crate::resolvers::bip353::HickoryDnssecTxtResolver;
 
 // ─── Ownership verification ─────────────────────────────────────────────────────
 
@@ -296,8 +309,21 @@ pub fn verify_bip353_ownership(
 
     let parsed = parse_bip321(&resolution.bitcoin_uri)?;
 
-    // A SatsPath profile pointer is sufficient linkage.
-    if parsed.sp_profile.is_some() || parsed.sp_profile_hash.is_some() {
+    // If an sp-profile-hash commitment is present, it MUST match the SHA-256
+    // of the signed profile representation.
+    if let Some(expected_hash) = &parsed.sp_profile_hash {
+        use sha2::Digest;
+        let signed_hash = crate::crypto::signed_profile_hash(signed)?;
+        let profile_bytes = crate::crypto::canonical_profile_bytes(&signed.profile)?;
+        let profile_hash = hex::encode(sha2::Sha256::digest(&profile_bytes));
+        let expected = expected_hash.trim().to_ascii_lowercase();
+        if expected != signed_hash && expected != profile_hash {
+            return Ok(false);
+        }
+    }
+
+    // A SatsPath profile pointer is sufficient linkage once any hash commitment passes.
+    if parsed.sp_profile.is_some() {
         return Ok(true);
     }
 
@@ -367,7 +393,11 @@ impl DohTxtResolver {
 
 #[async_trait]
 impl DnsTxtResolver for DohTxtResolver {
-    /// Fetch TXT answers over the validated DoH connection.
+    /// Fetch TXT answers over DoH, marking every returned record as unvalidated.
+    ///
+    /// Returns an empty list when no usable TXT answers are present. URL or IP
+    /// restrictions return `ValidationError`; DNS, transport, JSON parsing, and
+    /// response bodies over 64 KiB return `NetworkError`.
     async fn query_txt(&self, fqdn: &str) -> Result<Vec<DnsTxtRecord>> {
         crate::ssrf::validate_url(&self.endpoint, false)?;
         let client = crate::outbound::http_client(std::time::Duration::from_secs(10));

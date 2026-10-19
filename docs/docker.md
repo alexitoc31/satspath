@@ -155,6 +155,17 @@ When `satspathd` binds to a non-loopback interface (such as `0.0.0.0`, `::`, or 
 
 Localhost / loopback bindings (`127.0.0.1`, `::1`) remain allowed for zero-friction local development.
 
+### Production Configuration Flags & Environment Variables
+
+| Flag / Environment Variable | Default | Production Requirement |
+| :--- | :--- | :--- |
+| `--behind-proxy` / `SATSPATHD_BEHIND_PROXY=1` | `false` | Enable when running behind Caddy/Nginx so `satspathd` trusts `X-Forwarded-For` / `X-Real-IP`. |
+| `--require-tls-or-proxy` / `SATSPATHD_REQUIRE_TLS_OR_PROXY=1` | `false` | **Recommended in production.** Fails closed on startup if bound to a non-loopback address without TLS or `--behind-proxy`. |
+| `SATSPATH_AUTHORITY_DOMAIN` | *(none)* | Set to your public domain (e.g. `node.example.com`) to allow incoming `Host` headers and prevent DNS rebinding. |
+| `SATSPATHD_AUTH_TOKEN` | `<home>/admin.macaroon` | 64-character hex Bearer token for admin/mutating `/v1/*` endpoints (auto-generated in `<home>/admin.macaroon` if unset). |
+| `--log-format` / `SATSPATH_LOG_FORMAT` | `text` | Set to `json` for structured JSON logs in Docker/Kubernetes (`text` or `pretty` for human-readable output). |
+| `GET /health` & `GET /metrics` | Enabled | Liveness probe (`/health`), deep dependency health probe (`/v1/health`), and Prometheus scrape endpoint (`/metrics`). |
+
 ---
 
 ## Make targets
@@ -239,8 +250,3 @@ docker compose run --rm --entrypoint /bin/sh --user root satspath-cli -c "chown 
 # For Daemon container (UID 10002):
 docker compose run --rm --entrypoint /bin/sh --user root satspathd -c "chown -R 10002:10002 /data && chmod -R 770 /data"
 ```
-
-**Build fails on `is_multiple_of` (pre-existing)**
--> This is a known pre-existing issue in `satspath-router/src/lightning.rs` using
-a nightly-only Rust API. It does not affect the `satspath` CLI binary build,
-only `satspath-router` library checks on stable Rust. Unrelated to Docker.

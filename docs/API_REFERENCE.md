@@ -11,9 +11,11 @@ response schemas; this page explains behavior that a schema cannot express
 > and executes.
 
 Maturity labels follow the [README taxonomy](../README.md#maturity-taxonomy):
-BIP-353 is PREVIEW; BOLT12, Silent Payments, P2P, and invites are EXPERIMENTAL;
-the post-quantum profile fields are RESEARCH. SatsPath has not had an
-independent third-party security audit.
+BIP-353 and BOLT12 primitives are IMPLEMENTED; Ark payment routing is PREVIEW;
+Silent Payments, P2P, and invites are EXPERIMENTAL; the post-quantum profile
+fields are RESEARCH. Note that the daemon's quote, pay, send, and receive
+handoff endpoints still enforce strict on-chain BIP-21 validation. SatsPath has
+not had an independent third-party security audit.
 
 ---
 
@@ -225,8 +227,8 @@ across 50 paths.
 | `PUT` | `/v1/profile` | Bearer | Create or update profile |
 | `POST` | `/v1/profile` | Bearer | Same as `PUT` (CORS-friendly) |
 | `POST` | `/v1/profile/methods` | Bearer | Update receive methods |
-| `POST` | `/v1/profile/challenge` | Bearer | Start alias verification (MOCK) |
-| `POST` | `/v1/profile/verify` | Bearer | Complete alias verification (MOCK) |
+| `POST` | `/v1/profile/challenge` | Bearer | Start alias verification (DEV MOCK) |
+| `POST` | `/v1/profile/verify` | Bearer | Complete alias verification (DEV MOCK) |
 | `POST` | `/v1/profile/rotate-key` | Bearer | Rotate identity key |
 | `POST` | `/v1/profile/recover` | Public | Recover key with guardian quorum |
 | `POST` | `/v1/broadcast` | Bearer | Save profile for publication |
@@ -241,7 +243,7 @@ across 50 paths.
 | `POST` | `/v1/pay` | Bearer | Wallet handoff (never executes payment) |
 | `POST` | `/v1/send` | Public | Preview send via legacy resolver chain |
 | `POST` | `/v1/receive` | Public | Receive payload and QR for own profile |
-| `POST` | `/v1/dns/resolve` | Public | Resolve a BIP-353 name (PREVIEW) |
+| `POST` | `/v1/dns/resolve` | Public | Resolve a BIP-353 name (local DNSSEC) |
 | `POST` | `/v1/p2p/resolve` | Bearer | Resolve a P2P candidate (EXPERIMENTAL) |
 
 ### S2S v2
@@ -321,9 +323,12 @@ curl -s http://127.0.0.1:9737/v1/status
 
 ### Publish a receiving profile
 
-The alias must be verified before methods can be saved. The built-in verifier is
-a **mock**: the token equals the email address, so it proves nothing about inbox
-ownership.
+The alias must be verified before methods can be saved. The daemon ships no
+production alias verifier yet, so `/v1/profile/challenge` and `/v1/profile/verify`
+**fail closed (`HTTP 400`) by default**. For local development on a non-mainnet
+network, start `satspathd` with `--dev-mock-alias-verification` (or
+`SATSPATH_DEV_MOCK_ALIAS_VERIFICATION=1`) to enable the mock verifier where the
+token equals the email address itself (refused on `mainnet`).
 
 ```bash
 curl -s -X POST http://127.0.0.1:9737/v1/profile/challenge \
@@ -339,8 +344,43 @@ curl -s -X PUT http://127.0.0.1:9737/v1/profile \
   -d '{"lightning_address":"alice@getalby.com","onchain_address":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"}'
 ```
 
-Each save re-signs the profile with a new `sequence`, a 30-day expiry, appends a
-name event to the transparency log, and signs a new operator checkpoint.
+Each save re-signs the profile (`SHA256("SatsPathProfileV1" || RFC8785(profile))`)
+with the next `sequence` and a 30-day expiry, appends a `register` or
+`update_profile` `NameEvent` to the transparency log, and signs a new operator
+checkpoint.
+
+### Rotate or recover an identity key
+
+* **Key rotation (`POST /v1/profile/rotate-key`)**: requires Bearer auth and an
+  empty request body. The daemon generates a new identity key and embeds a
+  dual-signed `profile.rotation` object where the previous key signs under
+  `SatsPathKeyRotationAuthorizationV1`, the new key signs under
+  `SatsPathKeyRotationAcceptanceV1`, and the previous key signs the `rotate_key`
+  `NameEvent`.
+* **Guardian key recovery (`POST /v1/profile/recover`)**: public (no Bearer
+  token). Accepts `alias`, `proof` (`KeyRecoveryProof`), and `signed_profile`
+  (where `signed_profile.profile.recovery` must equal `proof`, retain a
+  `recovery_policy`, and contain no `rotation`). Guardians sign under
+  `SatsPathKeyRecoveryAuthorizationV1` and the new key signs acceptance under
+  `SatsPathKeyRecoveryAcceptanceV1`. When the new key is not in the daemon's
+  local keystore, also supply `event_signature` (over the `recover_key`
+  `NameEvent`) and `event_created_at` (within ±300 seconds of server time). See
+  [`key_recovery.md`](key_recovery.md).
+
+### Resolve a BIP-353 DNS name
+
+```bash
+curl -s -X POST http://127.0.0.1:9737/v1/dns/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"alice@example.com"}'
+```
+
+By default (`allow_insecure_dns_for_dev: false`), `/v1/dns/resolve` queries DNS
+with `HickoryDnssecTxtResolver` under `DnssecPolicy::Strict`, validating the
+RRSIG/DNSKEY/DS chain locally against the embedded ICANN root KSKs (`38696`,
+`20326`, `19036`) and failing closed if DNSSEC validation fails. Passing
+`"allow_insecure_dns_for_dev": true` switches to `DohTxtResolver` under
+`DnssecPolicy::DevInsecure` for local testing.
 
 ### Quote and hand off to a wallet
 
@@ -373,9 +413,10 @@ final validation. A BOLT11 invoice can be validated against its payee, network,
 amount, and expiry, but these quote paths do not generate one. Lightning
 Addresses and LNURL links remain **amount-less receive pointers**; BOLT12, Ark,
 and Silent Payment handoffs return `no_route` or an explicit receive error until
-protocol-aware validation is available. On `/v1/receive`, an omitted rail
-prefers on-chain when `amount_sats` is set and Lightning otherwise; explicitly
-selecting an unsupported rail does not bypass validation.
+protocol-aware validation is wired into the daemon quote endpoints. On
+`/v1/receive`, an omitted rail prefers on-chain when `amount_sats` is set and
+Lightning otherwise; explicitly selecting an unsupported rail does not bypass
+validation.
 
 `POST /v1/pay` wraps an `ok` quote as `status: wallet_handoff` with
 `payment_payload`, `qr_svg`, and `handoff.daemon_executes_payment: false`.

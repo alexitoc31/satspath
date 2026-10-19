@@ -14,6 +14,11 @@
 #![allow(warnings)]
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "small_alloc")]
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
+#[cfg(feature = "bolt12")]
 pub mod bolt12;
 mod crypto;
 pub mod handoff;
@@ -24,6 +29,7 @@ mod ssrf;
 mod topic;
 pub mod types;
 
+#[cfg(feature = "bolt12")]
 pub use bolt12::fetch_bolt12_invoice;
 pub use crypto::{
     canonical_profile_json, derive_identity_keypair_from_seed, fingerprint_pubkey,

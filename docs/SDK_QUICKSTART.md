@@ -1,12 +1,12 @@
-# ⚡ SatsPath SDK Quickstart Guide
+# SatsPath SDK Quickstart Guide
 
-Quickstart guide for wallet developers, PWAs, and web applications (React, Vite, React Native, Arkade).
+Quickstart guide for sovereign Bitcoin wallet developers, PWAs, and native Rust/TypeScript applications integrating `@satspath/wasm` and `satspath-router`.
 
 ---
 
-## 📦 1. Installation (with `pnpm`)
+## 1. Installation
 
-Install official SatsPath packages using **`pnpm`**:
+### Web / PWA / React Native (`pnpm`)
 
 ```bash
 pnpm add @satspath/wasm bip39 react-qr-code
@@ -14,131 +14,171 @@ pnpm add @satspath/wasm bip39 react-qr-code
 pnpm add @satspath/resolvers @satspath/router
 ```
 
-> **Tip:** If you are building the WebAssembly package directly from the local repository:
+> **Building `@satspath/wasm` locally from source:**
 >
 > ```bash
 > cd crates/satspath-wasm
-> wasm-pack build --target web --out-dir ../../pkg/satspath-wasm
-> cd ../../your-app
-> pnpm add ../satspath/pkg/satspath-wasm
+> wasm-pack build --target web --release --out-dir ../../pkg/satspath-wasm
 > ```
+
+### Native Rust (`Cargo.toml`)
+
+```toml
+[dependencies]
+satspath-core = { path = "crates/satspath-core" }
+satspath-router = { path = "crates/satspath-router" }
+```
 
 ---
 
-## 🚀 2. Basic 3-Step Flow
+## 2. Non-Custodial 3-Step Flow
 
 ```text
 ┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
-│ 1. DERIVE IDENTITY      │ ──> │ 2. RESOLVE & QUOTE      │ ──> │ 3. EXECUTE PAYMENT      │
-│ Seed (12 words)         │     │ "user@domain" + sats    │     │ QR / BOLT11 / BIP-21    │
-│ m/9737'/0'              │     │ Smart Route Selection   │     │ Host wallet pays        │
+│ 1. DERIVE IDENTITY      │ ──> │ 2. RESOLVE & QUOTE      │ ──> │ 3. WALLET HANDOFF       │
+│ Seed (in host wallet)   │     │ "user@domain" + sats    │     │ BIP-21 / BOLT11 / Ark   │
+│ m/9737'/0' (identity)   │     │ Signature + Route Score │     │ Host wallet signs & pays│
 └─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
 ```
 
 ---
 
-## 💻 3. Code Example (TypeScript / React)
+## 3. Browser / TypeScript Integration (`@satspath/wasm`)
 
-### Step 1: Initialize the SDK and Derive Identity
+### Step 1: Initialize WASM & Derive Identity Keypair
 
-Deterministically derive a secure identity keypair inside the trusted wallet boundary without accessing or exposing Bitcoin spending keys:
+Deterministically derive an identity keypair inside the trusted wallet boundary without exposing Bitcoin spending keys (`xprv`/`tprv`):
 
 ```typescript
-import init, { derive_identity_keypair_from_seed } from '@satspath/wasm';
-import * as bip39 from 'bip39';
+import init, {
+  derive_identity_keypair_from_seed,
+  sign_profile_json,
+  verify_signed_profile,
+} from "@satspath/wasm";
+import * as bip39 from "bip39";
 
-// 1. Initialize WASM module when mounting the app
 await init();
 
-// 2. Derive SatsPath identity inside the trusted wallet boundary (m/9737'/0')
-// Seed/mnemonic remains strictly private inside the wallet context and is never transmitted.
-const mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+// TEST ONLY: This public BIP-39 test vector is not a real identity seed.
+// Never register an identity derived from this phrase.
+// Production: use the host wallet seed source inside its trusted boundary.
+const mnemonic =
+  "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const seed = bip39.mnemonicToSeedSync(mnemonic);
 
-// Account 0 by default
 const identity = derive_identity_keypair_from_seed(seed, 0);
 if (!identity) {
-  throw new Error("Failed to derive identity keypair");
+  throw new Error("Failed to derive SatsPath identity keypair");
 }
 
-console.log("Your SatsPath Public Key:", identity.pubkey_hex);
-// => "03e0fa79bc28965724d3eee52d58cf0cd11f712462582f42e79a545d13d85aac0b"
+console.log("SatsPath Identity Pubkey:", identity.pubkey_hex);
 ```
 
----
-
-### Step 2: Resolve an Alias and Quote Best Route (`quote`)
-
-When a user inputs a recipient identifier (e.g. `chelo@satspath.dev`) and an amount in Satoshis:
+### Step 2: Resolve, Verify & Quote (`quote`)
 
 ```typescript
-import { quote } from '@satspath/wasm';
+import { quote, verify_signed_profile } from "@satspath/wasm";
 
-async function handleSendPayment(recipientAlias: string, amountSats: bigint) {
-  try {
-    // Resolves alias and evaluates live mempool fees
-    const quoteResult = await quote(recipientAlias, amountSats);
+export async function resolveAndQuote(recipientAlias: string, amountSats: bigint) {
+  const quoteResult = await quote(recipientAlias, amountSats);
 
-    if (quoteResult.status === "ok") {
-      console.log("Selected Rail:", quoteResult.selected_method.type); // "Lightning" | "Ark" | "Onchain"
-      console.log("Estimated Fee:", quoteResult.fee_sats, "sats");
-      console.log("Payment Payload:", quoteResult.qr); 
-      
-      // quoteResult.qr contains the string ready for wallet payment:
-      // - Lightning: "lnbc10u1p..." or BOLT12 offer
-      // - Ark: "ark:<pubkey>?server=...&amount=10000"
-      // - On-Chain: "bitcoin:bc1q...?amount=0.0001"
-      
-      return quoteResult.qr;
-    } else if (quoteResult.status === "invalid_signature") {
-      console.error("Invalid signature on recipient profile:", quoteResult.recipient.alias);
-    } else if (quoteResult.status === "no_route") {
-      console.error("No valid payment route found:", quoteResult.reason);
-    } else if (quoteResult.status === "not_registered") {
-      console.error("Recipient is not registered");
+  switch (quoteResult.status) {
+    case "ok": {
+      if (!quoteResult.recipient.profile_signature_verified) {
+        throw new Error("Recipient profile signature failed verification");
+      }
+      console.log("Selected Method:", quoteResult.selected_method.type);
+      console.log("Estimated Fee (sats):", quoteResult.fee_sats);
+      console.log("Validated Handoff Payload:", quoteResult.qr);
+      return quoteResult;
     }
-  } catch (error) {
-    console.error("Error resolving or quoting payment:", error);
+    case "invalid_signature":
+      throw new Error(`Invalid profile signature for ${quoteResult.recipient.alias}`);
+    case "no_route":
+      throw new Error(`No viable payment rail: ${quoteResult.reason}`);
+    case "not_registered":
+      console.log("Recipient not registered; invite token:", quoteResult.invite.invite_id);
+      return null;
   }
 }
 ```
 
 ---
 
-### Step 3: Render Payment QR Code in UI (React)
+## 4. Native Rust Integration (`satspath-router` + `satspath-core`)
 
-```tsx
-import React from 'react';
-import QRCode from 'react-qr-code';
+Host wallets written in Rust (such as BDK or LDK mobile/desktop wallets) can resolve aliases, verify cryptographic signatures, and consume `QuoteResponse` handoffs directly. This example returns `Some(payload)` for BIP-21 and Ark handoffs; the caller must pass that payload to its wallet flow. `None` means Lightning was paid or an invite was returned:
 
-export function PaymentScreen({ invoicePayload }: { invoicePayload: string }) {
-  return (
-    <div className="payment-card">
-      <h3>Scan to Pay</h3>
-      <div style={{ background: 'white', padding: '16px', borderRadius: '8px' }}>
-        <QRCode value={invoicePayload} size={256} />
-      </div>
-      <p style={{ wordBreak: 'break-all', fontSize: '12px' }}>{invoicePayload}</p>
-    </div>
-  );
+```rust
+use satspath_core::crypto::verify_signed_profile;
+use satspath_core::execution::{ExecutionGatePolicy, WalletExecutor};
+use satspath_core::resolver::ChainResolver;
+use satspath_router::quote_response::{quote_with_resolver, QuoteResponse};
+
+pub async fn prepare_wallet_handoff(
+    resolver: &ChainResolver,
+    recipient_alias: &str,
+    amount_sats: u64,
+    wallet: &dyn WalletExecutor,
+) -> satspath_core::Result<Option<String>> {
+    // 1. Resolve alias, verify Schnorr signature + expiry, and select optimal rail
+    let response = quote_with_resolver(resolver, recipient_alias, amount_sats).await;
+
+    match response {
+        QuoteResponse::Ok {
+            recipient,
+            selected_method,
+            qr,
+            fee_sats,
+            ..
+        } => {
+            assert!(recipient.profile_signature_verified);
+            println!(
+                "Verified {} ({}) -> {:?} (est. fee: {:?} sats)",
+                recipient.alias, recipient.pubkey_fingerprint, selected_method, fee_sats
+            );
+
+            // 2. Enforce ExecutionGatePolicy before invoking host wallet signing
+            let policy = ExecutionGatePolicy::testnet_default();
+            policy.check_execution_safety(wallet.network(), amount_sats, true)?;
+
+            if qr.starts_with("lnbc") || qr.starts_with("lntb") || qr.starts_with("lnbcrt") {
+                let _receipt = wallet.pay_bolt11(&qr, Some(amount_sats * 1_000)).await?;
+                Ok(None)
+            } else if qr.starts_with("bitcoin:") || qr.starts_with("ark:") || qr.starts_with("ark1") {
+                // Return BIP-21 / Ark payloads to the caller's host wallet flow.
+                Ok(Some(qr))
+            } else {
+                Err(satspath_core::SatsPathError::ValidationError(
+                    "Unsupported payment payload".into(),
+                ))
+            }
+        }
+        QuoteResponse::InvalidSignature { recipient } => Err(
+            satspath_core::SatsPathError::ValidationError(format!(
+                "Invalid signature for {}",
+                recipient.alias
+            )),
+        ),
+        QuoteResponse::NoRoute { reason } => {
+            Err(satspath_core::SatsPathError::NoRouteFound(reason))
+        }
+        QuoteResponse::NotRegistered { invite } => {
+            println!("Recipient not registered; share invite URL: {}", invite.claim_url);
+            Ok(None)
+        }
+    }
 }
 ```
 
 ---
 
-## 📖 4. Main Methods Reference
+## 5. Main SDK Functions Reference
 
-| Function | Parameters | Return Type | Description |
-| :--- | :--- | :--- | :--- |
-| `derive_identity_keypair_from_seed` | `seed: Uint8Array, index: number` | `{ pubkey_hex, secret_key_hex } \| undefined` | Deterministically derives identity keypair under the `m/9737'/0'` HMAC namespace. |
-| `quote` | `recipient: string, amount_sats: bigint` | `QuoteResponse` | Resolves alias across S2S/DNSSEC chain and selects the optimal rail (Lightning, Ark, or On-chain). |
-| `resolve_alias` | `alias: string` | `SignedPaymentProfile` | Resolves and retrieves the signed recipient profile (signature is verified with `verify_signed_profile`). |
-| `verify_signed_profile` | `profile_json: string` | `boolean` | Verifies the `secp256k1` Schnorr signature of a received profile. |
-
----
-
-## 🛡️ 5. Security Principles for Wallets
-
-1. **Zero Custody:** The SDK never requests or stores private Bitcoin spending keys (`xprv`/`tprv`).
-2. **Fail-Closed:** If a profile signature is invalid or DNSSEC fails, `quote` automatically rejects the payment.
-3. **Mempool Smart Routing:** Evaluates Lightning first, selects On-chain when mempool fees are below threshold, and falls back to Ark as an off-chain alternative.
+| Function | Layer | Parameters | Return Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `derive_identity_keypair_from_seed` | `@satspath/wasm` | `seed: Uint8Array, index: number` | `IdentityKeypair \| undefined` | Derives `secp256k1` identity keypair under `m/9737'/0'`. |
+| `quote` | `@satspath/wasm` | `recipient: string, amount_sats: bigint` | `QuoteResponse` | Resolves alias, verifies signature, and selects best rail. |
+| `verify_signed_profile` | `@satspath/wasm` | `profile_json: string` | `boolean` | Verifies RFC 8785 canonical JSON + BIP-340 Schnorr signature. |
+| `quote_with_resolver` | `satspath-router` | `resolver, recipient, amount_sats` | `QuoteResponse` | Native Rust end-to-end resolution, verification, and routing. |
+| `select_route_with_fees` | `satspath-router` | `&RouteRequest, &FeeEstimate` | `Result<RouteQuote>` | Deterministic rail selection (Lightning → On-chain → Ark). |

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>SatsPath WASM vs Native Benchmark Harness</title>
+</head>
+<body>
+  <h1>SatsPath WASM Browser Benchmark Suite</h1>
+  <pre id="output">Initializing WASM module...</pre>
+  <script type="module">
+    import init, {
+      canonical_profile_json,
+      generate_identity_keypair,
+      sign_profile_json,
+      verify_signed_profile,
+      topic_for_alias,
+    } from "../pkg/satspath_wasm.js";
+
+    async function runBenchmarks() {
+      await init();
+      const out = document.getElementById("output");
+      const kp = generate_identity_keypair();
+      const profileObj = {
+        alias: "satoshi@satspath.dev",
+        identity_pubkey: kp.pubkey_hex,
+        methods: [
+          { type: "lightning", label: "LN", lightning_address: "satoshi@satspath.dev" },
+          { type: "onchain", label: "L1", network: "mainnet", address: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" }
+        ],
+        updated_at: 1700000000,
+        sequence: 1,
+        preferences: ["lightning", "onchain"]
+      };
+      const profileJson = JSON.stringify(profileObj);
+      const sigHex = sign_profile_json(profileJson, kp.secret_key_hex);
+      const signedJson = JSON.stringify({ profile: profileObj, signature: sigHex });
+
+      const measure = (name, iterations, fn) => {
+        // Warmup
+        for (let i = 0; i < 20; i++) fn();
+        const t0 = performance.now();
+        for (let i = 0; i < iterations; i++) fn();
+        const elapsedMs = performance.now() - t0;
+        const perOpUs = ((elapsedMs * 1000) / iterations).toFixed(2);
+        return `${name.padEnd(36)} ${perOpUs} µs/op (${iterations} iterations)`;
+      };
+
+      const lines = [
+        measure("wasm::canonical_profile_json", 2000, () => canonical_profile_json(profileJson)),
+        measure("wasm::sign_profile_json", 500, () => sign_profile_json(profileJson, kp.secret_key_hex)),
+        measure("wasm::verify_signed_profile", 500, () => verify_signed_profile(signedJson)),
+        measure("wasm::topic_for_alias", 5000, () => topic_for_alias("satoshi@satspath.dev")),
+      ];
+      out.textContent = lines.join("\n");
+    }
+
+    runBenchmarks().catch((err) => {
+      document.getElementById("output").textContent = "Benchmark error: " + err;
+    });
+  </script>
+</body>
+</html>

@@ -64,16 +64,21 @@ pub fn validate_lightning_address(address: &str) -> Result<()> {
 
 /// Validate a BOLT12 offer string using the shared handoff validator.
 pub fn validate_bolt12_offer(offer: &str) -> Result<()> {
-    validate_bolt12_offer_for_network(offer, None)
+    validate_bolt12_offer_internal(offer, None)
 }
 
-fn validate_bolt12_offer_for_network(offer: &str, network: Option<BitcoinNetwork>) -> Result<()> {
+pub fn validate_bolt12_offer_for_network(offer: &str, network: BitcoinNetwork) -> Result<()> {
+    validate_bolt12_offer_internal(offer, Some(network))
+}
+
+fn validate_bolt12_offer_internal(offer: &str, network: Option<BitcoinNetwork>) -> Result<()> {
     let trimmed = offer.trim();
     assert_no_private_material(trimmed)?;
     let network = network.map(|net| match net {
         BitcoinNetwork::Mainnet => Network::Bitcoin,
         BitcoinNetwork::Testnet => Network::Testnet,
         BitcoinNetwork::Regtest => Network::Regtest,
+        BitcoinNetwork::Signet => Network::Signet,
     });
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     satspath_handoff::bolt12(trimmed, network, now).map_err(SatsPathError::InvalidPaymentPointer)
@@ -87,6 +92,7 @@ pub fn validate_bitcoin_address(address: &str, network: BitcoinNetwork) -> Resul
         BitcoinNetwork::Mainnet => Network::Bitcoin,
         BitcoinNetwork::Testnet => Network::Testnet,
         BitcoinNetwork::Regtest => Network::Regtest,
+        BitcoinNetwork::Signet => Network::Signet,
     };
     parsed
         .require_network(expected)
@@ -102,6 +108,7 @@ pub fn validate_silent_payment_address(address: &str, network: BitcoinNetwork) -
         BitcoinNetwork::Mainnet => Network::Bitcoin,
         BitcoinNetwork::Testnet => Network::Testnet,
         BitcoinNetwork::Regtest => Network::Regtest,
+        BitcoinNetwork::Signet => Network::Signet,
     };
     satspath_handoff::silent(address, network).map_err(SatsPathError::InvalidPaymentPointer)
 }
@@ -290,8 +297,9 @@ pub fn validate_public_profile(profile: &PaymentProfile) -> Result<()> {
                 }
             }
             PaymentMethod::Bolt12(offer) => {
-                validate_bolt12_offer_for_network(&offer.offer, Some(offer.network))?;
+                validate_bolt12_offer_for_network(&offer.offer, offer.network)?;
             }
+
             PaymentMethod::Ark {
                 server,
                 pubkey,
@@ -426,6 +434,8 @@ mod tests {
         assert!(validate_claim_policy(&policy).is_ok());
     }
 
+    /// Accept valid Silent Payment encodings on their expected networks and
+    /// reject network mismatches, empty/private material, truncation, and versions.
     #[test]
     /// Verify that silent payment address validation.
     fn silent_payment_address_validation() {
@@ -436,10 +446,20 @@ mod tests {
         payload.extend([key.clone(), key].concat().to_base32());
         let mainnet_sp = bech32::encode("sp", &payload, bech32::Variant::Bech32m).unwrap();
         let testnet_sp = bech32::encode("tsp", &payload, bech32::Variant::Bech32m).unwrap();
+        let regtest_sp = bech32::encode("sprt", &payload, bech32::Variant::Bech32m).unwrap();
 
         // Valid addresses
         assert!(validate_silent_payment_address(&mainnet_sp, BitcoinNetwork::Mainnet).is_ok());
         assert!(validate_silent_payment_address(&testnet_sp, BitcoinNetwork::Testnet).is_ok());
+        assert!(validate_silent_payment_address(&regtest_sp, BitcoinNetwork::Regtest).is_ok());
+
+        // Official BIP-352 mainnet test vector address
+        assert!(validate_silent_payment_address(
+            "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv",
+            BitcoinNetwork::Mainnet
+        )
+        .is_ok());
+
         assert!(validate_silent_payment_address(
             &format!(" \t{mainnet_sp}\n"),
             BitcoinNetwork::Mainnet

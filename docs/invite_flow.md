@@ -111,16 +111,16 @@ identifier -> no signed profile -> create invite -> receiver verifies email -> r
 
 ### 3. List Invites
 - **Endpoint:** `GET /v1/invites`
-- **Auth:** Admin token
+- **Auth:** None (Public `GET`)
 - **Response:** Array of `InviteRecord` objects.
 
 ### 4. List Claim Notifications
 - **Endpoint:** `GET /v1/invites/notifications`
-- **Auth:** Admin token
+- **Auth:** None (Public `GET`)
 - **Response:** Array of `ClaimNotification` objects.
 
 ### 5. Mark Notification Read
-- **Endpoint:** `POST /v1/invites/notifications/<ID>/read`
-- **Auth:** Admin token
-- **Response:** `{"status": "ok", "notification_id": "...", "read": true}`
+- **Endpoint:** `POST /v1/invites/notifications/<ID>/read` (or `POST /v1/invites/notifications/read-all`)
+- **Auth:** Bearer token (`admin.macaroon` / `SATSPATHD_AUTH_TOKEN`)
+- **Response:** `{"status": "ok", "notification_id": "...", "read": true}` (or `{"status": "ok", "all_read": true}`)
 

@@ -4,7 +4,7 @@
 
 A SatsPath Transparency Witness is a lightweight node designed to protect against split-view attacks. It acts as an independent auditor for Transparency Log operators, ensuring they do not equivocate by presenting different valid trees to different clients.
 
-> **Note:** The `satspath-witness` crate currently serves as a reference protocol prototype. Full production deployment with automated cryptographic signature verification and gossip is scheduled for the v0.2 milestone.
+> **Note:** Standalone witness cosigning (`crates/satspath-witness`) and checkpoint gossip monitoring (`crates/satspath-gossip`) are implemented in the workspace; production deployment requires operating independent witnesses across separate administrative and infrastructure domains.
 
 The witness holds minimal but **durable** state: for each audited log it persists the pinned `log_id`, `tree_size`, `root_hash`, and any recorded equivocation evidence. This state MUST survive restarts. A witness deployed on ephemeral storage loses its pins and stops detecting rollback and equivocation.
 

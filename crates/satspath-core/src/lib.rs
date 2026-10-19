@@ -2,6 +2,7 @@ pub mod ark;
 pub mod bip321;
 pub mod bip353;
 pub mod bip353_publish;
+pub mod bolt12;
 pub mod codec;
 pub mod crypto;
 pub mod dns;
@@ -48,7 +49,8 @@ pub use bip353_publish::{
     MockDnsPublisher, PublishingPlan,
 };
 pub use crypto::{
-    fingerprint_pubkey, generate_identity_keypair, generate_nonce, sign_message, sign_profile,
+    canonical_profile_bytes, canonical_signed_profile_bytes, fingerprint_pubkey,
+    generate_identity_keypair, generate_nonce, sign_message, sign_profile, signed_profile_hash,
     verify_message_signature, verify_signed_profile, IdentityKeypair,
 };
 pub use dns::{DnsDescriptor, DnsError};
@@ -110,6 +112,22 @@ pub use resolver::{
 };
 #[cfg(feature = "std")]
 pub use resolvers::{bip353::Bip353Resolver, http::HttpResolver, nostr::NostrResolver};
+
+/// Returns the default stable application data directory for SatsPath state and continuity.
+///
+/// Precedence:
+/// 1. `SATSPATH_DIR` environment variable
+/// 2. Local `.satspath` relative to the current working directory
+#[cfg(feature = "std")]
+pub fn default_data_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("SATSPATH_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return std::path::PathBuf::from(trimmed);
+        }
+    }
+    std::path::PathBuf::from(".satspath")
+}
 
 pub use validation::validate_silent_payment_address;
 

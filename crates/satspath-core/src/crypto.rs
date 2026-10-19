@@ -67,6 +67,22 @@ pub fn canonical_profile_bytes(profile: &PaymentProfile) -> Result<Vec<u8>> {
     Ok(canonical.into_bytes())
 }
 
+/// Produce a deterministic canonical JSON serialization of a SignedPaymentProfile.
+/// Uses canonical_json crate which sorts object keys for deterministic output.
+pub fn canonical_signed_profile_bytes(signed: &SignedPaymentProfile) -> Result<Vec<u8>> {
+    let value = serde_json::to_value(signed)
+        .map_err(|e| SatsPathError::SerializationError(e.to_string()))?;
+    let canonical = canonical_json::to_string(&value)
+        .map_err(|e| SatsPathError::SerializationError(e.to_string()))?;
+    Ok(canonical.into_bytes())
+}
+
+/// Compute the SHA-256 digest of a canonical SignedPaymentProfile as lowercase hex.
+pub fn signed_profile_hash(signed: &SignedPaymentProfile) -> Result<String> {
+    let bytes = canonical_signed_profile_bytes(signed)?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
 /// Sign a PaymentProfile with the given secret key and return a SignedPaymentProfile.
 ///
 /// Uses domain-separated hashing per Protocol v0.1 Section 12:

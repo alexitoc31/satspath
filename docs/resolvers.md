@@ -94,6 +94,8 @@ Strict DNS behavior:
 
 The reference implementation provides:
 
+- `HickoryDnssecTxtResolver` (embedded local DNSSEC validator anchored at ICANN root KSKs `38696`, `20326`, `19036`)
+- `verify_dnssec_zone_chain`
 - `DohTxtResolver`
 - `resolve_bip353_with`
 - `DnssecPolicy::Strict`

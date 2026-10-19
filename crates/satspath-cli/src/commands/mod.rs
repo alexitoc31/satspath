@@ -45,13 +45,17 @@ use satspath_core::registry::Registry;
 use std::path::PathBuf;
 
 pub(crate) fn satspath_dir() -> PathBuf {
-    PathBuf::from(".satspath")
+    satspath_core::default_data_dir()
 }
 
 pub(crate) fn open_registry() -> Result<Registry> {
     let dir = satspath_dir();
     if !dir.exists() {
-        anyhow::bail!(".satspath/ not found. Run `satspath init` first.");
+        let local = PathBuf::from(".satspath");
+        if local.exists() {
+            return Ok(Registry::open(&local)?);
+        }
+        anyhow::bail!("{}/ not found. Run `satspath init` first.", dir.display());
     }
     Ok(Registry::open(&dir)?)
 }
@@ -69,7 +73,7 @@ pub(crate) fn get_resolver() -> Result<ChainResolver> {
         chain = chain.push(reg);
     }
 
-    chain = chain.push(Bip353Resolver::new());
+    chain = chain.push(Bip353Resolver::new(satspath_dir()));
 
     // Add public HTTP resolver fallback
     chain = chain.push(HttpResolver::new());

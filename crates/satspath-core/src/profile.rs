@@ -116,6 +116,7 @@ impl PaymentMethod {
                     BitcoinNetwork::Mainnet => "mainnet",
                     BitcoinNetwork::Testnet => "testnet",
                     BitcoinNetwork::Regtest => "regtest",
+                    BitcoinNetwork::Signet => "signet",
                 };
                 if let Some(sp) = silent_payment_pubkey {
                     format!("onchain:{net}:sp:{sp}")

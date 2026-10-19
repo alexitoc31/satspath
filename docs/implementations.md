@@ -8,10 +8,12 @@ The implementation must be understood as a protocol stack, not as a single P2P s
 
 ```txt
 crates/satspath-core      protocol data types, signatures, resolvers, validation, transparency log, state map
-crates/satspath-router    quote response contract, fee consensus, BOLT12, Silent Payments, route selection
+crates/satspath-handoff   strict payment handoff payload validation (BIP-21, BOLT11, network/amount bounds)
+crates/satspath-router    quote response contract, fee consensus, BOLT12, Silent Payments, Ark, route selection
 crates/satspath-cli       command-line reference client
 crates/satspathd          local / authoritative daemon and HTTP API
 crates/satspath-witness   independent witness node and K-of-N checkpoint cosigner
+crates/satspath-gossip    checkpoint gossip monitor and split-view detector
 crates/satspath-wasm      WebAssembly bindings for browser / wallet integrations
 crates/satspath-swaps     experimental testnet/regtest swap scaffolding (Boltz v2)
 crates/satspath-pqc       experimental post-quantum hybrid signature research module (ML-DSA-65)
@@ -35,6 +37,7 @@ Spec mapping:
 | `PaymentMethod.Lightning` | `PaymentMethod::Lightning` |
 | `PaymentMethod.Onchain`   | `PaymentMethod::Onchain`   |
 | `PaymentMethod.Ark`       | `PaymentMethod::Ark`       |
+| `PaymentMethod.Bolt12`    | `PaymentMethod::Bolt12`    |
 | Invite                    | `Invite`, `InviteRecord`   |
 
 ## Signature and Safety Validation
@@ -71,14 +74,14 @@ crates/satspath-core/src/peer_registry.rs
 
 Current resolver surfaces:
 
-| Resolver            | File                               | Status                                                                    |
-| ------------------- | ---------------------------------- | ------------------------------------------------------------------------- |
-| Local registry      | `registry.rs`                      | Active local storage                                                      |
-| Local peer registry | `peer_registry.rs`                 | Active local peer storage                                                 |
-| BIP-353             | `resolvers/bip353.rs`, `bip353.rs` | Resolver and DNS primitives; strict DNSSEC fails closed without validator |
-| HTTPS               | `resolvers/http.rs`                | Active HTTPS `.well-known` resolver with URL validation                   |
-| Nostr               | `resolvers/nostr.rs`               | Active NIP-05 + kind 30078 resolver                                       |
-| Platform            | `resolvers/platform.rs`            | Scaffold                                                                  |
+| Resolver            | File                               | Status                                                                                      |
+| ------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------- |
+| Local registry      | `registry.rs`                      | Active local storage                                                                        |
+| Local peer registry | `peer_registry.rs`                 | Active local peer storage                                                                   |
+| BIP-353             | `resolvers/bip353.rs`, `bip353.rs` | Implemented with embedded local DNSSEC validator (`HickoryDnssecTxtResolver`, fail-closed)  |
+| HTTPS               | `resolvers/http.rs`                | Active HTTPS `.well-known` resolver with URL validation                                     |
+| Nostr               | `resolvers/nostr.rs`               | Active NIP-05 + kind 30078 resolver                                                         |
+| Platform            | `resolvers/platform.rs`            | Scaffold                                                                                    |
 
 Resolver chain behavior is implemented by `ChainResolver`.
 
@@ -93,6 +96,8 @@ crates/satspath-router/src/fees.rs
 crates/satspath-router/src/lightning.rs
 crates/satspath-router/src/bolt12.rs
 crates/satspath-router/src/silent_payments.rs
+crates/satspath-router/src/ark.rs
+crates/satspath-router/src/ark_routes.rs
 ```
 
 Spec mapping:
@@ -122,10 +127,12 @@ These values are the UI and API contract.
 Implemented in:
 
 ```txt
+crates/satspathd/src/router.rs
+crates/satspathd/src/handlers/
 crates/satspathd/src/main.rs
 ```
 
-The daemon exposes the protocol over a local/reverse-proxied HTTP API:
+The daemon exposes the protocol over a local/reverse-proxied HTTP API (see [`API_REFERENCE.md`](./API_REFERENCE.md) and [`openapi.yaml`](./openapi.yaml) for the complete 55-operation reference):
 
 | Endpoint                   | Purpose                                       |
 | -------------------------- | --------------------------------------------- |
@@ -195,14 +202,11 @@ Wire behavior is documented in [wire_p2p.md](./wire_p2p.md).
 
 Known v1/v2 implementation gaps:
 
-- **DNSSEC Local Validation:** BIP-353 strict mode requires an embedded validating resolver to avoid relying on upstream resolver flags or failing closed.
-- **BOLT12 Interoperability:** Prototype TLV, offer-handling, and blinded-path primitives exist, but standards-conformant checksumless BOLT12 string decoding, invoice-request construction, Merkle signing, and interoperability with implementations such as Core Lightning and LDK remain incomplete.
-- **Silent Payments Interoperability:** Experimental Silent Payments primitives and address/output construction are implemented; BIP-352 conformance and interoperability remain unverified until the official send/receive test vectors pass.
 - **External Security Audit:** Independent third-party cryptographic and security audit is required before recommending real-funds production usage.
-- **Ark Settlement:** Ark remains preview / simulated (receive pointers and routing exist; live ASP round execution is mocked).
+- **Alias Inbox Attestation:** `satspathd` ships no production email/inbox verifier yet; `/v1/profile/challenge` and `/v1/profile/verify` fail closed unless started with `--dev-mock-alias-verification` on a non-mainnet network.
+- **Daemon Payable Handoff Gate:** While BOLT12 (`crates/satspath-router/src/bolt12.rs`), Ark (`crates/satspath-router/src/ark.rs`), and Silent Payments (`crates/satspath-router/src/silent_payments.rs`) primitives are implemented in `satspath-router`, `satspathd`'s `/v1/quote`, `/v1/preview`, `/v1/pay`, and `/v1/send` handoff gate (`satspath-handoff`) currently emits only validated, amount-bound on-chain BIP-21 payloads.
+- **Silent Payments Host Wallet ECDH:** SatsPath validates BIP-352 public keys, input eligibility, and expected outputs against public projections of all 28 official vector groups, while private-key ECDH shared-secret derivation and transaction construction remain in the host wallet.
 - **Mainnet Payment Execution:** Mainnet payment execution and transaction signing are deliberately unsupported (delegated to host wallets).
-- **Cross-Witness Gossip:** Cross-witness public gossip protocol for real-time split-view alerting is designed but not yet deployed.
-- **Method Ownership Proofs:** Method ownership proofs exist in core and are enforced for quotes, with wider resolver adoption ongoing.
 
 ## Conformance Checklist
 

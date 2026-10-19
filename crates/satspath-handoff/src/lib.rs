@@ -395,6 +395,8 @@ pub fn bolt12(value: &str, network: Option<Network>, now: u64) -> Result<(), Str
                 }
             }
             6 => {
+                std::str::from_utf8(payload)
+                    .map_err(|_| "BOLT12 offer currency is not valid UTF-8")?;
                 has_currency = true;
             }
             8 => {
@@ -404,6 +406,8 @@ pub fn bolt12(value: &str, network: Option<Network>, now: u64) -> Result<(), Str
                 has_amount = true;
             }
             10 => {
+                std::str::from_utf8(payload)
+                    .map_err(|_| "BOLT12 offer description is not valid UTF-8")?;
                 has_description = true;
             }
             12 => {

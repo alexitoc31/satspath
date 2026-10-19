@@ -376,6 +376,7 @@ pub(crate) fn bitcoin_network(network: &str) -> satspath_core::BitcoinNetwork {
     match network.to_ascii_lowercase().as_str() {
         "mainnet" | "bitcoin" => BitcoinNetwork::Mainnet,
         "regtest" => BitcoinNetwork::Regtest,
+        "signet" => BitcoinNetwork::Signet,
         // devnet uses testnet-form receive addresses until a distinct core
         // network enum is added.
         _ => BitcoinNetwork::Testnet,

@@ -1,0 +1,6 @@
+{
+  "profile_json": "{\"alias\":\"satoshi@satspath.dev\",\"identity_pubkey\":\"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\",\"methods\":[{\"type\":\"lightning\",\"label\":\"LN\",\"lightning_address\":\"satoshi@satspath.dev\"},{\"type\":\"onchain\",\"label\":\"L1\",\"network\":\"mainnet\",\"address\":\"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq\"}],\"updated_at\":1700000000,\"sequence\":1,\"preferences\":[\"lightning\",\"onchain\"]}",
+  "canonical_json": "{\"alias\":\"satoshi@satspath.dev\",\"identity_pubkey\":\"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\",\"methods\":[{\"label\":\"LN\",\"lightning_address\":\"satoshi@satspath.dev\",\"type\":\"lightning\"},{\"address\":\"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq\",\"label\":\"L1\",\"network\":\"mainnet\",\"type\":\"onchain\"}],\"preferences\":[\"lightning\",\"onchain\"],\"sequence\":1,\"updated_at\":1700000000}",
+  "alias": "satoshi@satspath.dev",
+  "topic_hex": "dcb4aa326025bd006d0f4873c0a86e4c481a2f94e0f08582083f031999d97400"
+}

@@ -1,326 +1,534 @@
-use bitcoin::secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey};
-use bitcoin::Network;
-use rand::rngs::OsRng;
-use satspath_core::pointer::BitcoinNetwork;
-use satspath_core::profile::{PaymentMethod, PaymentProfile};
-use satspath_core::validation::{validate_public_profile, validate_silent_payment_address};
-use satspath_router::silent_payments::{
-    compute_input_hash, create_silent_payment_address, create_silent_payment_address_for_network,
-    derive_spending_privkey, detect_silent_payment_outputs, find_smallest_outpoint,
-    generate_silent_payment_keys, parse_outpoint_to_bytes, parse_silent_payment_address,
-    tagged_hash, SilentPayment, SilentPaymentInput, BIP0352_TAG_INPUTS, BIP0352_TAG_SHARED_SECRET,
+//! Wallet boundary and malformed-data regressions for public BIP-352 helpers.
+use std::collections::HashMap;
+
+use bitcoin::{
+    consensus::serialize,
+    hashes::{hash160, Hash},
+    secp256k1::PublicKey,
+    Network, Witness,
+};
+use satspath_core::{
+    validation::validate_public_profile, BitcoinNetwork, PaymentMethod, PaymentProfile,
+};
+use satspath_router::{
+    bip352_input_context, build_qr_payload, create_bip352_outputs,
+    create_silent_payment_address_for_network, extract_bip352_input_pubkey,
+    parse_silent_payment_address, scan_bip352_transaction, tagged_hash, Bip352PrevoutInput,
+    Bip352ScanKeys, BIP0352_TAG_INPUTS, BIP0352_TAG_SHARED_SECRET,
 };
 
-#[test]
-fn test_bip352_tagged_hash_domain_separation() {
-    let tag_a = BIP0352_TAG_INPUTS;
-    let tag_b = BIP0352_TAG_SHARED_SECRET;
-    let data = b"sample_input_material";
-
-    let hash_a = tagged_hash(tag_a, data);
-    let hash_b = tagged_hash(tag_b, data);
-
-    assert_ne!(
-        hash_a, hash_b,
-        "Domain separation between BIP0352 tags must produce distinct hashes"
-    );
+/// Load the first public receiving vector for wallet-boundary regression tests.
+fn fixture() -> (
+    Vec<Bip352PrevoutInput>,
+    Bip352ScanKeys,
+    PublicKey,
+    Vec<String>,
+) {
+    fixture_group(0)
 }
 
-#[test]
-fn test_bip352_mainnet_and_signet_address_derivation() {
-    let secp = Secp256k1::new();
-    let scan_sk = SecretKey::new(&mut OsRng);
-    let scan_pk = PublicKey::from_secret_key(&secp, &scan_sk);
-    let spend_sk = SecretKey::new(&mut OsRng);
-    let spend_pk = PublicKey::from_secret_key(&secp, &spend_sk);
-
-    // Mainnet derivation
-    let mainnet_addr = create_silent_payment_address(&scan_pk, &spend_pk).unwrap();
-    assert!(mainnet_addr.starts_with("sp1q"));
-    validate_silent_payment_address(&mainnet_addr, BitcoinNetwork::Mainnet).unwrap();
-
-    let (parsed_scan, parsed_spend, network) = parse_silent_payment_address(&mainnet_addr).unwrap();
-    assert_eq!(parsed_scan, scan_pk);
-    assert_eq!(parsed_spend, spend_pk);
-    assert_eq!(network, Network::Bitcoin);
-
-    // Signet / Testnet derivation
-    let signet_addr =
-        create_silent_payment_address_for_network(&scan_pk, &spend_pk, Network::Signet).unwrap();
-    assert!(signet_addr.starts_with("tsp1q"));
-    validate_silent_payment_address(&signet_addr, BitcoinNetwork::Testnet).unwrap();
-
-    let (parsed_scan_s, parsed_spend_s, network_s) =
-        parse_silent_payment_address(&signet_addr).unwrap();
-    assert_eq!(parsed_scan_s, scan_pk);
-    assert_eq!(parsed_spend_s, spend_pk);
-    assert_eq!(network_s, Network::Testnet);
-}
-
-#[test]
-fn test_bip352_sender_recipient_full_roundtrip_with_spending() {
-    let secp = Secp256k1::new();
-
-    // Recipient (Alice)
-    let scan_sk = SecretKey::new(&mut OsRng);
-    let scan_pk = PublicKey::from_secret_key(&secp, &scan_sk);
-    let spend_sk = SecretKey::new(&mut OsRng);
-    let spend_pk = PublicKey::from_secret_key(&secp, &spend_sk);
-
-    // Sender (Bob) with single input
-    let bob_sk = SecretKey::new(&mut OsRng);
-    let bob_pk = PublicKey::from_secret_key(&secp, &bob_sk);
-
-    let bob_input = SilentPaymentInput {
-        outpoint: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789:0".to_string(),
-        input_pubkey: hex::encode(bob_pk.serialize()),
-        input_privkey: Some(hex::encode(bob_sk.secret_bytes())),
+/// Load a group's first receiving case as inputs, public keys, an ECDH point,
+/// and output keys; omit labels because these regressions use unlabeled groups.
+fn fixture_group(
+    index: usize,
+) -> (
+    Vec<Bip352PrevoutInput>,
+    Bip352ScanKeys,
+    PublicKey,
+    Vec<String>,
+) {
+    let groups: serde_json::Value = serde_json::from_str(include_str!(
+        "data/bip352_send_and_receive_test_vectors.json"
+    ))
+    .unwrap();
+    let given = &groups[index]["receiving"][0]["given"];
+    let inputs = given["vin"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|vin| Bip352PrevoutInput {
+            txid: vin["txid"].as_str().unwrap().into(),
+            vout: vin["vout"].as_u64().unwrap() as u32,
+            script_sig: vin["scriptSig"].as_str().unwrap().into(),
+            txinwitness: vin["txinwitness"].as_str().unwrap().into(),
+            prevout_script_pubkey: vin["prevout"]["scriptPubKey"]["hex"]
+                .as_str()
+                .unwrap()
+                .into(),
+        })
+        .collect();
+    let keys = Bip352ScanKeys {
+        scan_pubkey: serde_json::from_value(given["scan_pubkey"].clone()).unwrap(),
+        spend_pubkey: serde_json::from_value(given["spend_pubkey"].clone()).unwrap(),
+        labels: vec![],
     };
-
-    let payment = SilentPayment::new(
-        hex::encode(scan_pk.serialize()),
-        hex::encode(spend_pk.serialize()),
-        150_000,
-        vec![bob_input],
-        None,
-        Network::Bitcoin,
-    );
-
-    // Bob creates two outputs to Alice (k=0 and k=1)
-    let output_k0 = payment
-        .create_output_with_index(&scan_pk, &spend_pk, 0)
-        .unwrap();
-    let output_k1 = payment
-        .create_output_with_index(&scan_pk, &spend_pk, 1)
-        .unwrap();
-
-    assert_ne!(
-        output_k0.script_pubkey, output_k1.script_pubkey,
-        "Outputs for distinct indices k must have distinct scriptPubKeys"
-    );
-    assert!(output_k0.script_pubkey.starts_with("5120"));
-    assert!(output_k1.script_pubkey.starts_with("5120"));
-
-    // Simulated block containing mixed outputs
-    let tx_outputs = vec![
-        (
-            "51201111111111111111111111111111111111111111111111111111111111111111".to_string(),
-            25_000,
-        ),
-        (output_k0.script_pubkey.clone(), 75_000),
-        (
-            "51202222222222222222222222222222222222222222222222222222222222222222".to_string(),
-            50_000,
-        ),
-        (output_k1.script_pubkey.clone(), 75_000),
-    ];
-
-    // Alice scans the block outputs using input_pubkey (bob_pk)
-    // Note: since bob_input specified an outpoint, Bob computed shared secret using input_hash.
-    let outpoint_bytes = parse_outpoint_to_bytes(
-        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789:0",
+    (
+        inputs,
+        keys,
+        serde_json::from_value(given["host_shared_secret"].clone()).unwrap(),
+        serde_json::from_value(given["outputs"].clone()).unwrap(),
     )
-    .unwrap();
-    let input_hash = compute_input_hash(&outpoint_bytes, &bob_pk);
+}
 
-    let detected = SilentPayment::detect_outputs_with_input_hash(
-        &scan_sk,
-        &spend_pk,
-        &bob_pk,
-        &input_hash,
-        &tx_outputs,
-    )
-    .unwrap();
-
-    assert_eq!(detected.len(), 2, "Alice should detect exactly 2 outputs");
-    assert_eq!(detected[0].script_pubkey, output_k0.script_pubkey);
-    assert_eq!(detected[1].script_pubkey, output_k1.script_pubkey);
-
-    // Alice derives spending private key for each detected output and verifies Taproot x-only match
-    for (k, detected_out) in detected.iter().enumerate() {
-        let shared_secret_pk = PublicKey::from_slice(
-            &hex::decode(detected_out.shared_secret.as_ref().unwrap()).unwrap(),
+/// Require the recipient network to match even without eligible inputs, and
+/// confirm that generated outputs can be detected on each supported network.
+#[test]
+fn network_context_is_enforced_before_generating_outputs() {
+    let (inputs, keys, shared, _) = fixture();
+    let shared_points = HashMap::from([(keys.scan_pubkey, shared)]);
+    let networks = [Network::Bitcoin, Network::Testnet, Network::Regtest];
+    for address_network in networks {
+        let address = create_silent_payment_address_for_network(
+            &keys.scan_pubkey,
+            &keys.spend_pubkey,
+            address_network,
         )
         .unwrap();
-
-        let spending_sk = derive_spending_privkey(&spend_sk, &shared_secret_pk, k as u32).unwrap();
-        let derived_pk = PublicKey::from_secret_key(&secp, &spending_sk);
-        let (derived_x_only, parity) = derived_pk.x_only_public_key();
-
-        // Must have even parity for Schnorr / BIP-340 compatibility
-        assert_eq!(parity, Parity::Even);
-
-        let expected_x_only = &detected_out.script_pubkey[4..];
-        assert_eq!(hex::encode(derived_x_only.serialize()), expected_x_only);
+        for expected_network in networks {
+            for vin in [inputs.as_slice(), &[]] {
+                let result = create_bip352_outputs(
+                    vin,
+                    &[(address.clone(), 1)],
+                    &shared_points,
+                    expected_network,
+                );
+                assert_eq!(result.is_ok(), address_network == expected_network);
+                if address_network == expected_network && !vin.is_empty() {
+                    let sent = result.unwrap();
+                    let detected = scan_bip352_transaction(
+                        &keys,
+                        vin,
+                        &sent.outputs,
+                        Some(&shared),
+                        expected_network,
+                    )
+                    .unwrap();
+                    assert_eq!(detected.outputs.len(), 1);
+                    assert_eq!(detected.outputs[0].output_index, 0);
+                    assert_eq!(detected.outputs[0].label, None);
+                    assert_eq!(
+                        detected.addresses.as_slice(),
+                        std::slice::from_ref(&address)
+                    );
+                }
+            }
+        }
+    }
+    // Signet and Testnet4 intentionally share the testnet HRP.
+    let address = create_silent_payment_address_for_network(
+        &keys.scan_pubkey,
+        &keys.spend_pubkey,
+        Network::Testnet,
+    )
+    .unwrap();
+    for network in [Network::Signet, Network::Testnet4] {
+        assert!(
+            create_bip352_outputs(&inputs, &[(address.clone(), 1)], &shared_points, network)
+                .is_ok()
+        );
     }
 }
 
+/// Reject malformed output hex and lengths before input shortcuts.
 #[test]
-fn test_bip352_multi_input_aggregation() {
-    let secp = Secp256k1::new();
+fn scanner_rejects_every_malformed_output_even_without_eligible_inputs() {
+    let (inputs, keys, shared, valid) = fixture();
+    for malformed in [
+        "not-hex".into(),
+        "".into(),
+        "00".repeat(31),
+        "00".repeat(33),
+    ] {
+        let outputs = vec![valid[0].clone(), malformed];
+        for vin in [inputs.as_slice(), &[]] {
+            assert!(
+                scan_bip352_transaction(&keys, vin, &outputs, Some(&shared), Network::Bitcoin)
+                    .is_err()
+            );
+        }
+    }
+}
 
-    // Recipient
-    let (scan_sk_hex, scan_pk_hex, spend_sk_hex, spend_pk_hex) =
-        generate_silent_payment_keys().unwrap();
-    let scan_sk = SecretKey::from_slice(&hex::decode(scan_sk_hex).unwrap()).unwrap();
-    let scan_pk = PublicKey::from_slice(&hex::decode(scan_pk_hex).unwrap()).unwrap();
-    let spend_sk = SecretKey::from_slice(&hex::decode(spend_sk_hex).unwrap()).unwrap();
-    let spend_pk = PublicKey::from_slice(&hex::decode(spend_pk_hex).unwrap()).unwrap();
+/// Skip invalid 32-byte curve points while retaining valid output matches,
+/// including when candidate sets or eligible input sets have no matches.
+#[test]
+fn scanner_skips_invalid_curve_points_and_detects_valid_outputs() {
+    let (inputs, keys, shared, valid) = fixture_group(10);
+    let baseline =
+        scan_bip352_transaction(&keys, &inputs, &valid, Some(&shared), Network::Bitcoin).unwrap();
+    assert_eq!(baseline.outputs.len(), 2);
+    let mut outputs = vec!["00".repeat(32), "ff".repeat(32)];
+    for output in &valid {
+        outputs.push(output.clone());
+        outputs.push("00".repeat(32));
+    }
+    assert_eq!(
+        scan_bip352_transaction(&keys, &inputs, &outputs, Some(&shared), Network::Bitcoin).unwrap(),
+        baseline
+    );
+    for candidates in [outputs.as_slice(), &outputs[..2]] {
+        let result =
+            scan_bip352_transaction(&keys, &[], candidates, None, Network::Bitcoin).unwrap();
+        assert!(result.outputs.is_empty());
+    }
+    assert!(scan_bip352_transaction(
+        &keys,
+        &inputs,
+        &outputs[..2],
+        Some(&shared),
+        Network::Bitcoin,
+    )
+    .unwrap()
+    .outputs
+    .is_empty());
+}
 
-    // 2 Inputs from sender
-    let sk1 = SecretKey::new(&mut OsRng);
-    let pk1 = PublicKey::from_secret_key(&secp, &sk1);
-    let sk2 = SecretKey::new(&mut OsRng);
-    let pk2 = PublicKey::from_secret_key(&secp, &sk2);
+/// Build a public P2WPKH input, optionally nested in P2SH, with matching hashes.
+fn witness_input(nested: bool) -> Bip352PrevoutInput {
+    let (_, keys, _, _) = fixture();
+    let pk_bytes = keys.scan_pubkey.serialize();
+    witness_input_with_key(nested, &pk_bytes)
+}
 
-    let op1_str = "1111111111111111111111111111111111111111111111111111111111111111:0";
-    let op2_str = "2222222222222222222222222222222222222222222222222222222222222222:1";
+/// Build a witness input whose native or nested script hashes bind the supplied
+/// key bytes, including ineligible encodings used by negative tests.
+fn witness_input_with_key(nested: bool, pk_bytes: &[u8]) -> Bip352PrevoutInput {
+    let pkh = hash160::Hash::hash(pk_bytes);
+    let redeem = format!("0014{pkh}");
+    let redeem_bytes = hex::decode(&redeem).unwrap();
+    Bip352PrevoutInput {
+        txid: "11".repeat(32),
+        vout: 0,
+        script_sig: if nested {
+            format!("16{redeem}")
+        } else {
+            String::new()
+        },
+        txinwitness: hex::encode(serialize(&Witness::from_slice(&[&[1u8][..], pk_bytes]))),
+        prevout_script_pubkey: if nested {
+            format!("a914{}87", hash160::Hash::hash(&redeem_bytes))
+        } else {
+            redeem
+        },
+    }
+}
 
-    let op1 = parse_outpoint_to_bytes(op1_str).unwrap();
-    let op2 = parse_outpoint_to_bytes(op2_str).unwrap();
-    let smallest_op = find_smallest_outpoint(&[op1, op2]).unwrap();
-    assert_eq!(smallest_op, op1);
-
-    // Sum private keys
-    let sc2 = Scalar::from_be_bytes(sk2.secret_bytes()).unwrap();
-    let sum_sk = sk1.add_tweak(&sc2).unwrap();
-    let sum_scalar = Scalar::from_be_bytes(sum_sk.secret_bytes()).unwrap();
-    let aggregate_pk = PublicKey::from_secret_key(&secp, &sum_sk);
-
-    // Verify PublicKey::combine_keys matches sum of private keys
-    let combined_pk = PublicKey::combine_keys(&[&pk1, &pk2]).unwrap();
-    assert_eq!(aggregate_pk, combined_pk);
-
-    // Also test direct detect_silent_payment_outputs with [pk1, pk2] (without input hash)
-    let direct_shared_secret = scan_pk.mul_tweak(&secp, &sum_scalar).unwrap();
-    let mut direct_tweak_data = Vec::with_capacity(37);
-    direct_tweak_data.extend_from_slice(&direct_shared_secret.serialize());
-    direct_tweak_data.extend_from_slice(&0u32.to_be_bytes());
-    let direct_tweak_scalar =
-        Scalar::from_be_bytes(tagged_hash(BIP0352_TAG_SHARED_SECRET, &direct_tweak_data)).unwrap();
-    let direct_output_pk = spend_pk.add_exp_tweak(&secp, &direct_tweak_scalar).unwrap();
-    let (direct_x_only, _) = direct_output_pk.x_only_public_key();
-    let direct_script = format!("5120{}", hex::encode(direct_x_only.serialize()));
-
-    let direct_tx_outputs = vec![(direct_script.clone(), 77_000)];
-    let direct_detected =
-        detect_silent_payment_outputs(&scan_sk, &spend_pk, &[pk1, pk2], &direct_tx_outputs)
-            .unwrap();
-    assert_eq!(direct_detected.len(), 1);
-    assert_eq!(direct_detected[0].script_pubkey, direct_script);
-
-    // Sender computes output with input hash
-    let input_hash = compute_input_hash(&smallest_op, &aggregate_pk);
-    let hash_scalar = Scalar::from_be_bytes(input_hash).unwrap();
-
-    let shared_secret = scan_pk
-        .mul_tweak(&secp, &sum_scalar)
-        .unwrap()
-        .mul_tweak(&secp, &hash_scalar)
-        .unwrap();
-
-    let mut tweak_data = Vec::with_capacity(37);
-    tweak_data.extend_from_slice(&shared_secret.serialize());
-    tweak_data.extend_from_slice(&0u32.to_be_bytes());
-
-    let tweak_scalar =
-        Scalar::from_be_bytes(tagged_hash(BIP0352_TAG_SHARED_SECRET, &tweak_data)).unwrap();
-    let tweaked_output_pk = spend_pk.add_exp_tweak(&secp, &tweak_scalar).unwrap();
-    let (x_only, _) = tweaked_output_pk.x_only_public_key();
-    let expected_script = format!("5120{}", hex::encode(x_only.serialize()));
-
-    // Recipient detects output with input pubkeys [pk1, pk2]
-    let tx_outputs = vec![(expected_script.clone(), 99_000)];
-    let detected = SilentPayment::detect_outputs_with_input_hash(
-        &scan_sk,
-        &spend_pk,
-        &aggregate_pk,
-        &input_hash,
-        &tx_outputs,
+/// Enforce witness and redeem-script hash bindings and reject malformed witnesses
+/// and uncompressed witness keys that do not match the bound public-key hash.
+#[test]
+fn witness_keys_must_match_both_hash_bindings() {
+    let (_, keys, shared, outputs) = fixture();
+    let address = create_silent_payment_address_for_network(
+        &keys.scan_pubkey,
+        &keys.spend_pubkey,
+        Network::Bitcoin,
     )
     .unwrap();
+    let points = HashMap::from([(keys.scan_pubkey, shared)]);
+    let assert_rejected = |input: Bip352PrevoutInput| {
+        let inputs = [input];
+        assert!(bip352_input_context(&inputs).is_err());
+        assert!(
+            create_bip352_outputs(&inputs, &[(address.clone(), 1)], &points, Network::Bitcoin)
+                .is_err()
+        );
+        assert!(
+            scan_bip352_transaction(&keys, &inputs, &outputs, Some(&shared), Network::Bitcoin)
+                .is_err()
+        );
+    };
+    for nested in [false, true] {
+        let input = witness_input(nested);
+        assert!(extract_bip352_input_pubkey(&input).unwrap().is_some());
+        let mut wrong_prevout = input.clone();
+        wrong_prevout.prevout_script_pubkey = if nested {
+            format!("a914{}87", "00".repeat(20))
+        } else {
+            format!("0014{}", "00".repeat(20))
+        };
+        assert!(extract_bip352_input_pubkey(&wrong_prevout).is_err());
+        assert_rejected(wrong_prevout);
+        if nested {
+            let mut wrong_inner = input.clone();
+            let redeem = format!("0014{}", "00".repeat(20));
+            wrong_inner.script_sig = format!("16{redeem}");
+            wrong_inner.prevout_script_pubkey = format!(
+                "a914{}87",
+                hash160::Hash::hash(&hex::decode(redeem).unwrap())
+            );
+            assert!(extract_bip352_input_pubkey(&wrong_inner).is_err());
+            assert_rejected(wrong_inner);
+        }
+        for witness in ["02ff".to_string(), format!("{}00", input.txinwitness)] {
+            let mut malformed = input.clone();
+            malformed.txinwitness = witness;
+            assert!(extract_bip352_input_pubkey(&malformed).is_err());
+        }
+        let mut uncompressed = input.clone();
+        let (_, keys, _, _) = fixture();
+        uncompressed.txinwitness = hex::encode(serialize(&Witness::from_slice(&[
+            &[1u8][..],
+            &keys.scan_pubkey.serialize_uncompressed(),
+        ])));
+        assert_rejected(uncompressed);
+    }
+}
 
-    assert_eq!(detected.len(), 1);
-    assert_eq!(detected[0].script_pubkey, expected_script);
+/// Skip hash-bound noncompressed witness encodings and reject hash mismatches
+/// for both native and nested P2WPKH inputs.
+#[test]
+fn hash_bound_non_compressed_keys_are_ineligible() {
+    let (_, keys, _, _) = fixture();
+    let uncompressed = keys.scan_pubkey.serialize_uncompressed();
+    let mut hybrid = uncompressed;
+    hybrid[0] = 0x06 | (uncompressed[64] & 1);
+    let ineligible_keys = [
+        uncompressed.to_vec(),
+        hybrid.to_vec(),
+        vec![0x04; 33],
+        vec![0x01],
+        vec![],
+    ];
+    for pk_bytes in &ineligible_keys {
+        for nested in [false, true] {
+            let input = witness_input_with_key(nested, pk_bytes);
+            assert_eq!(extract_bip352_input_pubkey(&input).unwrap(), None);
+            let context = bip352_input_context(std::slice::from_ref(&input)).unwrap();
+            assert!(context.input_pub_keys.is_empty());
+            assert!(context.tweak.is_none());
+            let mut mismatch = input;
+            let mut other_key = pk_bytes.clone();
+            other_key.push(0x01);
+            mismatch.txinwitness =
+                hex::encode(serialize(&Witness::from_slice(&[&[1u8][..], &other_key])));
+            assert!(extract_bip352_input_pubkey(&mismatch).is_err());
+        }
+    }
+}
 
-    // Recipient spending key derivation
-    let spending_sk = derive_spending_privkey(&spend_sk, &shared_secret, 0).unwrap();
-    let spending_pk = PublicKey::from_secret_key(&secp, &spending_sk);
-    let (derived_x_only, _) = spending_pk.x_only_public_key();
+/// Skip matching P2PKH pushes that are not valid compressed public keys, and
+/// reject scripts without any push matching the prevout hash.
+#[test]
+fn p2pkh_skips_matching_keys_that_are_not_valid_compressed_keys() {
+    let (_, keys, _, _) = fixture();
+    let mut invalid_point = vec![0xff; 33];
+    invalid_point[0] = 0x02;
+    for pk_bytes in [
+        keys.scan_pubkey.serialize_uncompressed().to_vec(),
+        vec![0x04; 33],
+        invalid_point,
+        vec![0x01],
+        vec![],
+    ] {
+        let mut input = witness_input(false);
+        input.txinwitness.clear();
+        input.prevout_script_pubkey = format!("76a914{}88ac", hash160::Hash::hash(&pk_bytes));
+        input.script_sig = format!("{:02x}{}", pk_bytes.len(), hex::encode(&pk_bytes));
+        assert_eq!(extract_bip352_input_pubkey(&input).unwrap(), None);
+        let context = bip352_input_context(std::slice::from_ref(&input)).unwrap();
+        assert!(context.input_pub_keys.is_empty());
+        input.prevout_script_pubkey = format!(
+            "76a914{}88ac",
+            hash160::Hash::hash(&keys.scan_pubkey.serialize())
+        );
+        assert!(extract_bip352_input_pubkey(&input).is_err());
+    }
+}
+
+/// Reject private input fields during deserialization and ensure that serialized
+/// inputs and the vector fixture contain only the intended public data.
+#[test]
+fn only_public_input_fields_are_accepted_and_serialized() {
+    let (inputs, _, _, _) = fixture();
+    let public = serde_json::to_value(&inputs[0]).unwrap();
+    assert_eq!(public.as_object().unwrap().len(), 5);
     assert_eq!(
-        hex::encode(derived_x_only.serialize()),
-        &expected_script[4..]
+        serde_json::from_value::<Bip352PrevoutInput>(public.clone()).unwrap(),
+        inputs[0]
+    );
+    for forbidden in ["private_key", "input_privkey", "spend_privkey", "seed"] {
+        let mut supplied = public.clone();
+        supplied[forbidden] = "forbidden material".into();
+        assert!(serde_json::from_value::<Bip352PrevoutInput>(supplied).is_err());
+    }
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "data/bip352_send_and_receive_test_vectors.json"
+    ))
+    .unwrap();
+    /// Recursively reject private-key and signature field names in the fixture.
+    fn assert_public(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, child) in fields {
+                    assert!(
+                        !["private", "priv_key", "signature"]
+                            .iter()
+                            .any(|s| key.contains(s)),
+                        "unexpected field {key}"
+                    );
+                    assert_public(child);
+                }
+            }
+            serde_json::Value::Array(values) => values.iter().for_each(assert_public),
+            _ => {}
+        }
+    }
+    assert_public(&vectors);
+}
+
+/// Count repeated public keys from distinct inputs and reject repeated outpoints.
+#[test]
+fn duplicate_keys_count_but_duplicate_outpoints_fail() {
+    let input = witness_input(false);
+    assert!(bip352_input_context(&[input.clone(), input.clone()]).is_err());
+    let mut other = input.clone();
+    other.vout += 1;
+    let context = bip352_input_context(&[input, other]).unwrap();
+    assert_eq!(context.input_pub_keys.len(), 2);
+    assert_eq!(context.input_pub_keys[0], context.input_pub_keys[1]);
+    let expected = context.input_pub_keys[0]
+        .combine(&context.input_pub_keys[1])
+        .unwrap();
+    assert_eq!(context.aggregate_pubkey, Some(expected));
+}
+
+/// Reject missing spend data, invalid Taproot keys, and mixed-case addresses,
+/// while accepting uniformly uppercase address encodings.
+#[test]
+fn malformed_or_missing_spend_data_fails_closed() {
+    let (inputs, keys, shared, outputs) = fixture();
+    let mut malformed_inputs = vec![
+        inputs[0].clone(),
+        fixture_group(6).0[0].clone(),
+        witness_input(false),
+        witness_input(true),
+    ];
+    for input in &mut malformed_inputs {
+        input.script_sig.clear();
+        input.txinwitness.clear();
+        assert!(bip352_input_context(std::slice::from_ref(input)).is_err());
+        assert!(scan_bip352_transaction(
+            &keys,
+            std::slice::from_ref(input),
+            &outputs,
+            Some(&shared),
+            Network::Bitcoin
+        )
+        .is_err());
+    }
+    let mut invalid_taproot = fixture_group(6).0[0].clone();
+    invalid_taproot.prevout_script_pubkey = format!("5120{}", "ff".repeat(32));
+    assert!(extract_bip352_input_pubkey(&invalid_taproot).is_err());
+    let address = create_silent_payment_address_for_network(
+        &keys.scan_pubkey,
+        &keys.spend_pubkey,
+        Network::Bitcoin,
+    )
+    .unwrap();
+    let mut mixed_case = address.clone();
+    mixed_case.replace_range(..1, "S");
+    assert!(parse_silent_payment_address(&mixed_case).is_err());
+    assert_eq!(
+        parse_silent_payment_address(&address.to_uppercase()).unwrap(),
+        parse_silent_payment_address(&address).unwrap()
     );
 }
 
+/// Require host-wallet ECDH points and validate recipient counts and addresses
+/// before allocating outputs, including when the input set is empty.
 #[test]
-fn test_bip352_profile_validation_integration() {
-    let secp = Secp256k1::new();
-    let scan_sk = SecretKey::new(&mut OsRng);
-    let scan_pk = PublicKey::from_secret_key(&secp, &scan_sk);
-    let spend_sk = SecretKey::new(&mut OsRng);
-    let spend_pk = PublicKey::from_secret_key(&secp, &spend_sk);
+fn sender_requires_wallet_ecdh_and_bounds_counts_before_allocation() {
+    let (inputs, keys, _, _) = fixture();
+    let address = create_silent_payment_address_for_network(
+        &keys.scan_pubkey,
+        &keys.spend_pubkey,
+        Network::Bitcoin,
+    )
+    .unwrap();
+    let points = HashMap::new();
+    assert!(
+        create_bip352_outputs(&inputs, &[(address.clone(), 1)], &points, Network::Bitcoin).is_err()
+    );
+    for count in [0, 2324, usize::MAX] {
+        assert!(
+            create_bip352_outputs(&[], &[(address.clone(), count)], &points, Network::Bitcoin)
+                .is_err()
+        );
+    }
+    assert!(
+        create_bip352_outputs(&[], &[("malformed".into(), 1)], &points, Network::Bitcoin).is_err()
+    );
+    assert!(create_bip352_outputs(
+        &[],
+        &[(address.clone(), 2323), (address, 1)],
+        &points,
+        Network::Bitcoin
+    )
+    .is_err());
+    assert!(scan_bip352_transaction(&keys, &inputs, &[], None, Network::Bitcoin).is_err());
+}
 
-    let mainnet_sp = create_silent_payment_address(&scan_pk, &spend_pk).unwrap();
-
-    // Valid profile with BIP-352 silent payment method
-    let valid_profile = PaymentProfile {
-        alias: "alice@example.com".into(),
-        identity_pubkey: hex::encode(spend_pk.serialize()),
-        methods: vec![PaymentMethod::Onchain {
-            label: "Cold Storage Silent Payment".into(),
-            network: BitcoinNetwork::Mainnet,
+/// Preserve Silent Payment networks and exact satoshi amounts through profile
+/// validation and BIP-21 handoff formatting, rejecting profile network mismatches.
+#[test]
+fn silent_payment_profile_and_wallet_handoff_preserve_network_and_amount() {
+    let (_, keys, _, _) = fixture();
+    for (network, profile_network) in [
+        (Network::Bitcoin, BitcoinNetwork::Mainnet),
+        (Network::Testnet, BitcoinNetwork::Testnet),
+        (Network::Regtest, BitcoinNetwork::Regtest),
+    ] {
+        let address = create_silent_payment_address_for_network(
+            &keys.scan_pubkey,
+            &keys.spend_pubkey,
+            network,
+        )
+        .unwrap();
+        let method = PaymentMethod::Onchain {
+            label: "Silent Payment".into(),
+            network: profile_network,
             address: None,
-            silent_payment_pubkey: Some(mainnet_sp),
+            silent_payment_pubkey: Some(address.clone()),
             pubkey_hint: None,
             descriptor_hint: None,
             address_list: vec![],
-        }],
-        updated_at: 100,
-        expires_at: Some(200),
-        sequence: None,
-        preferences: vec![],
-        nonce: None,
-        rotation: None,
-        method_verifications: Vec::new(),
-        hybrid_pubkey: None,
-        pqc_required: false,
-        revoked: false,
-        recovery_policy: None,
-        recovery: None,
-    };
+        };
+        let profile: PaymentProfile = serde_json::from_value(serde_json::json!({
+            "alias": "alice@example.com", "identity_pubkey": keys.spend_pubkey.to_string(),
+            "methods": [method], "updated_at": 100, "expires_at": 200,
+            "preferences": [], "nonce": null, "rotation": null,
+        }))
+        .unwrap();
+        validate_public_profile(&profile).unwrap();
+        for (sats, _btc) in [
+            (1, "0.00000001"),
+            (21_000, "0.00021000"),
+            (100_000_001, "1.00000001"),
+        ] {
+            assert!(matches!(
+                build_qr_payload(&profile.methods[0], sats),
+                Err(satspath_core::SatsPathError::InvalidPaymentPointer(ref msg))
+                    if msg.contains("silent payment handoffs require wallet-side validation")
+            ));
+        }
+        assert_eq!(parse_silent_payment_address(&address).unwrap().2, network);
+        let mut mismatch = profile.clone();
+        if let PaymentMethod::Onchain { network: value, .. } = &mut mismatch.methods[0] {
+            *value = if network == Network::Bitcoin {
+                BitcoinNetwork::Testnet
+            } else {
+                BitcoinNetwork::Mainnet
+            };
+        }
+        assert!(validate_public_profile(&mismatch).is_err());
+    }
+}
 
-    assert!(validate_public_profile(&valid_profile).is_ok());
-
-    // Profile with invalid silent payment address (wrong network)
-    let testnet_sp =
-        create_silent_payment_address_for_network(&scan_pk, &spend_pk, Network::Testnet).unwrap();
-
-    let invalid_profile = PaymentProfile {
-        alias: "alice@example.com".into(),
-        identity_pubkey: hex::encode(spend_pk.serialize()),
-        methods: vec![PaymentMethod::Onchain {
-            label: "Mismatched Network".into(),
-            network: BitcoinNetwork::Mainnet, // Mainnet network with Testnet address
-            address: None,
-            silent_payment_pubkey: Some(testnet_sp),
-            pubkey_hint: None,
-            descriptor_hint: None,
-            address_list: vec![],
-        }],
-        updated_at: 100,
-        expires_at: Some(200),
-        sequence: None,
-        preferences: vec![],
-        nonce: None,
-        rotation: None,
-        method_verifications: Vec::new(),
-        hybrid_pubkey: None,
-        pqc_required: false,
-        revoked: false,
-        recovery_policy: None,
-        recovery: None,
-    };
-
-    assert!(validate_public_profile(&invalid_profile).is_err());
+/// Ensure input hashing and output tweak hashing use distinct BIP-352 domains.
+#[test]
+fn tags_are_domain_separated() {
+    assert_ne!(
+        tagged_hash(BIP0352_TAG_INPUTS, b"data"),
+        tagged_hash(BIP0352_TAG_SHARED_SECRET, b"data")
+    );
 }

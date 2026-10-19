@@ -15,7 +15,11 @@ ARG OPENSSL_VERSION="3.0.22"
 # NOTE: fully-qualified image names are required for Podman compatibility.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM docker.io/rust:bookworm AS chef
-RUN cargo install cargo-chef
+# tiny_http's HTTPS backend links against the system OpenSSL libraries.
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends libssl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-chef
 WORKDIR /build
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,4 +148,3 @@ EXPOSE 9737
 
 ENTRYPOINT ["/usr/local/bin/satspathd"]
 CMD ["--home", "/data", "--no-open"]
-

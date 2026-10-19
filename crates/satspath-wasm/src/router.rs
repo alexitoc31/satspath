@@ -296,7 +296,18 @@ pub fn build_qr_payload(method: &PaymentMethod, amount_sats: u64) -> Result<Stri
 
 // ===== High-level quote function =====
 
-/// Full quote pipeline: resolve → verify → route → build QR
+/// Resolve a recipient alias and quote a payment amount in satoshis with a QR payload.
+///
+/// Returns `InvalidSignature` when signature verification fails, or `NoRoute` if
+/// the verified profile has expired or the amount is outside valid bounds. Otherwise,
+/// selects a route using normal urgency and live fee estimates, falling back to default
+/// fees on fetch errors.
+///
+/// Payable QR payloads are built only for verified on-chain addresses. Amount-less
+/// pointers and experimental offers fail closed as `NoRoute`.
+///
+/// Returns an error if resolution, profile JSON parsing or serialization, route
+/// selection, or QR payload construction fails.
 pub async fn quote(recipient: &str, amount_sats: u64) -> Result<QuoteResponse, String> {
     if amount_sats == 0 || amount_sats > 21_000_000 * 100_000_000 {
         return Ok(QuoteResponse::NoRoute {

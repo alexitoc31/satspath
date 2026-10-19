@@ -12,5 +12,17 @@ corpus/fuzz_ownership_proof/*
 !corpus/fuzz_profile_deser/
 corpus/fuzz_profile_deser/*
 !corpus/fuzz_profile_deser/seed-*
+!corpus/fuzz_nostr_event/
+corpus/fuzz_nostr_event/*
+!corpus/fuzz_nostr_event/seed-*
+!corpus/fuzz_merkle_proof/
+corpus/fuzz_merkle_proof/*
+!corpus/fuzz_merkle_proof/seed-*
+!corpus/fuzz_capability_handoff/
+corpus/fuzz_capability_handoff/*
+!corpus/fuzz_capability_handoff/seed-*
+!corpus/fuzz_schnorr_profile/
+corpus/fuzz_schnorr_profile/*
+!corpus/fuzz_schnorr_profile/seed-*
 artifacts
 coverage

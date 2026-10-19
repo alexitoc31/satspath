@@ -24,8 +24,9 @@ script compromise or a privileged browser extension.
 
 ## HTTP Host and reverse proxies
 
-Every route, including public `/v1/control`, validates exactly one HTTP `Host`
-header before routing. Loopback binds allow `localhost` and loopback IP literals;
+Every route, including public `/v1/control`, validates a single trusted HTTP `Host`
+header before routing (with an internal-scrape exception for `GET /metrics` when
+the parsed `Host` is `satspathd`). Loopback binds allow `localhost` and loopback IP literals;
 specific interface binds allow their IP, and wildcard binds allow IP literals.
 Other DNS names must be explicitly configured through `SATSPATH_AUTHORITY_DOMAIN`
 or the hostname of `SATSPATH_AUTHORITY_URL`. Missing, duplicate, malformed and
@@ -47,14 +48,14 @@ authentication remain independent checks.
 | GET /v1/claim?invite_id=… | Public |
 | POST /v1/send, /v1/receive, /v1/claim | Public under existing backend rules |
 | POST /v1/transparency/verify/inclusion | Public proof verification |
-| POST /v1/profile/challenge, /v1/profile/verify | Authenticated |
+| POST /v1/profile/challenge, /v1/profile/verify | Authenticated (also requires `--dev-mock-alias-verification` on non-mainnet) |
 | PUT /v1/profile | Authenticated |
 | POST /v1/broadcast | Authenticated |
 | POST /v1/invites/notifications/{id}/read (both notification actions) | Authenticated |
 | POST /v1/dashboard/auth (sign-in helper) | Authenticated |
 
 GET /health remains public. The helper also mirrors the existing public mutation
-exceptions for /v1/dns/resolve and /v2/resolve. All other mutations default to
+exceptions for /v1/dns/resolve, /v1/profile/recover and /v2/resolve. All other mutations default to
 authenticated, including /v1/profile/methods, /v1/profile/rotate-key and
 /v1/p2p/resolve, which currently have no dashboard fetch call. Backend rules,
 profile verification and P2P trust boundaries are unchanged.

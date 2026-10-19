@@ -1,7 +1,7 @@
 //! SSRF (Server-Side Request Forgery) protection for SatsPath resolvers.
 //!
 //! All outbound HTTP/HTTPS requests from resolvers MUST pass through
-//! [`validate_url`] before being issued. This prevents a malicious alias
+//! [`pinned_http_client`] before being issued. This prevents a malicious alias
 //! (e.g. `attacker@127.0.0.1`) from tricking the resolver into contacting
 //! internal services.
 
@@ -20,13 +20,14 @@ const BLOCKED_HOSTS: &[&str] = &[
     "metadata.google.internal.",
 ];
 
-/// Validate that a URL is safe to request (no SSRF risk).
+/// Validate URL syntax and literal destinations. DNS names additionally require
+/// [`resolve_public_endpoint`] and connection pinning.
 ///
 /// Checks performed:
 /// 1. Scheme must be HTTPS (or HTTP only if `allow_http` is true — for tests).
 /// 2. Host must not be a known internal/metadata hostname.
 /// 3. If the host is an IP literal, it must not be in a private/reserved range.
-/// 4. Port must be standard (443 for HTTPS, 80 for HTTP) or in 1024..=65535.
+/// 4. Port must be 80, 443, 8080, or 8443.
 pub fn validate_url(url: &str, allow_http: bool) -> Result<()> {
     let parsed = url::Url::parse(url)
         .map_err(|e| SatsPathError::ValidationError(format!("Invalid URL: {e}")))?;
@@ -90,6 +91,87 @@ pub fn validate_url(url: &str, allow_http: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve once and validate every answer before creating any connection.
+pub async fn resolve_public_endpoint(
+    url: &str,
+    allow_http: bool,
+) -> Result<(url::Url, Vec<std::net::SocketAddr>)> {
+    validate_url(url, allow_http)?;
+    let parsed = url::Url::parse(url).map_err(|e| SatsPathError::ValidationError(e.to_string()))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| SatsPathError::ValidationError("missing host".into()))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| SatsPathError::ValidationError("missing port".into()))?;
+    let addresses = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::lookup_host((host.trim_matches(['[', ']']), port)),
+    )
+    .await
+    .map_err(|_| SatsPathError::NetworkError("DNS timeout".into()))?
+    .map_err(|e| SatsPathError::NetworkError(e.to_string()))?
+    .collect::<Vec<_>>();
+    validate_resolved_addresses(&addresses)?;
+    Ok((parsed, addresses))
+}
+
+fn validate_resolved_addresses(addresses: &[std::net::SocketAddr]) -> Result<()> {
+    if addresses.is_empty() || addresses.iter().any(|a| is_private_or_reserved_ip(a.ip())) {
+        return Err(SatsPathError::ValidationError(
+            "DNS returned an empty or non-public address set".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// HTTP client pinned to the validated DNS snapshot. The URL hostname remains
+/// intact for Host/SNI and certificate verification. Proxies and redirects are
+/// disabled so neither can resolve a different destination behind our back.
+pub async fn pinned_http_client(url: &str, allow_http: bool) -> Result<reqwest::Client> {
+    let (parsed, addresses) = resolve_public_endpoint(url, allow_http).await?;
+    pinned_client_builder(&parsed, &addresses)
+        .build()
+        .map_err(|e| SatsPathError::NetworkError(e.to_string()))
+}
+
+fn pinned_client_builder(
+    url: &url::Url,
+    addresses: &[std::net::SocketAddr],
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(url.host_str().expect("validated host"), addresses)
+}
+
+/// Connect the TCP socket to a validated address, then perform the WebSocket
+/// and TLS handshakes using the original hostname. No second DNS lookup occurs.
+pub async fn pinned_websocket(
+    url: &str,
+) -> Result<(
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+)> {
+    let mut http_url =
+        url::Url::parse(url).map_err(|e| SatsPathError::ValidationError(e.to_string()))?;
+    let scheme = match http_url.scheme() {
+        "wss" => "https",
+        _ => return Err(SatsPathError::ValidationError("relay requires wss".into())),
+    };
+    http_url
+        .set_scheme(scheme)
+        .map_err(|_| SatsPathError::ValidationError("invalid relay URL".into()))?;
+    let (_, addresses) = resolve_public_endpoint(http_url.as_str(), false).await?;
+    let stream = tokio::net::TcpStream::connect(addresses.as_slice())
+        .await
+        .map_err(|e| SatsPathError::NetworkError(e.to_string()))?;
+    tokio_tungstenite::client_async_tls(url, stream)
+        .await
+        .map_err(|e| SatsPathError::NetworkError(e.to_string()))
 }
 
 /// Returns `true` if the IP address is in a private, loopback, link-local,
@@ -208,9 +290,163 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
     false
 }
 
+/// Builds a reqwest client pinned to the pre-validated IP address of `url`.
+#[cfg(feature = "std")]
+pub async fn build_pinned_http_client(
+    url: &str,
+    timeout: std::time::Duration,
+    allow_http: bool,
+) -> Result<reqwest::Client> {
+    validate_url(url, allow_http)?;
+    let parsed = url::Url::parse(url)
+        .map_err(|e| SatsPathError::ValidationError(format!("Invalid URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| SatsPathError::ValidationError("URL has no host".to_string()))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    let ip_str = host.trim_start_matches('[').trim_end_matches(']');
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+        if is_private_or_reserved_ip(ip) {
+            return Err(SatsPathError::ValidationError(format!(
+                "Blocked IP: {ip} (private/reserved range)"
+            )));
+        }
+    } else {
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| {
+                SatsPathError::NetworkError(format!("DNS resolution failed for {host}: {e}"))
+            })?
+            .collect();
+        if addrs.is_empty() {
+            return Err(SatsPathError::NetworkError(format!(
+                "DNS resolution returned no addresses for {host}"
+            )));
+        }
+        for addr in &addrs {
+            if is_private_or_reserved_ip(addr.ip()) {
+                return Err(SatsPathError::ValidationError(format!(
+                    "Blocked resolved IP for {host}: {} (private/reserved range)",
+                    addr.ip()
+                )));
+            }
+        }
+        builder = pin_http_host(builder, &parsed, &addrs);
+    }
+
+    builder
+        .build()
+        .map_err(|e| SatsPathError::NetworkError(e.to_string()))
+}
+
+/// Key the override by the exact URL host reqwest will resolve, including a final dot.
+#[cfg(feature = "std")]
+fn pin_http_host(
+    builder: reqwest::ClientBuilder,
+    url: &url::Url,
+    addrs: &[std::net::SocketAddr],
+) -> reqwest::ClientBuilder {
+    builder.resolve_to_addrs(url.host_str().expect("validated URL has a host"), addrs)
+}
+
+/// Read an HTTP response body up to `max_bytes`, failing closed if the stream exceeds the bound.
+#[cfg(feature = "std")]
+pub async fn read_bounded_response(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            return Err(SatsPathError::NetworkError(format!(
+                "Response content-length ({len} bytes) exceeds limit of {max_bytes} bytes"
+            )));
+        }
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| SatsPathError::NetworkError(format!("Error reading response stream: {e}")))?
+    {
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(SatsPathError::NetworkError(format!(
+                "Response payload exceeded size limit of {max_bytes} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reject_any_unsafe_dns_answer_before_connecting() {
+        assert!(validate_resolved_addresses(&[]).is_err());
+        for blocked in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "192.0.2.1",
+            "::1",
+            "fc00::1",
+        ] {
+            let mixed = [
+                "8.8.8.8:443".parse().unwrap(),
+                std::net::SocketAddr::new(blocked.parse().unwrap(), 443),
+            ];
+            assert!(validate_resolved_addresses(&mixed).is_err(), "{blocked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_snapshot_prevents_second_dns_lookup_and_preserves_host() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct RebindingDns(Arc<AtomicUsize>);
+        impl reqwest::dns::Resolve for RebindingDns {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                // A changed answer must never be consulted by the connection.
+                Box::pin(async {
+                    Ok(Box::new(std::iter::once("127.0.0.2:80".parse().unwrap()))
+                        as reqwest::dns::Addrs)
+                })
+            }
+        }
+        let mut server = mockito::Server::new_async().await;
+        let port = url::Url::parse(&server.url()).unwrap().port().unwrap();
+        let url = url::Url::parse(&format!("http://rebind.invalid:{port}/")).unwrap();
+        let expected = server
+            .mock("GET", "/")
+            .match_header("host", format!("rebind.invalid:{port}").as_str())
+            .with_status(302)
+            .with_header("location", "http://127.0.0.2/")
+            .create_async()
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Use a local fixture as the already-validated snapshot only inside this
+        // test; the public helper always rejects loopback before building it.
+        let snapshot = [format!("127.0.0.1:{port}").parse().unwrap()];
+        let client = pinned_client_builder(&url, &snapshot)
+            .dns_resolver(Arc::new(RebindingDns(calls.clone())))
+            .build()
+            .unwrap();
+        let response = client.get(url).send().await.unwrap();
+        assert_eq!(response.status(), 302); // Redirect destination is not contacted.
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        expected.assert_async().await;
+    }
 
     /// NAT64 must inherit the public/private status of the embedded IPv4 host.
     #[test]
