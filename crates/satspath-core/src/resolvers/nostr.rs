@@ -473,11 +473,20 @@ mod tests {
     use crate::{PaymentMethod, PaymentProfile};
 
     async fn served_nip05(body: Vec<u8>) -> Result<Nip05Document> {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
+            // Wait for the full request before responding: newer HTTP clients
+            // reject an unsolicited response while still sending the request.
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0u8; 1024];
+                let len = socket.read(&mut chunk).await.unwrap();
+                assert!(len > 0 && request.len() + len <= 8192);
+                request.extend_from_slice(&chunk[..len]);
+            }
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()

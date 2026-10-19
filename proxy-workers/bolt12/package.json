@@ -4,10 +4,12 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev src/index.ts",
-    "deploy": "wrangler deploy --minify src/index.ts"
+    "deploy": "wrangler deploy --minify src/index.ts",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "hono": "^4.0.0"
+    "hono": "^4.13.5"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240222.0",

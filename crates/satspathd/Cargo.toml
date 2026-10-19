@@ -21,7 +21,9 @@ secp256k1 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2.workspace = true
-tiny_http = { version = "0.12", features = ["ssl-rustls"] }
+# tiny_http's ssl-rustls feature pulls rustls 0.20 and vulnerable ring 0.16.
+# Keep native HTTPS while using the already-provisioned OpenSSL backend.
+tiny_http = { version = "0.12", features = ["ssl-openssl"] }
 tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
